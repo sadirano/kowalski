@@ -1,0 +1,14 @@
+zig-out/
+.zig-cache/
+*.exe
+*.pdb
+
+# Local data, never tracked
+*.db
+*.db-wal
+*.db-shm
+*.pid
+fixtures/
+
+# Fetched Zig packages (third-party source)
+zig-pkg/

@@ -1,0 +1,281 @@
+'use strict';
+let _blockData = [];
+const _openBlocks = new Set();
+
+// ── Report view ───────────────────────────────────────────────────────────────
+function renderReport(rep) {
+  const area = id('table-area');
+  _taskData = []; // reset task registry for switch buttons
+  _blockData = []; // reset interval registry for block actions
+  _slotSel = null;  // a selection does not survive a re-render
+  if (!rep.tasks?.length) {
+    area.innerHTML = `<div class="empty">${t('no_sessions')}</div>`;
+    return;
+  }
+
+  area.innerHTML = rep.tasks.map(entry => {
+    const task = entry.task;
+    const hopCls  = entry.hops > 0 ? 'some' : 'none';
+    const hopText = entry.hops > 0 ? t('hops', { n: entry.hops }) : t('no_hops');
+
+    const sessions = rep.intervals.filter(s => s.task.id === task.id).sort((a, b) => a.start_ms - b.start_ms);
+    const blocks = sessions.map((s, idx) => {
+      const bi = _blockData.length;
+      _blockData.push(s);
+      const isOpen   = s.end_ms == null;
+      const endStr   = isOpen ? `<span style="color:var(--grn)">${t('now')}</span>` : fmtTime(s.end_ms);
+      const dur      = fmtMs(Math.min(s.end_ms ?? Date.now() + _skew, rep.end_ms) - Math.max(s.start_ms, rep.start_ms));
+      const badge    = (isOpen ? `<span class="open-badge">${t('live')}</span>` : '')
+                     + (s.role === 'parallel' ? `<span class="open-badge par">${t('parallel')}</span>` : '');
+      const filled   = s.notes.length + (s.text ? 1 : 0);
+      const preview  = filled > 0 ? t('notes_n', { n: filled }) : t('click_notes');
+      const blockOpen = _openBlocks.has(s.id) || (isOpen && !_openBlocks.has(-s.id));
+
+      // Merge button: show between this block and the next when:
+      //  • Both closed and gap ≤ 60 s, OR
+      //  • Next block is the currently open interval (gap constraint waived)
+      let mergeBtn = '';
+      const next = sessions[idx + 1];
+      if (next && !isOpen && s.role === next.role) {
+        const gapMs  = next.start_ms - s.end_ms;
+        const gapStr = gapMs < 0 ? 'overlap'
+                     : gapMs < 1000 ? '<1s'
+                     : gapMs < 60000 ? `${Math.round(gapMs/1000)}s`
+                     : `${Math.round(gapMs/60000)}m`;
+        const nextIsOpen   = next.end_ms == null;
+        const withinWindow = gapMs >= 0 && gapMs <= 60000;
+        if (nextIsOpen || withinWindow) {
+          const bigGap  = gapMs > 600000;
+          const label = `${t('merge_next')} (gap ${gapStr})`;
+          mergeBtn = `<div class="merge-row">
+            <button class="merge-btn${bigGap?' warn':''}" onclick="mergeBlocks(${bi},${bi + 1},${gapMs})" title="${escAttr(label)}">
+              ${esc(label)}
+            </button>
+          </div>`;
+        }
+      }
+
+      return `<div class="block" id="blk-${s.id}">
+        <div class="block-hdr" onclick="toggleBlock(this)"${isOpen ? '' : ` draggable="true" ondragstart="dragBlock(event,${bi})" ondragend="dragEndBlock()" title="${escAttr(t('drag_block'))}"`}>
+          <div class="block-time">${fmtTime(s.start_ms)} → ${endStr}${badge}</div>
+          <div class="block-dur">${dur}</div>
+          <div class="block-note-preview ${filled>0?'has-note':''}">${preview}</div>
+          <div class="block-actions">
+            <button class="btn-icon" title="${escAttr(t('edit_times'))}" aria-label="${escAttr(t('edit_times'))}" onclick="event.stopPropagation();openEditTime(${bi})">${icon('edit')}</button>
+            ${isOpen ? '' : `<button class="btn-icon" title="${escAttr(t('delete_block'))}" aria-label="${escAttr(t('delete_block'))}" onclick="event.stopPropagation();deleteBlock(${bi})">${icon('trash')}</button>`}
+          </div>
+          <div class="block-toggle">${blockOpen ? '▾' : '▸'}</div>
+        </div>
+        <div class="slot-grid${blockOpen ? ' open' : ''}">${buildSlotRows(s, bi)}</div>
+      </div>${mergeBtn}`;
+    }).join('');
+
+    // Register task data for the switch button (avoids escaping task data in onclick)
+    const taskIdx = _taskData.length;
+    _taskData.push({ task });
+    const isCurrent  = task.id === _currentTaskId;
+    const switchLabel = isCurrent ? '●' : '▶';
+    const switchTitle = isCurrent ? t('live') : t('search_switch');
+    const switchCls   = isCurrent ? 'switch-btn current-task' : 'switch-btn';
+    const switchClick = isCurrent
+      ? ''
+      : `onclick="event.stopPropagation();switchToTaskByIdx(${taskIdx})"`;
+
+    return `<div class="task-card" data-task="${task.id}" ondragover="dragOverTask(event,${taskIdx})" ondragleave="dragLeaveTask(event)" ondrop="dropOnTask(event,${taskIdx})">
+      <div class="task-hdr">
+        <div>
+          <div class="task-id">${task.ref ? refLink(task.ref) : esc('#' + task.id)}</div>
+          <div class="task-meta">${esc(entry.fields.map(field => field.value).filter(Boolean).concat(task.title).join(' · '))}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="${switchCls}" title="${escAttr(switchTitle)}" aria-label="${escAttr(switchTitle)}" ${switchClick}>${switchLabel}</button>
+          <div>
+            <div class="task-dur">${fmtMs(entry.focus_ms)}</div>
+            <div class="task-hops ${hopCls}">${hopText}</div>
+          </div>
+        </div>
+      </div>
+      <div class="block-list">${blocks}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── 15-minute slots ───────────────────────────────────────────────────────────
+// An open block lists every 15-minute clock slot it covers, each with the
+// notes written in it. An empty slot takes a note at its start (or at the
+// interval's start, in its first slot). Note times are not edited.
+const SLOT_MS = 15 * 60000;
+
+function slotsOf(s) {
+  const end = s.end_ms ?? Date.now() + _skew;
+  const first = Math.floor(s.start_ms / SLOT_MS) * SLOT_MS;
+  const count = Math.max(1, Math.ceil((end - first) / SLOT_MS));
+  return { first, count, end };
+}
+
+function buildSlotRows(s, bi) {
+  const { first, count } = slotsOf(s);
+  const bySlot = Array.from({ length: count }, () => []);
+  const place = at => Math.min(count - 1, Math.max(0, Math.floor((at - first) / SLOT_MS)));
+  if (s.text) bySlot[place(s.start_ms)].push(`<span class="slot-note">${esc(s.text)}</span>`);
+  for (const n of s.notes) {
+    bySlot[place(n.at_ms)].push(`<span class="slot-note" id="sn-${n.id}" onclick="editNote(${bi},${n.id})">${esc(n.text)}</span>`);
+  }
+  const closed = s.end_ms != null;
+  const hint = closed ? escAttr(t('slot_hint')) : '';
+  return bySlot.map((notes, k) => {
+    const at = first + k * SLOT_MS;
+    const time = fmtTime(at);
+    const handle = closed
+      ? ` onclick="selectSlot(event,${bi},${k})" draggable="true" ondragstart="dragSlots(event,${bi},${k})" ondragend="dragEndBlock()" title="${hint}"`
+      : '';
+    const body = notes.length ? notes.join('')
+      : `<span class="slot-note blank" id="na-${s.id}-${k}" data-ph="${escAttr(t('add_note'))}" onclick="addNoteAt(${bi},${k})"></span>`;
+    return `<div class="slot-row" data-slot="${k}">
+      <div class="slot-time${closed ? ' pick' : ''}"${handle}>${time}</div>
+      <div class="slot-note-wrap">${body}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Slot selection ────────────────────────────────────────────────────────────
+// Click a slot's time to select it, Shift+click another in the same interval
+// to select the run between; the selection drags onto another task.
+let _slotSel = null; // { bi, a, b }: slot indices, a <= b
+
+function selectSlot(e, bi, k) {
+  e.stopPropagation();
+  if (e.shiftKey && _slotSel?.bi === bi) {
+    _slotSel = { bi, a: Math.min(_slotSel.a, k), b: Math.max(_slotSel.b, k) };
+  } else if (_slotSel?.bi === bi && _slotSel.a === k && _slotSel.b === k) {
+    _slotSel = null;
+  } else {
+    _slotSel = { bi, a: k, b: k };
+  }
+  markSlotSel();
+}
+
+function markSlotSel() {
+  document.querySelectorAll('.slot-row.sel').forEach(el => el.classList.remove('sel'));
+  if (!_slotSel) return;
+  const block = id(`blk-${_blockData[_slotSel.bi].id}`);
+  block?.querySelectorAll('.slot-row').forEach(el => {
+    const k = Number(el.dataset.slot);
+    el.classList.toggle('sel', k >= _slotSel.a && k <= _slotSel.b);
+  });
+}
+
+// The selected run as times inside the interval: [from, to).
+function slotRange(bi, a, b) {
+  const s = _blockData[bi];
+  const { first, end } = slotsOf(s);
+  return { from: Math.max(s.start_ms, first + a * SLOT_MS), to: Math.min(end, first + (b + 1) * SLOT_MS) };
+}
+
+// Toggle a block's note rows open/closed
+function toggleBlock(hdr) {
+  const grid = hdr.nextElementSibling;
+  const tog  = hdr.querySelector('.block-toggle');
+  const open = grid.classList.toggle('open');
+  const blockId = Number(hdr.parentElement.id.slice(4));
+  if (open) {
+    _openBlocks.add(blockId);
+    _openBlocks.delete(-blockId);
+  } else {
+    _openBlocks.delete(blockId);
+    _openBlocks.add(-blockId);
+  }
+  tog.textContent = open ? '▾' : '▸';
+}
+
+// ── Note editing ──────────────────────────────────────────────────────────────
+// Open note editors. A save re-renders the report only once no other editor
+// is open, so a finished save never wipes a draft in progress.
+let _noteEditors = 0;
+let _reloadPending = false;
+async function closeNoteEditor(saved) {
+  _noteEditors = Math.max(0, _noteEditors - 1);
+  if (saved) _reloadPending = true;
+  if (_noteEditors > 0) return;
+  if (_reloadPending) {
+    _reloadPending = false;
+    await loadDay(selectedDate);
+  } else {
+    renderReport(D);
+  }
+}
+
+// Swaps `span` for a textarea editor. Ctrl+Enter or the button saves, Escape
+// cancels, leaving the box saves; `commit` gets the trimmed text.
+function openNoteEditor(span, value, placeholder, commit) {
+  const inp = document.createElement('textarea');
+  inp.className   = 'slot-inp';
+  inp.id          = span.id;
+  inp.value       = value;
+  inp.placeholder = placeholder;
+  _noteEditors++;
+  let done = false;
+  const save = async () => {
+    if (done) return;
+    done = true;
+    try {
+      if (!await commit(inp.value.trim())) { await closeNoteEditor(false); return; }
+    } catch (e) {
+      showError(e.message);
+      done = false; // keep the editor and the text to fix or retry
+      return;
+    }
+    await closeNoteEditor(true);
+  };
+  const cancel = () => {
+    if (done) return;
+    done = true;
+    closeNoteEditor(false);
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  };
+  inp.onblur = () => save();
+  const btn = document.createElement('span');
+  btn.className   = 'save-btn';
+  btn.textContent = t('save');
+  btn.onmousedown = e => { e.preventDefault(); save(); };
+  const row = document.createElement('div');
+  row.className = 'slot-edit';
+  row.append(inp, btn);
+  span.replaceWith(row);
+  inp.focus();
+  return inp;
+}
+
+// Edits a note's text; clearing it deletes the note.
+function editNote(bi, noteId) {
+  const s = _blockData[bi];
+  const n = s?.notes.find(note => note.id === noteId);
+  const span = id(`sn-${noteId}`);
+  if (!n || !span || span.tagName === 'TEXTAREA') return;
+  openNoteEditor(span, n.text, t('edit_note'), async value => {
+    if (value === n.text) return false;
+    if (!value) await apiJSON('POST', `/api/notes/${noteId}/delete`);
+    else await apiJSON('PATCH', `/api/notes/${noteId}`, { text: value });
+    return true;
+  }).select();
+}
+
+// Adds a note in slot `k`: at the slot's start, kept inside the interval
+// (the running slot takes the time it is saved).
+function addNoteAt(bi, k) {
+  const s = _blockData[bi];
+  const span = id(`na-${s.id}-${k}`);
+  if (!span || span.tagName === 'TEXTAREA') return;
+  openNoteEditor(span, '', t('add_note'), async value => {
+    if (!value) return false;
+    const { first, end } = slotsOf(s);
+    const slotStart = first + k * SLOT_MS;
+    const live = s.end_ms == null && Date.now() + _skew < slotStart + SLOT_MS;
+    const atMs = live ? Math.max(s.start_ms, Date.now() + _skew) : Math.min(end, Math.max(s.start_ms, slotStart));
+    await apiJSON('POST', '/api/notes', { interval: s.id, at_ms: atMs, text: value });
+    return true;
+  });
+}
