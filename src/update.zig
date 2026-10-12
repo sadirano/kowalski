@@ -205,6 +205,23 @@ pub fn extractExecutables(a: std.mem.Allocator, io: Io, zip_path: []const u8, st
     if (!found_console or !found_window) return error.MissingExe;
 }
 
+extern "kernel32" fn MoveFileExW([*:0]const u16, [*:0]const u16, u32) callconv(.winapi) i32;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+
+/// Renames a file, including the image of a running executable (Windows
+/// allows that through MoveFileExW; std's rename asks for access it refuses).
+/// Replaces an existing target and waits until the move is on disk.
+pub fn moveFile(a: std.mem.Allocator, from: []const u8, to: []const u8) !void {
+    const from_w = try std.unicode.utf8ToUtf16LeAllocZ(a, from);
+    defer a.free(from_w);
+    const to_w = try std.unicode.utf8ToUtf16LeAllocZ(a, to);
+    defer a.free(to_w);
+    if (MoveFileExW(from_w, to_w, 1 | 8) == 0) return switch (GetLastError()) {
+        2, 3 => error.FileNotFound,
+        else => error.MoveFailed,
+    };
+}
+
 pub const Swap = struct {
     exe_dir: []const u8,
     stage: []const u8,
@@ -215,7 +232,7 @@ pub const Swap = struct {
             const current = join(a, &.{ self.exe_dir, name }) catch continue;
             const old = std.fmt.allocPrint(a, "{s}.old", .{current}) catch continue;
             cwd.deleteFile(io, current) catch {};
-            Io.Dir.rename(cwd, old, cwd, current, io) catch {};
+            moveFile(a, old, current) catch {};
         }
     }
 };
@@ -234,7 +251,12 @@ pub fn swapExecutables(a: std.mem.Allocator, io: Io, exe_dir: []const u8, stage:
         current[i] = try join(a, &.{ exe_dir, name });
         old[i] = try std.fmt.allocPrint(a, "{s}.old", .{current[i]});
         incoming[i] = try std.fmt.allocPrint(a, "{s}.new", .{current[i]});
-        if (cwd.statFile(io, old[i], .{})) |_| return error.OldExePresent else |err| if (err != error.FileNotFound) return err;
+        // Leftovers of a finished update (the guard ran from them): the caller
+        // holds the update lock and no transaction is pending, so they can go.
+        cwd.deleteFile(io, old[i]) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.OldExePresent,
+        };
         const source = try join(a, &.{ stage, name });
         try Io.Dir.copyFile(cwd, source, cwd, incoming[i], io, .{ .replace = true });
         copied += 1;
@@ -243,14 +265,14 @@ pub fn swapExecutables(a: std.mem.Allocator, io: Io, exe_dir: []const u8, stage:
     var moved_new: [2]bool = .{ false, false };
     errdefer {
         for (0..2) |i| if (moved_new[i]) cwd.deleteFile(io, current[i]) catch {};
-        for (0..2) |i| if (moved_old[i]) Io.Dir.rename(cwd, old[i], cwd, current[i], io) catch {};
+        for (0..2) |i| if (moved_old[i]) moveFile(a, old[i], current[i]) catch {};
     }
     for (0..2) |i| {
-        try Io.Dir.rename(cwd, current[i], cwd, old[i], io);
+        try moveFile(a, current[i], old[i]);
         moved_old[i] = true;
     }
     for (0..2) |i| {
-        try Io.Dir.rename(cwd, incoming[i], cwd, current[i], io);
+        try moveFile(a, incoming[i], current[i]);
         moved_new[i] = true;
     }
     return .{ .exe_dir = exe_dir, .stage = stage };
@@ -276,6 +298,8 @@ pub fn outcome(value: ?journal.Journal) ?Outcome {
 pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db_path: []const u8, version: []const u8, local_file: ?[]const u8) anyerror!Installed {
     var lock = update_lock.tryAcquire() orelse return error.UpdateInProgress;
     errdefer lock.release();
+    // An unfinished transaction still needs its .old executables to roll back.
+    if (try journal.read(a, io, db_path)) |pending| if (journal.needsRecovery(pending)) return error.UpdateInProgress;
     const cwd = Io.Dir.cwd();
     var bytes: []const u8 = undefined;
     var signature: []const u8 = undefined;
@@ -324,7 +348,7 @@ pub fn newJournal(a: std.mem.Allocator, version: []const u8) !journal.Journal {
         .id = try a.dupe(u8, &id), .from = current_version, .to = version, .phase = .swapped,
         .nonce = try a.dupe(u8, &nonce),
         .snapshot = try std.fmt.allocPrint(a, "update-snapshot-{s}.db", .{id}),
-        .exe_dir = ".", .started_ms = clock.nowMs(),
+        .exe_dir = try launch.exeDir(a), .started_ms = clock.nowMs(),
     };
 }
 
