@@ -10,17 +10,8 @@ const opener = @import("opener.zig");
 const demo = @import("demo.zig");
 const tour_mod = @import("tour.zig");
 const zone_mod = @import("zone.zig");
-const contract = @import("kowalski_provider");
-const provider_impl = @import("provider_impl");
-const windows = std.os.windows;
 
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
-extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?windows.HANDLE;
-extern "kernel32" fn GetConsoleMode(handle: windows.HANDLE, mode: *u32) callconv(.winapi) i32;
-extern "kernel32" fn SetConsoleMode(handle: windows.HANDLE, mode: u32) callconv(.winapi) i32;
-extern "kernel32" fn ReadConsoleW(handle: windows.HANDLE, buffer: [*]u16, len: u32, read: *u32, control: ?*anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn ReadFile(handle: windows.HANDLE, data: [*]u8, len: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
-
 pub fn main(init: std.process.Init) void {
     const code = run(init) catch |err| blk: {
         std.debug.print("kowalski: {s}\n", .{@errorName(err)});
@@ -78,7 +69,6 @@ fn run(init: std.process.Init) !u8 {
         return 0;
     }
     if (std.mem.eql(u8, command, "demo")) return demoData(init, db, args);
-    if (std.mem.eql(u8, command, "provider") and args.len == 1 and std.mem.eql(u8, args[0], "login")) return providerLogin(init, db);
 
     var out: std.Io.Writer.Allocating = .init(a);
     var err_out: std.Io.Writer.Allocating = .init(a);
@@ -100,136 +90,6 @@ fn run(init: std.process.Init) !u8 {
     try std.Io.File.stdout().writeStreamingAll(init.io, out.written());
     try std.Io.File.stderr().writeStreamingAll(init.io, err_out.written());
     return @backingInt(exit);
-}
-
-fn providerLogin(init: std.process.Init, db_path: []const u8) !u8 {
-    const a = init.arena.allocator();
-    const table = provider_impl.kowalskiProvider(contract.version) orelse {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "no provider in this build\n");
-        return 1;
-    };
-    if (table.version != contract.version) return loginFailed(init, "provider version mismatch");
-    const data_dir = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(db_path) orelse ".", "providers", table.instance.slice() });
-    try std.Io.Dir.cwd().createDirPath(init.io, data_dir);
-    const config = try std.json.Stringify.valueAlloc(a, .{ .contract = contract.version, .data_dir = data_dir }, .{});
-    var context: ?*anyopaque = null;
-    const started = table.init(table.context, .of(config), &context);
-    defer if (started.message.ptr != null) table.free(context, started.message);
-    if (started.code != 0) return loginFailed(init, started.message.slice());
-    var copy = table.*;
-    copy.context = context;
-    defer copy.deinit(copy.context);
-    var listed: contract.Bytes = .{};
-    const listing = copy.login_prompts(copy.context, &listed);
-    defer if (listing.message.ptr != null) copy.free(copy.context, listing.message);
-    if (listing.code != 0) return loginFailed(init, listing.message.slice());
-    const Prompt = struct { name: []const u8, label: []const u8, secret: bool = false };
-    const prompts = std.json.parseFromSliceLeaky([]Prompt, a, listed.slice(), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-    if (listed.ptr != null) copy.free(copy.context, listed);
-    const list = prompts catch return loginFailed(init, "invalid login prompts");
-    if (list.len == 0) return loginFailed(init, "the provider needs no login");
-
-    const input = GetStdHandle(0xfffffff6) orelse return error.Stdin;
-    if (input == windows.INVALID_HANDLE_VALUE) return error.Stdin;
-    var mode: u32 = 0;
-    const console = GetConsoleMode(input, &mode) != 0;
-    var answers: std.Io.Writer.Allocating = .init(a);
-    // Answers hold secrets; wipe them however this returns.
-    defer @memset(answers.writer.buffer, 0);
-    var json: std.json.Stringify = .{ .writer = &answers.writer };
-    try json.beginObject();
-    for (list) |prompt| {
-        var line: [4096]u8 = undefined;
-        defer @memset(&line, 0);
-        if (console) try std.Io.File.stderr().writeStreamingAll(init.io, try std.fmt.allocPrint(a, "{s}: ", .{prompt.label}));
-        const masked = console and prompt.secret;
-        const value = if (masked) readMasked(init.io, input, &line, mode) catch |err| {
-            try std.Io.File.stderr().writeStreamingAll(init.io, "\n");
-            if (err == error.Interrupted) return loginFailed(init, "cancelled");
-            return err;
-        } else try readLine(input, &line);
-        if (masked) try std.Io.File.stderr().writeStreamingAll(init.io, "\n");
-        if (value.len == 0) return loginFailed(init, try std.fmt.allocPrint(a, "empty {s}", .{prompt.label}));
-        try json.objectField(prompt.name);
-        try json.write(value);
-    }
-    try json.endObject();
-    const status = copy.login(copy.context, .of(answers.written()));
-    defer if (status.message.ptr != null) copy.free(copy.context, status.message);
-    if (status.code != 0) return loginFailed(init, status.message.slice());
-    try std.Io.File.stdout().writeStreamingAll(init.io, "login saved\n");
-    return 0;
-}
-
-fn loginFailed(init: std.process.Init, message: []const u8) !u8 {
-    const text = if (message.len > 0) message else "provider error";
-    try std.Io.File.stderr().writeStreamingAll(init.io, try std.fmt.allocPrint(init.arena.allocator(), "kowalski: login failed: {s}\n", .{text}));
-    return 1;
-}
-
-/// A secret typed at the console: one `*` per character, Backspace erases,
-/// Ctrl+C cancels. Keys are read raw, so the console mode always comes back.
-fn readMasked(io: std.Io, input: windows.HANDLE, buffer: []u8, mode: u32) ![]const u8 {
-    // No processed, line or echo input.
-    if (SetConsoleMode(input, mode & ~@as(u32, 0x0007)) == 0) return error.ConsoleMode;
-    defer _ = SetConsoleMode(input, mode);
-    const out = std.Io.File.stderr();
-    var len: usize = 0;
-    var high: ?u16 = null;
-    while (true) {
-        var unit: [1]u16 = undefined;
-        var read: u32 = 0;
-        if (ReadConsoleW(input, &unit, 1, &read, null) == 0) return error.Stdin;
-        if (read == 0) continue;
-        const u = unit[0];
-        switch (u) {
-            '\r', '\n' => break,
-            0x03 => return error.Interrupted,
-            0x08 => {
-                if (len > 0) {
-                    // Drop one whole UTF-8 character.
-                    len -= 1;
-                    while (len > 0 and buffer[len] & 0xC0 == 0x80) len -= 1;
-                    try out.writeStreamingAll(io, "\x08 \x08");
-                }
-                continue;
-            },
-            else => if (u < 0x20) continue,
-        }
-        var code: u21 = u;
-        if (u >= 0xD800 and u < 0xDC00) {
-            high = u;
-            continue;
-        }
-        if (u >= 0xDC00 and u < 0xE000) {
-            const h = high orelse continue;
-            code = 0x10000 + ((@as(u21, h) - 0xD800) << 10) + (u - 0xDC00);
-        }
-        high = null;
-        var encoded: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(code, &encoded) catch continue;
-        if (len + n > buffer.len) return error.InputTooLong;
-        @memcpy(buffer[len..][0..n], encoded[0..n]);
-        len += n;
-        try out.writeStreamingAll(io, "*");
-    }
-    return buffer[0..len];
-}
-
-/// One line from stdin into `buffer`.
-fn readLine(input: windows.HANDLE, buffer: []u8) ![]const u8 {
-    var len: usize = 0;
-    while (true) {
-        var byte: [1]u8 = undefined;
-        var read: u32 = 0;
-        if (ReadFile(input, &byte, 1, &read, null) == 0) return error.Stdin;
-        if (read == 0 or byte[0] == '\n') break;
-        if (byte[0] == '\r') continue;
-        if (len == buffer.len) return error.InputTooLong;
-        buffer[len] = byte[0];
-        len += 1;
-    }
-    return buffer[0..len];
 }
 
 fn usageError() u8 {
@@ -302,7 +162,7 @@ fn demoData(init: std.process.Init, destination: []const u8, args: []const []con
     };
     const zone = try zone_mod.Zone.load(zone_id);
     const now = if (at) |text| localMs(&zone, text) orelse return usageError() else clock.nowMs();
-    const instance = if (provider_impl.kowalskiProvider(contract.version)) |table| table.instance.slice() else tour_mod.instance;
+    const instance = try store.getSetting("provider_instance") orelse tour_mod.instance;
     demo.seed(&db, a, .{ .lang = lang, .instance = instance, .now_ms = now, .zone = &zone }) catch |err| switch (err) {
         error.NotEmpty => {
             std.debug.print("kowalski: the database already has tasks; demo fills an empty one\n", .{});

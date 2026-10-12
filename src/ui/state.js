@@ -2,6 +2,7 @@
 let S = null;         // GET /api/state
 let D = null;         // GET /api/day for selectedDate
 let provider = null;  // GET /api/provider: {instance, fields:[{name,label,type,order}]} or null
+let providerStatus = { state: 'none', name: '', build: '', reason: '' };
 let settings = {};    // key -> value from GET /api/settings
 let selectedDate   = todayStr();
 let activeTab      = 'report';

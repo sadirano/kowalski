@@ -5,6 +5,8 @@ This is the normative contract for providers compiled into kowalski with
 exports `kowalskiProvider` and `kowalskiProviderInfo`. Runtime loading is not
 part of this version.
 
+Only the daemon process loads and calls the provider; the CLI uses the daemon.
+
 ## ABI and versioning
 
 The ABI targets Windows x86_64. Both exports and all function pointers use

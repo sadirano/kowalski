@@ -217,16 +217,15 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     };
     if (provider_impl.kowalskiProvider(contract.version)) |table| {
         if (table.version != contract.version) {
+            d.app.provider_status = .{ .state = .unavailable, .reason = "provider speaks a different contract version" };
             log("provider answered version {d}, need {d}; running without it", .{ table.version, contract.version });
         } else {
             const InfoShape = struct { contracts: []const u32, name: []const u8, build: []const u8 };
             const info = std.json.parseFromSliceLeaky(InfoShape, traits_arena.allocator(), provider_impl.kowalskiProviderInfo().slice(), .{ .ignore_unknown_fields = true }) catch null;
             if (info) |metadata| {
-                var info_name: [128]u8 = undefined;
-                var build: [128]u8 = undefined;
-                for (metadata.name[0..@min(metadata.name.len, info_name.len)], 0..) |c, i| info_name[i] = if (std.ascii.isPrint(c)) c else '?';
-                for (metadata.build[0..@min(metadata.build.len, build.len)], 0..) |c, i| build[i] = if (std.ascii.isPrint(c)) c else '?';
-                log("provider info: {s} ({s})", .{ info_name[0..@min(metadata.name.len, info_name.len)], build[0..@min(metadata.build.len, build.len)] });
+                d.app.provider_status.name = try printableAscii(traits_arena.allocator(), metadata.name, 128);
+                d.app.provider_status.build = try printableAscii(traits_arena.allocator(), metadata.build, 128);
+                log("provider info: {s} ({s})", .{ d.app.provider_status.name, d.app.provider_status.build });
             } else log("provider info: invalid JSON", .{});
             const data_dir = try std.fs.path.resolve(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", "providers", table.instance.slice() });
             defer gpa.free(data_dir);
@@ -237,7 +236,10 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
             const status = table.init(table.context, .of(config), &context);
             defer if (status.message.ptr != null) table.free(context, status.message);
             if (status.code != 0) {
-                log("provider init failed ({d}): {s}; running without it", .{ status.code, status.message.slice() });
+                const message = try printableAscii(traits_arena.allocator(), status.message.slice(), 200);
+                d.app.provider_status.state = .unavailable;
+                d.app.provider_status.reason = try std.fmt.allocPrint(traits_arena.allocator(), "init failed: {s}", .{message});
+                log("provider init failed ({d}): {s}; running without it", .{ status.code, message });
             } else {
                 const copy = try std.heap.page_allocator.create(contract.Table);
                 copy.* = table.*;
@@ -245,6 +247,8 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
                 d.provider_table = copy;
                 d.provider = .{ .table = copy, .io = io, .late = onLate, .late_context = &d };
                 d.app.provider = copy.instance.slice();
+                d.app.provider_status.state = .loaded;
+                try store.setSetting("provider_instance", copy.instance.slice(), clock.nowMs());
                 d.app.traits = api.parseTraits(traits_arena.allocator(), copy.traits.slice());
                 log("provider: {s}", .{copy.instance.slice()});
             }
@@ -286,6 +290,18 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     d.stopped.set(io);
     // After `stopped`: an end-session handler waiting on it holds the window thread.
     window.stop();
+}
+
+fn printableAscii(a: std.mem.Allocator, source: []const u8, limit: usize) ![]const u8 {
+    const result = try a.alloc(u8, @min(source.len, limit));
+    for (result, source[0..result.len]) |*dest, c| dest.* = if (std.ascii.isPrint(c)) c else '?';
+    return result;
+}
+
+test "provider status text is printable and capped" {
+    const value = try printableAscii(std.testing.allocator, "a\x00\n\xffb", 4);
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("a???", value);
 }
 
 fn heartbeatLoop(d: *Daemon) Io.Cancelable!void {

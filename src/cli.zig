@@ -5,6 +5,13 @@ const Io = std.Io;
 const sqlite = @import("sqlite.zig");
 const api = @import("api.zig");
 const zone = @import("zone.zig");
+const windows = std.os.windows;
+
+extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn GetConsoleMode(handle: windows.HANDLE, mode: *u32) callconv(.winapi) i32;
+extern "kernel32" fn SetConsoleMode(handle: windows.HANDLE, mode: u32) callconv(.winapi) i32;
+extern "kernel32" fn ReadConsoleW(handle: windows.HANDLE, buffer: [*]u16, len: u32, read: *u32, control: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn ReadFile(handle: windows.HANDLE, data: [*]u8, len: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
 
 pub const usage =
     \\usage: kowalski [--db <path>] [--json] <command> [args]
@@ -200,6 +207,122 @@ fn pathEscape(ctx: *Context, text: []const u8) ![]const u8 {
     return out.items;
 }
 
+fn providerLogin(ctx: *Context) !Exit {
+    const reply = try call(ctx, "GET", "/api/provider/login", null);
+    if (reply.status < 200 or reply.status >= 300) {
+        _ = try settle(ctx, reply);
+        return .failed;
+    }
+    const Prompt = struct { name: []const u8, label: []const u8, secret: bool = false };
+    const listed = try parse(struct { prompts: []Prompt }, ctx, reply.body);
+    if (listed.prompts.len == 0) {
+        try ctx.err.writeAll("kowalski: login failed: the provider needs no login\n");
+        return .failed;
+    }
+    const input = GetStdHandle(0xfffffff6) orelse return error.Stdin;
+    if (input == windows.INVALID_HANDLE_VALUE) return error.Stdin;
+    var mode: u32 = 0;
+    const console = GetConsoleMode(input, &mode) != 0;
+    var answers: Io.Writer.Allocating = .init(ctx.a);
+    // Answers hold secrets; wipe them however this returns.
+    defer @memset(answers.writer.buffer, 0);
+    var json: std.json.Stringify = .{ .writer = &answers.writer };
+    try json.beginObject();
+    for (listed.prompts) |prompt| {
+        var line: [4096]u8 = undefined;
+        defer @memset(&line, 0);
+        if (console) {
+            const out = Io.File.stderr();
+            for (prompt.label) |c| {
+                const printable: [1]u8 = .{if (std.ascii.isPrint(c)) c else '?'};
+                try out.writeStreamingAll(ctx.io, &printable);
+            }
+            try out.writeStreamingAll(ctx.io, ": ");
+        }
+        const masked = console and prompt.secret;
+        const value = if (masked) readMasked(ctx.io, input, &line, mode) catch |err| {
+            try Io.File.stderr().writeStreamingAll(ctx.io, "\n");
+            if (err == error.Interrupted) {
+                try ctx.err.writeAll("kowalski: login failed: cancelled\n");
+                return .failed;
+            }
+            return err;
+        } else try readLine(input, &line);
+        if (masked) try Io.File.stderr().writeStreamingAll(ctx.io, "\n");
+        if (value.len == 0) {
+            try ctx.err.writeAll("kowalski: login failed: empty answer\n");
+            return .failed;
+        }
+        try json.objectField(prompt.name);
+        try json.write(value);
+    }
+    try json.endObject();
+    const signed = try call(ctx, "POST", "/api/provider/login", answers.written());
+    if (!try settle(ctx, signed)) return .ok;
+    try ctx.out.writeAll("signed in\n");
+    return .ok;
+}
+
+/// A secret typed at the console: one `*` per character, Backspace erases,
+/// Ctrl+C cancels. Keys are read raw, so the console mode always comes back.
+fn readMasked(io: Io, input: windows.HANDLE, buffer: []u8, mode: u32) ![]const u8 {
+    if (SetConsoleMode(input, mode & ~@as(u32, 0x0007)) == 0) return error.ConsoleMode;
+    defer _ = SetConsoleMode(input, mode);
+    const out = Io.File.stderr();
+    var len: usize = 0;
+    var high: ?u16 = null;
+    while (true) {
+        var unit: [1]u16 = undefined;
+        var read: u32 = 0;
+        if (ReadConsoleW(input, &unit, 1, &read, null) == 0) return error.Stdin;
+        if (read == 0) continue;
+        const u = unit[0];
+        switch (u) {
+            '\r', '\n' => break,
+            0x03 => return error.Interrupted,
+            0x08 => {
+                if (len > 0) {
+                    len -= 1;
+                    while (len > 0 and buffer[len] & 0xC0 == 0x80) len -= 1;
+                    try out.writeStreamingAll(io, "\x08 \x08");
+                }
+                continue;
+            },
+            else => if (u < 0x20) continue,
+        }
+        var code: u21 = u;
+        if (u >= 0xD800 and u < 0xDC00) { high = u; continue; }
+        if (u >= 0xDC00 and u < 0xE000) {
+            const h = high orelse continue;
+            code = 0x10000 + ((@as(u21, h) - 0xD800) << 10) + (u - 0xDC00);
+        }
+        high = null;
+        var encoded: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(code, &encoded) catch continue;
+        if (len + n > buffer.len) return error.InputTooLong;
+        @memcpy(buffer[len..][0..n], encoded[0..n]);
+        len += n;
+        try out.writeStreamingAll(io, "*");
+    }
+    return buffer[0..len];
+}
+
+/// One line from stdin into `buffer`.
+fn readLine(input: windows.HANDLE, buffer: []u8) ![]const u8 {
+    var len: usize = 0;
+    while (true) {
+        var byte: [1]u8 = undefined;
+        var read: u32 = 0;
+        if (ReadFile(input, &byte, 1, &read, null) == 0) return error.Stdin;
+        if (read == 0 or byte[0] == '\n') break;
+        if (byte[0] == '\r') continue;
+        if (len == buffer.len) return error.InputTooLong;
+        buffer[len] = byte[0];
+        len += 1;
+    }
+    return buffer[0..len];
+}
+
 /// Prints the reply as JSON when asked, or reports a failure. True when the
 /// caller should render a success.
 fn settle(ctx: *Context, reply: Reply) !bool {
@@ -390,16 +513,21 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "provider")) {
+        if (args.len == 1 and eql(u8, args[0], "login")) return providerLogin(ctx);
         if (args.len != 0) return error.Usage;
         const reply = try call(ctx, "GET", "/api/provider", null);
         if (!try settle(ctx, reply)) return .ok;
         const Named = struct { name: []const u8, label: []const u8 = "" };
-        const r = try parse(struct { instance: ?[]const u8, fields: []Named, settings: []Named = &.{}, post_options: []Named = &.{}, sessions: bool = false }, ctx, reply.body);
+        const r = try parse(struct { instance: ?[]const u8, status: api.ProviderStatus, fields: []Named, settings: []Named = &.{}, post_options: []Named = &.{}, sessions: bool = false }, ctx, reply.body);
+        switch (r.status.state) {
+            .none => try ctx.out.writeAll("no provider\n"),
+            .unavailable => try ctx.out.print("provider unavailable: {s}\n", .{r.status.reason}),
+            .loaded => try ctx.out.print("provider  {s} {s} (loaded)\n", .{ r.status.name, r.status.build }),
+        }
         const instance = r.instance orelse {
-            try ctx.out.writeAll("no provider in this build\n");
             return .ok;
         };
-        try ctx.out.print("provider  {s}\n", .{instance});
+        _ = instance;
         if (r.sessions) try ctx.out.writeAll("sessions: supported (kowalski set post_sessions 1)\n");
         for (r.fields) |f| try ctx.out.print("  {s: <16} {s}\n", .{ f.name, f.label });
         if (r.settings.len > 0) try ctx.out.writeAll("settings (kowalski set provider.<name> <value>)\n");

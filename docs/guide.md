@@ -236,7 +236,7 @@ The dialog shows remaining local time ranges; a running session waits until
 it stops. Already posted ranges are kept covered so later edits offer only
 new time. A day already posted as a total stays in total mode for that ref.
 
-Signing in to the provider is in the ⋯ menu, or `kowalski provider login`.
+Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the daemon must be running).
 
 ## Settings
 

@@ -16,6 +16,7 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').cat
   if (currentResult.status === 'rejected') showError(currentResult.reason.message);
   if (providerResult.status === 'fulfilled') {
     const data = providerResult.value;
+    providerStatus = data.status || providerStatus;
     provider = data.instance ? data : null;
   } else {
     provider = S && S.provider ? { instance: S.provider, fields: [] } : null;

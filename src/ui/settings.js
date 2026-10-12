@@ -65,6 +65,13 @@ async function showSettings() {
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
     id('set-post-sessions-row').style.display = provider?.sessions ? '' : 'none';
     id('set-account-row').style.display = provider ? '' : 'none';
+    const providerRow = id('set-provider-status');
+    providerRow.style.display = providerStatus.state === 'none' ? 'none' : '';
+    const providerText = id('set-provider-status-text');
+    providerText.textContent = providerStatus.state === 'unavailable'
+      ? t('provider_unavailable', { reason: providerStatus.reason })
+      : [providerStatus.name, providerStatus.build].filter(Boolean).join(' ');
+    providerText.classList.toggle('warn', providerStatus.state === 'unavailable');
     renderProviderSettings();
     const fields = (provider?.fields || []).slice().sort((a, b) => a.order - b.order);
     const hiddenTabs = chartHiddenGroups();

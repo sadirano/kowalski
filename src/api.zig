@@ -37,9 +37,17 @@ pub const App = struct {
     stop_requested: bool = false,
     /// Binding instance of the compiled-in provider; null without one.
     provider: ?[]const u8 = null,
+    provider_status: ProviderStatus = .{},
     /// The provider's static traits; empty without one.
     traits: Traits = .{},
     running_post: ?*const fn () ?i64 = null,
+};
+
+pub const ProviderStatus = struct {
+    state: enum { none, loaded, unavailable } = .none,
+    name: []const u8 = "",
+    build: []const u8 = "",
+    reason: []const u8 = "",
 };
 
 const SessionRecord = struct { id: i64, session: sessions.Session };
@@ -234,7 +242,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return bindTask(app, a, id, req.body);
     }
     if (is(req, .GET, path, "/api/provider")) {
-        if (app.provider == null) return send(a, .ok, .{ .instance = null, .fields = [_]u8{}, .settings = [_]u8{}, .post_options = [_]u8{}, .sessions = false });
+        if (app.provider == null) return send(a, .ok, .{ .instance = null, .fields = [_]u8{}, .settings = [_]u8{}, .post_options = [_]u8{}, .sessions = false, .status = app.provider_status });
         return .{ .status = .ok, .body = "", .followup = .fields };
     }
     if (is(req, .GET, path, "/api/postings")) return offers(app, a, try param(a, params, "date"));
@@ -1459,7 +1467,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
         .fields => {
             if (!succeeded(outcome)) return providerFailure(a, outcome, null);
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, outcome.done.out, .{}) catch return error.ProviderOutput;
-            return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions });
+            return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions, .status = app.provider_status });
         },
         .lookup => |l| {
             if (!succeeded(outcome)) {
@@ -2225,6 +2233,16 @@ test "without a provider posting and binding are refused" {
     try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"instance\":null"));
     try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
     try std.testing.expect(contains(f.call(.POST, "/api/postings", "{\"task\":\"#1\"}").body, "NoProvider"));
+}
+
+test "provider status is included with and without a provider" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"status\":{\"state\":\"none\""));
+    f.app.provider = "fake";
+    f.app.provider_status = .{ .state = .loaded, .name = "Fake", .build = "test" };
+    try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"status\":{\"state\":\"loaded\""));
 }
 
 test "history creates and edits intervals with range and stale checks" {
