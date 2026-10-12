@@ -35,6 +35,20 @@ to stop opening the dashboard on launch. Your data lives in
 command line; [docs/DESIGN.md](docs/DESIGN.md) and [docs/UI.md](docs/UI.md)
 hold the design notes.
 
+## Updates
+
+Use `kowalski update` or **Settings > Advanced > Check for updates** to ask
+GitHub whether a newer release exists. Kowalski contacts GitHub only when
+you request a check. With your confirmation, it downloads the release ZIP,
+checks its size and published SHA-256 when available, copies the database
+before installing the two executables, and restarts the background service.
+
+To go back by hand, download the previous release ZIP and restore its two
+executables. If the new version changed the database schema, restore the
+matching `backup-before-<version>-<date>/` database copy as well. The `.old`
+executables are removed when the updated daemon starts, so use the previous
+release ZIP for a rollback.
+
 ## Providers
 
 The public build tracks tasks locally and needs nothing else. An optional
@@ -63,3 +77,4 @@ Task search was proposed and first built by
 
 MIT, see [LICENSE](LICENSE). The dashboard vendors Chart.js 4.4.0 (MIT)
 under `src/ui/vendor/`, with its license beside it.
+

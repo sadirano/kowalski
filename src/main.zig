@@ -12,6 +12,7 @@ const tour_mod = @import("tour.zig");
 const zone_mod = @import("zone.zig");
 
 test { _ = @import("kowalskiw.zig"); }
+test { _ = @import("update.zig"); }
 
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
 pub fn main(init: std.process.Init) void {

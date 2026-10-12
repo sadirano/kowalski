@@ -66,6 +66,7 @@ async function showSettings() {
     renderProviderControls();
     id('set-zone').value = pref('reporting_zone', '');
     id('set-port').textContent = pref('http_port', location.port || '47100');
+    apiJSON('GET', '/api/version').then(data => { id('set-version').textContent = data.version; }).catch(e => showError(e.message));
     renderPaidRows(false);
     renderLockRows(false);
     _settingsLoaded = true;
@@ -200,23 +201,80 @@ async function restartKowalski() {
   banner.textContent = t('restarting');
   banner.classList.add('show');
   try {
+    const before = (await apiJSON('GET', '/api/version')).pid;
     await apiJSON('POST', '/api/restart');
-    let oldDaemonStopped = false;
-    for (let attempt = 0; attempt < 80; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      try {
-        await apiJSON('GET', '/api/state');
-        if (oldDaemonStopped) { location.reload(); return; }
-      } catch (_) {
-        oldDaemonStopped = true;
-      }
-    }
-    banner.textContent = t('restart_failed');
+    await waitForDaemon(before);
   } catch (e) {
     banner.classList.remove('show');
     showError(e.message);
   } finally {
     _restarting = false;
+  }
+}
+
+// A restart can finish between two polls, so wait for a different process
+// to answer rather than for the old one to go quiet.
+async function waitForDaemon(before) {
+  const banner = id('restart-banner');
+  banner.textContent = t('restarting');
+  for (let attempt = 0; attempt < 80; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    try {
+      if ((await apiJSON('GET', '/api/version')).pid !== before) { location.reload(); return; }
+    } catch (_) { /* down between the two daemons */ }
+  }
+  banner.textContent = t('restart_failed');
+}
+
+let _updateRelease = null;
+let _updateConfirm = false;
+let _updateBusy = false;
+async function checkKowalskiUpdate() {
+  if (_updateBusy) return;
+  _updateBusy = true;
+  id('update-check').disabled = true;
+  try {
+    const result = await apiJSON('GET', '/api/update');
+    _updateRelease = result.state === 'available' ? result : null;
+    _updateConfirm = false;
+    id('update-result').style.display = 'flex';
+    id('update-message').textContent = _updateRelease
+      ? t('update_available', { v: result.version, c: result.current })
+      : t('update_latest', { v: result.version });
+    const notes = id('update-notes');
+    const safeNotes = _updateRelease && /^https:\/\/github\.com\/sadirano\/kowalski\/releases\//.test(result.notes_url);
+    notes.style.display = safeNotes ? '' : 'none';
+    if (safeNotes) notes.href = result.notes_url;
+    id('update-install').style.display = _updateRelease ? '' : 'none';
+    id('update-install').textContent = t('update_install');
+  } catch (e) { showError(e.message); }
+  finally { _updateBusy = false; id('update-check').disabled = false; }
+}
+
+async function installKowalskiUpdate() {
+  if (!_updateRelease || _updateBusy || _restarting) return;
+  if (!_updateConfirm) {
+    _updateConfirm = true;
+    id('update-install').textContent = t('update_confirm');
+    return;
+  }
+  _updateBusy = true;
+  id('update-install').disabled = true;
+  const banner = id('restart-banner');
+  banner.textContent = t('updating');
+  banner.classList.add('show');
+  try {
+    const before = (await apiJSON('GET', '/api/version')).pid;
+    await apiJSON('POST', '/api/update', { version: _updateRelease.version });
+    await waitForDaemon(before);
+  } catch (e) {
+    banner.classList.remove('show');
+    showError(e.message);
+  } finally {
+    _updateBusy = false;
+    id('update-install').disabled = false;
+    _updateConfirm = false;
+    id('update-install').textContent = t('update_install');
   }
 }
 

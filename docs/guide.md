@@ -216,6 +216,18 @@ the task's time, the days it was worked on (click one to open it) and a ▶
 to switch to it. `↑` and `↓` browse, `Enter` opens the latest day. The
 last row starts a new task with what you typed.
 
+## Updates
+
+To check for a newer kowalski release, run `kowalski update` or use
+**Settings > Advanced > Check for updates**. Kowalski contacts GitHub only
+when you ask. If you approve an update, it downloads the Windows release ZIP,
+checks its size and the published SHA-256 when available, copies the database
+to a `backup-before-<version>-<date>/` folder, replaces the executables, and
+restarts. To return to the previous release, download that release ZIP and
+restore its executables. Restore the matching database copy too if the new
+version upgraded its schema. The `.old` executables are deleted on the next
+start.
+
 ## Attaching a provider
 
 Drop one provider DLL directly in the `providers` folder next to the

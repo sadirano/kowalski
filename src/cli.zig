@@ -45,6 +45,7 @@ pub const usage =
     \\  resolve <posting> posted|not-posted     settle a posting whose outcome is unknown
     \\  shutdown                     stop the daemon
     \\  restart                      restart the daemon to load an approved provider
+    \\  update [--yes]               check for a newer release and optionally install it
     \\  demo [--lang en|pt|ja] [--at YYYY-MM-DDTHH:MM] [--port N]
     \\                               fill an empty database with made-up history
     \\
@@ -661,22 +662,83 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
     }
     if (eql(u8, command, "restart")) {
         if (args.len != 0) return error.Usage;
+        const before = daemonPid(ctx);
         const reply = try call(ctx, "POST", "/api/restart", "");
-        _ = try settle(ctx, reply);
-        var stopped = false;
-        for (0..70) |_| {
-            try ctx.io.sleep(.fromMilliseconds(500), .awake);
-            const answering = ping(ctx);
-            if (!answering) stopped = true;
-            if (stopped and answering) {
-                if (!ctx.json) try ctx.out.writeAll("daemon restarted\n");
+        if (!try settle(ctx, reply)) return .failed;
+        return waitForRestart(ctx, before);
+    }
+    if (eql(u8, command, "update")) {
+        if (args.len > 1 or (args.len == 1 and !eql(u8, args[0], "--yes"))) return error.Usage;
+        const yes = args.len == 1;
+        const reply = try call(ctx, "GET", "/api/update", null);
+        if (!try settle(ctx, reply)) return .ok;
+        const info = try parse(struct { state: []const u8, version: []const u8, current: []const u8 = "", notes_url: []const u8 = "" }, ctx, reply.body);
+        if (eql(u8, info.state, "up_to_date")) {
+            try ctx.out.print("up to date ({s})\n", .{info.version});
+            return .ok;
+        }
+        if (!eql(u8, info.state, "available")) return error.BadResponse;
+        if (!yes) {
+            const input = GetStdHandle(0xfffffff6) orelse {
+                try ctx.out.print("{s} is available (current {s})\n", .{ info.version, info.current });
+                try asciiLine(ctx.out, info.notes_url);
+                try ctx.out.writeAll("run kowalski update --yes to install\n");
+                return .ok;
+            };
+            var mode: u32 = 0;
+            if (GetConsoleMode(input, &mode) == 0) {
+                try ctx.out.print("{s} is available (current {s})\n", .{ info.version, info.current });
+                try asciiLine(ctx.out, info.notes_url);
+                try ctx.out.writeAll("run kowalski update --yes to install\n");
                 return .ok;
             }
+            // The normal output buffer is flushed by main after this returns;
+            // print the prompt directly so it is visible while waiting.
+            var prompt: Io.Writer.Allocating = .init(ctx.a);
+            try prompt.writer.print("{s} is available (current {s})\n", .{ info.version, info.current });
+            try asciiLine(&prompt.writer, info.notes_url);
+            try prompt.writer.writeAll("Install it now? [y/N] ");
+            try Io.File.stdout().writeStreamingAll(ctx.io, prompt.written());
+            var answer_buffer: [16]u8 = undefined;
+            const answer = try readLine(input, &answer_buffer);
+            if (!std.ascii.eqlIgnoreCase(answer, "y") and !std.ascii.eqlIgnoreCase(answer, "yes")) return .ok;
+        } else {
+            try ctx.out.print("{s} is available (current {s})\n", .{ info.version, info.current });
+            try asciiLine(ctx.out, info.notes_url);
         }
-        try ctx.err.writeAll("kowalski: daemon did not restart within 35 s (run kowalski start)\n");
-        return .failed;
+        const before = daemonPid(ctx);
+        const installed = try call(ctx, "POST", "/api/update", try jsonBody(ctx, .{ .version = info.version }));
+        if (!try settle(ctx, installed)) return .failed;
+        return waitForRestart(ctx, before);
     }
     return error.Usage;
+}
+
+fn asciiLine(w: *Io.Writer, bytes: []const u8) !void {
+    for (bytes) |c| try w.writeByte(if (std.ascii.isPrint(c)) c else '?');
+    try w.writeByte('\n');
+}
+
+/// The process id of the daemon answering now, or null when none answers.
+fn daemonPid(ctx: *Context) ?u32 {
+    const reply = call(ctx, "GET", "/api/version", null) catch return null;
+    if (reply.status != 200) return null;
+    const r = parse(struct { pid: u32 }, ctx, reply.body) catch return null;
+    return r.pid;
+}
+
+/// Done when a different daemon answers: a restart can finish between polls.
+fn waitForRestart(ctx: *Context, before: ?u32) !Exit {
+    for (0..70) |_| {
+        try ctx.io.sleep(.fromMilliseconds(500), .awake);
+        const now = daemonPid(ctx) orelse continue;
+        if (before == null or now != before.?) {
+            if (!ctx.json) try ctx.out.writeAll("daemon restarted\n");
+            return .ok;
+        }
+    }
+    try ctx.err.writeAll("kowalski: daemon did not restart within 35 s (run kowalski start)\n");
+    return .failed;
 }
 
 fn isDate(text: []const u8) bool {

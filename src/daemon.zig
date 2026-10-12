@@ -15,6 +15,7 @@ const provider_loader = @import("provider_loader.zig");
 const tour_mod = @import("tour.zig");
 const demo = @import("demo.zig");
 const launch = @import("launch.zig");
+const update = @import("update.zig");
 
 extern "kernel32" fn CreateMutexW(attributes: ?*anyopaque, initial_owner: i32, name: [*:0]const u16) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
@@ -255,6 +256,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     var accept_future = try io.concurrent(acceptLoop, .{ &d, &listener, &connections });
     var heartbeat_future = try io.concurrent(heartbeatLoop, .{&d});
     log("listening on http://127.0.0.1:{d} (database {s})", .{ port, options.db_path });
+    update.cleanup(gpa, io, options.db_path) catch |err| log("update cleanup failed: {s}", .{@errorName(err)});
 
     d.stop.waitUncancelable(io);
 
@@ -602,6 +604,42 @@ fn restartCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.R
     return api.answer(a, .ok, .{ .restarting = true });
 }
 
+fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
+    const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
+    if (!std.mem.eql(u8, path, "/api/update")) return null;
+    if (api.updateRefused(d.app.port, a, request)) |r| return r;
+    const fetcher: update.Fetcher = .{ .context = @ptrCast(d), .get = update.httpGet };
+    if (request.method == .GET) {
+        const result = update.check(a, d.io, fetcher) catch |err| {
+            log("update check failed: {s}", .{@errorName(err)});
+            return api.answer(a, .bad_gateway, .{ .@"error" = "update_check", .message = @errorName(err) });
+        };
+        return switch (result) {
+            .up_to_date => api.answer(a, .ok, .{ .state = "up_to_date", .version = update.current_version }),
+            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest }),
+        };
+    }
+    if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
+    const Body = struct { version: []const u8 };
+    const body = std.json.parseFromSliceLeaky(Body, a, request.body, .{ .ignore_unknown_fields = true }) catch
+        return api.answer(a, .bad_request, .{ .@"error" = "body" });
+    if (update.parseVersion(body.version) == null) return api.answer(a, .bad_request, .{ .@"error" = "version" });
+    const swap = update.install(a, d.io, fetcher, d.app.store.db, d.db_path, body.version) catch |err| {
+        log("update install failed: {s}", .{@errorName(err)});
+        return api.answer(a, .internal_server_error, .{ .@"error" = "update_install", .message = @errorName(err) });
+    };
+    const command = launch.backgroundCommand(a, d.db_path, GetCurrentProcessId()) catch |err| {
+        swap.rollback(a, d.io);
+        return api.answer(a, .internal_server_error, .{ .@"error" = "restart_spawn", .message = @errorName(err) });
+    };
+    launch.spawn(a, command) catch |err| {
+        swap.rollback(a, d.io);
+        return api.answer(a, .internal_server_error, .{ .@"error" = "restart_spawn", .message = @errorName(err) });
+    };
+    d.app.stop_requested = true;
+    return api.answer(a, .ok, .{ .restarting = true });
+}
+
 fn acceptLoop(d: *Daemon, listener: *Io.net.Server, connections: *Io.Group) Io.Cancelable!void {
     while (true) {
         const stream = listener.accept(d.io) catch |err| switch (err) {
@@ -773,6 +811,7 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
         defer d.mutex.unlock(d.io);
         if (tourCommand(d, a, request)) |r| break :blk r;
         if (restartCommand(d, a, request)) |r| break :blk r;
+        if (updateCommand(d, a, request)) |r| break :blk r;
         if (providerCommand(d, a, request)) |r| break :blk r;
         break :blk api.handle(&d.app, a, request);
     };

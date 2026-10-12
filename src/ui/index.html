@@ -201,6 +201,11 @@
         <div class="set-ctl"><span class="set-ro" id="set-port"></span></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="restart_btn">Restart kowalski</span><small data-i18n="restart_hint">Stops and starts the background service, for example to load a newly approved provider.</small></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="restartKowalski()" data-i18n="restart_btn">Restart kowalski</button></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="update_check">Check for updates</span><small><span data-i18n="update_version">Current version</span>: <span id="set-version">...</span></small></div>
+        <div class="set-ctl"><button type="button" class="set-btn" id="update-check" onclick="checkKowalskiUpdate()" data-i18n="update_check">Check for updates</button></div></div>
+      <div class="update-result" id="update-result" style="display:none"><span id="update-message"></span>
+        <a id="update-notes" target="_blank" rel="noopener noreferrer" data-i18n="update_notes" style="display:none">Release notes</a>
+        <button type="button" class="set-btn" id="update-install" onclick="installKowalskiUpdate()" data-i18n="update_install" style="display:none">Update and restart</button></div>
     </details>
   </div>
   <div class="set-foot">

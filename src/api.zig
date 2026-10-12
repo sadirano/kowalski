@@ -11,6 +11,8 @@ const zone = @import("zone.zig");
 const query = @import("query.zig");
 const worker = @import("worker.zig");
 const sessions = @import("sessions.zig");
+/// Tells the dashboard which daemon answers, so it can see a restart finish.
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 const Store = store_mod.Store;
 
 pub const default_port: u16 = 47100;
@@ -186,6 +188,13 @@ pub fn refused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
     return null;
 }
 
+/// Update checks are explicit user actions, so even GET requires the marker.
+pub fn updateRefused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
+    if (refused(port, a, req)) |r| return r;
+    if (!req.marker) return fail(a, .{ .status = .forbidden, .code = "header", .message = "update requests need X-Kowalski: 1" });
+    return null;
+}
+
 /// A JSON answer, for the routes the daemon itself serves.
 pub fn answer(a: std.mem.Allocator, status: std.http.Status, value: anytype) Response {
     return send(a, status, value);
@@ -205,6 +214,7 @@ fn is(req: Request, method: std.http.Method, path: []const u8, want: []const u8)
 
 fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !Response {
     if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true });
+    if (is(req, .GET, path, "/api/version")) return send(a, .ok, .{ .version = @import("build_options").version, .pid = GetCurrentProcessId() });
     if (try history(app, a, req, path)) |r| return r;
     if (is(req, .GET, path, "/api/search")) return search(app, a, params);
     if (is(req, .GET, path, "/api/daytotals")) return dayTotals(app, a, params);
@@ -1708,6 +1718,8 @@ test "requests need loopback host, marker and same origin" {
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .GET, .target = "/api/health", .host = "127.0.0.1:47101" }).status);
     try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, .{ .method = .GET, .target = "/api/health", .host = "localhost:47100" }).status);
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .POST, .target = "/api/pause", .host = "127.0.0.1:47100" }).status);
+    try std.testing.expectEqual(std.http.Status.forbidden, updateRefused(f.app.port, a, .{ .method = .GET, .target = "/api/update", .host = "127.0.0.1:47100" }).?.status);
+    try std.testing.expectEqual(std.http.Status.forbidden, updateRefused(f.app.port, a, .{ .method = .POST, .target = "/api/update", .host = "127.0.0.1:47100" }).?.status);
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .POST, .target = "/api/restart", .host = "127.0.0.1:47100" }).status);
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .POST, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true, .origin = "http://evil.test" }).status);
     try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, .{ .method = .POST, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true, .origin = "http://127.0.0.1:47100" }).status);
