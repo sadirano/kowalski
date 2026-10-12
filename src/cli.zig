@@ -347,6 +347,10 @@ fn settle(ctx: *Context, reply: Reply) !bool {
         try ctx.err.print("kowalski: HTTP {d}\n", .{reply.status});
         return error.Reported;
     };
+    if (std.mem.eql(u8, f.@"error", "update_unsigned") or std.mem.eql(u8, f.@"error", "update_bad_signature")) {
+        try ctx.err.print("kowalski: {s}\n", .{f.message});
+        return error.Reported;
+    }
     try ctx.err.print("kowalski: {s}", .{f.@"error"});
     if (f.message.len > 0) try ctx.err.print(": {s}", .{f.message});
     try ctx.err.writeAll("\n");
@@ -672,12 +676,16 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         const yes = args.len == 1;
         const reply = try call(ctx, "GET", "/api/update", null);
         if (!try settle(ctx, reply)) return .ok;
-        const info = try parse(struct { state: []const u8, version: []const u8, current: []const u8 = "", notes_url: []const u8 = "" }, ctx, reply.body);
+        const info = try parse(struct { state: []const u8, version: []const u8, current: []const u8 = "", notes_url: []const u8 = "", signed: bool = false }, ctx, reply.body);
         if (eql(u8, info.state, "up_to_date")) {
             try ctx.out.print("up to date ({s})\n", .{info.version});
             return .ok;
         }
         if (!eql(u8, info.state, "available")) return error.BadResponse;
+        if (!info.signed) {
+            try ctx.out.writeAll("this release is not signed; kowalski will not install it\n");
+            return .ok;
+        }
         if (!yes) {
             const input = GetStdHandle(0xfffffff6) orelse {
                 try ctx.out.print("{s} is available (current {s})\n", .{ info.version, info.current });

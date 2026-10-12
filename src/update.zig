@@ -7,6 +7,11 @@ const launch = @import("launch.zig");
 
 pub const current_version = @import("build_options").version;
 pub const releases_url = "https://api.github.com/repos/sadirano/kowalski/releases/latest";
+pub const release_public_key: [32]u8 = blk: {
+    var key: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&key, "6434b476d6f442042c85deeeb428620ee428a34dddbab545a183908a738c04b8") catch unreachable;
+    break :blk key;
+};
 
 pub const Version = struct { major: u32, minor: u32, patch: u32 };
 pub fn parseVersion(text: []const u8) ?Version {
@@ -33,8 +38,11 @@ pub const Release = struct {
     version: []const u8,
     notes_url: []const u8,
     download_url: []const u8,
+    asset_name: []const u8 = "",
     size: u64,
     digest: ?[]const u8,
+    signature_url: ?[]const u8 = null,
+    signed: bool = false,
 };
 pub const Check = union(enum) { up_to_date, available: Release };
 
@@ -47,6 +55,15 @@ pub fn parseRelease(a: std.mem.Allocator, bytes: []const u8) !Check {
     const name = try std.fmt.allocPrint(a, "kowalski-{s}-windows-x86_64.zip", .{tag});
     const assets = root.object.get("assets") orelse return error.BadRelease;
     if (assets != .array) return error.BadRelease;
+    const signature_name = try std.fmt.allocPrint(a, "{s}.sig", .{name});
+    var signature_url: ?[]const u8 = null;
+    for (assets.array.items) |asset| {
+        if (asset != .object) continue;
+        const asset_name = asset.object.get("name") orelse continue;
+        if (asset_name != .string or !std.mem.eql(u8, asset_name.string, signature_name)) continue;
+        const url = asset.object.get("browser_download_url") orelse continue;
+        if (url == .string) signature_url = url.string;
+    }
     for (assets.array.items) |asset| {
         if (asset != .object) continue;
         const asset_name = asset.object.get("name") orelse continue;
@@ -61,8 +78,11 @@ pub fn parseRelease(a: std.mem.Allocator, bytes: []const u8) !Check {
             .version = try a.dupe(u8, if (std.mem.startsWith(u8, tag, "v")) tag[1..] else tag),
             .notes_url = notes.string,
             .download_url = url.string,
+            .asset_name = name,
             .size = @intCast(size.integer),
             .digest = digest,
+            .signature_url = signature_url,
+            .signed = signature_url != null,
         } };
     }
     return .up_to_date;
@@ -110,6 +130,25 @@ pub fn validDownload(bytes: []const u8, release: Release) !void {
         _ = std.fmt.hexToBytes(&expected, digest[7..]) catch return error.BadDigest;
         if (!std.mem.eql(u8, &hash, &expected)) return error.UpdateDigestMismatch;
     }
+}
+
+pub fn signedMessage(a: std.mem.Allocator, asset_name: []const u8, hash: [32]u8) ![]u8 {
+    return std.fmt.allocPrint(a, "kowalski-release-v1\n{s}\n{x}\n", .{ asset_name, &hash });
+}
+
+pub fn verifySignature(a: std.mem.Allocator, asset_name: []const u8, zip: []const u8, signature_text: []const u8, public_key: [32]u8) !void {
+    if (signature_text.len != 129 or signature_text[128] != '\n') return error.BadSignature;
+    for (signature_text[0..128]) |c| {
+        if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.BadSignature;
+    }
+    var sig_bytes: [64]u8 = undefined;
+    _ = std.fmt.hexToBytes(&sig_bytes, signature_text[0..128]) catch return error.BadSignature;
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(zip, &hash, .{});
+    const message = try signedMessage(a, asset_name, hash);
+    defer a.free(message);
+    const key = std.crypto.sign.Ed25519.PublicKey.fromBytes(public_key) catch return error.BadSignature;
+    std.crypto.sign.Ed25519.Signature.fromBytes(sig_bytes).verify(message, key) catch return error.BadSignature;
 }
 
 fn join(a: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
@@ -241,10 +280,14 @@ pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db: *sqlite.Db, d
         .available => |r| r,
     };
     if (!std.mem.eql(u8, version, release.version)) return error.UpdateChanged;
+    const signature_url = release.signature_url orelse return error.UnsignedRelease;
     if (!std.mem.startsWith(u8, release.download_url, "https://")) return error.BadRelease;
+    if (!std.mem.startsWith(u8, signature_url, "https://")) return error.BadRelease;
     if (release.size > 256 * 1024 * 1024) return error.UpdateTooLarge;
+    const signature = try fetcher.get(fetcher.context, a, io, signature_url, true, 1024);
     const bytes = try fetcher.get(fetcher.context, a, io, release.download_url, true, @intCast(release.size));
     try validDownload(bytes, release);
+    try verifySignature(a, release.asset_name, bytes, signature, release_public_key);
     const root = std.fs.path.dirname(db_path) orelse ".";
     const update_dir = try join(a, &.{ root, "update" });
     const stage = try join(a, &.{ update_dir, version });
@@ -286,8 +329,63 @@ test "release selects exact asset and rejects missing asset" {
     defer arena.deinit();
     const result = try parseRelease(arena.allocator(), json);
     try std.testing.expectEqualStrings("https://example.test/right", result.available.download_url);
+    try std.testing.expect(!result.available.signed);
     const missing = try parseRelease(arena.allocator(), "{\"tag_name\":\"v0.2.0\",\"assets\":[]}");
     try std.testing.expect(missing == .up_to_date);
+}
+
+test "signed message is byte exact and signature binds ZIP and asset name" {
+    const a = std.testing.allocator;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 7);
+    const key = try Ed25519.KeyPair.generateDeterministic(seed);
+    const zip = "ZIP bytes";
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(zip, &hash, .{});
+    const name = "kowalski-v0.2.0-windows-x86_64.zip";
+    const message = try signedMessage(a, name, hash);
+    defer a.free(message);
+    const expected = "kowalski-release-v1\nkowalski-v0.2.0-windows-x86_64.zip\n701ea42a760110f2b9933887d30ba10418fbaaa1642f2c9ab2a942d8759b8775\n";
+    try std.testing.expectEqualStrings(expected, message);
+    const signature = try key.sign(message, null);
+    const signature_text = try std.fmt.allocPrint(a, "{x}\n", .{&signature.toBytes()});
+    defer a.free(signature_text);
+    const public_key = key.public_key.toBytes();
+    try verifySignature(a, name, zip, signature_text, public_key);
+    try std.testing.expectError(error.BadSignature, verifySignature(a, name, "ZIP byteS", signature_text, public_key));
+    try std.testing.expectError(error.BadSignature, verifySignature(a, "kowalski-v0.3.0-windows-x86_64.zip", zip, signature_text, public_key));
+    try std.testing.expectError(error.BadSignature, verifySignature(a, name, zip, "abc\n", public_key));
+    var invalid: [129]u8 = undefined;
+    @memcpy(&invalid, signature_text);
+    invalid[0] = 'g';
+    try std.testing.expectError(error.BadSignature, verifySignature(a, name, zip, &invalid, public_key));
+}
+
+test "release finds signature asset independently of ZIP order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const json = "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/zip\"},{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip.sig\",\"size\":129,\"browser_download_url\":\"https://example.test/sig\"}]}";
+    const result = try parseRelease(arena.allocator(), json);
+    try std.testing.expect(result.available.signed);
+    try std.testing.expectEqualStrings("https://example.test/sig", result.available.signature_url.?);
+}
+
+test "unsigned release returns before fetching ZIP" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var calls: usize = 0;
+    const fake: Fetcher = .{ .context = &calls, .get = struct {
+        fn get(context: *anyopaque, _: std.mem.Allocator, _: Io, url: []const u8, _: bool, _: usize) ![]const u8 {
+            const count: *usize = @ptrCast(@alignCast(context));
+            count.* += 1;
+            try std.testing.expectEqualStrings(releases_url, url);
+            return "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
+        }
+    }.get };
+    var dummy_db: sqlite.Db = undefined;
+    try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, &dummy_db, "unused.db", "0.2.0"));
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 test "digest mismatch rejects download" {

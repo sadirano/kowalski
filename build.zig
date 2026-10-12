@@ -32,12 +32,25 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run kowalski");
     run_step.dependOn(&run.step);
 
+    const signer = b.addExecutable(.{
+        .name = "kowalski-sign",
+        .root_module = makeModule(b, seams, target, optimize, "tools/sign.zig"),
+    });
+    addSignerImports(b, seams, target, optimize, signer.root_module);
+    const sign_run = b.addRunArtifact(signer);
+    sign_run.addPassthruArgs();
+    const sign_step = b.step("sign", "Sign a release ZIP");
+    sign_step.dependOn(&sign_run.step);
+
     const tests = b.addTest(.{
         .root_module = makeModule(b, seams, target, optimize, "src/main.zig"),
     });
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_run.step);
+    const signer_tests = b.addTest(.{ .root_module = makeModule(b, seams, target, optimize, "tools/sign.zig") });
+    addSignerImports(b, seams, target, optimize, signer_tests.root_module);
+    test_step.dependOn(&b.addRunArtifact(signer_tests).step);
     const contract_tests = b.addTest(.{ .root_module = makeModule(b, seams, target, optimize, "src/provider_check_test.zig") });
     contract_tests.root_module.addImport("kowalski_provider_check", provider_check);
     const example_module = b.createModule(.{ .root_source_file = b.path("examples/provider.zig"), .target = target, .optimize = optimize });
@@ -51,6 +64,11 @@ pub fn build(b: *std.Build) void {
     const example_step = b.step("example-provider", "Build and install the example provider DLL");
     const install_example = b.addInstallArtifact(example_dll, .{});
     example_step.dependOn(&install_example.step);
+}
+
+fn addSignerImports(b: *std.Build, seams: Seams, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, module: *std.Build.Module) void {
+    module.addImport("release_update", makeModule(b, seams, target, optimize, "src/update.zig"));
+    module.addImport("release_paths", b.createModule(.{ .root_source_file = b.path("src/paths.zig"), .target = target, .optimize = optimize }));
 }
 
 const Seams = struct {

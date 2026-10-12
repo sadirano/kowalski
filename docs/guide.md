@@ -220,8 +220,8 @@ last row starts a new task with what you typed.
 
 To check for a newer kowalski release, run `kowalski update` or use
 **Settings > Advanced > Check for updates**. Kowalski contacts GitHub only
-when you ask. If you approve an update, it downloads the Windows release ZIP,
-checks its size and the published SHA-256 when available, copies the database
+when you ask. Unsigned releases are refused. If you approve an update, it downloads the Windows release ZIP,
+checks its signature, size and the published SHA-256 when available, copies the database
 to a `backup-before-<version>-<date>/` folder, replaces the executables, and
 restarts. To return to the previous release, download that release ZIP and
 restore its executables. Restore the matching database copy too if the new

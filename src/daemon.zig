@@ -616,7 +616,7 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
         };
         return switch (result) {
             .up_to_date => api.answer(a, .ok, .{ .state = "up_to_date", .version = update.current_version }),
-            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest }),
+            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest, .signed = release.signed }),
         };
     }
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
@@ -626,7 +626,17 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
     if (update.parseVersion(body.version) == null) return api.answer(a, .bad_request, .{ .@"error" = "version" });
     const swap = update.install(a, d.io, fetcher, d.app.store.db, d.db_path, body.version) catch |err| {
         log("update install failed: {s}", .{@errorName(err)});
-        return api.answer(a, .internal_server_error, .{ .@"error" = "update_install", .message = @errorName(err) });
+        const message: []const u8 = switch (err) {
+            error.UnsignedRelease => "this release is not signed; kowalski will not install it",
+            error.BadSignature => "The release signature does not match; kowalski did not install it.",
+            else => @errorName(err),
+        };
+        const code: []const u8 = switch (err) {
+            error.UnsignedRelease => "update_unsigned",
+            error.BadSignature => "update_bad_signature",
+            else => "update_install",
+        };
+        return api.answer(a, .internal_server_error, .{ .@"error" = code, .message = message });
     };
     const command = launch.backgroundCommand(a, d.db_path, GetCurrentProcessId()) catch |err| {
         swap.rollback(a, d.io);

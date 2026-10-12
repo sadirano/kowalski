@@ -239,20 +239,20 @@ async function checkKowalskiUpdate() {
     _updateConfirm = false;
     id('update-result').style.display = 'flex';
     id('update-message').textContent = _updateRelease
-      ? t('update_available', { v: result.version, c: result.current })
+      ? (result.signed ? t('update_available', { v: result.version, c: result.current }) : t('update_unsigned'))
       : t('update_latest', { v: result.version });
     const notes = id('update-notes');
     const safeNotes = _updateRelease && /^https:\/\/github\.com\/sadirano\/kowalski\/releases\//.test(result.notes_url);
     notes.style.display = safeNotes ? '' : 'none';
     if (safeNotes) notes.href = result.notes_url;
-    id('update-install').style.display = _updateRelease ? '' : 'none';
+    id('update-install').style.display = _updateRelease && result.signed ? '' : 'none';
     id('update-install').textContent = t('update_install');
   } catch (e) { showError(e.message); }
   finally { _updateBusy = false; id('update-check').disabled = false; }
 }
 
 async function installKowalskiUpdate() {
-  if (!_updateRelease || _updateBusy || _restarting) return;
+  if (!_updateRelease || !_updateRelease.signed || _updateBusy || _restarting) return;
   if (!_updateConfirm) {
     _updateConfirm = true;
     id('update-install').textContent = t('update_confirm');
@@ -269,7 +269,8 @@ async function installKowalskiUpdate() {
     await waitForDaemon(before);
   } catch (e) {
     banner.classList.remove('show');
-    showError(e.message);
+    showError(e.data?.error === 'update_bad_signature' ? t('update_bad_signature')
+      : e.data?.error === 'update_unsigned' ? t('update_unsigned') : e.message);
   } finally {
     _updateBusy = false;
     id('update-install').disabled = false;

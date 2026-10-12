@@ -11,13 +11,18 @@ pub const root_name = "sadirano";
 pub const tool_name = "kowalski";
 pub const db_name = "kowalski.db";
 
-/// `<Roaming AppData>\sadirano\kowalski`, from the Windows known-folder API.
-pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
+/// The Roaming AppData folder from the Windows known-folder API.
+pub fn roamingAppData(allocator: std.mem.Allocator) ![]u8 {
     var wide: ?[*:0]u16 = null;
     const hr = SHGetKnownFolderPath(&folder_roaming_app_data, 0, null, &wide);
     defer CoTaskMemFree(wide);
     if (hr != 0 or wide == null) return error.KnownFolder;
-    const base = try std.unicode.utf16LeToUtf8Alloc(allocator, std.mem.span(wide.?));
+    return std.unicode.utf16LeToUtf8Alloc(allocator, std.mem.span(wide.?));
+}
+
+/// `<Roaming AppData>\sadirano\kowalski`, from the Windows known-folder API.
+pub fn dataDir(allocator: std.mem.Allocator) ![]u8 {
+    const base = try roamingAppData(allocator);
     defer allocator.free(base);
     return std.fs.path.join(allocator, &.{ base, root_name, tool_name });
 }

@@ -40,7 +40,7 @@ hold the design notes.
 Use `kowalski update` or **Settings > Advanced > Check for updates** to ask
 GitHub whether a newer release exists. Kowalski contacts GitHub only when
 you request a check. With your confirmation, it downloads the release ZIP,
-checks its size and published SHA-256 when available, copies the database
+checks its signature, size and published SHA-256 when available, copies the database
 before installing the two executables, and restarts the background service.
 
 To go back by hand, download the previous release ZIP and restore its two
