@@ -10,15 +10,11 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').cat
   const [settingsResult, currentResult, providerResult] = await Promise.allSettled([
     loadSettings(),
     loadCurrent(),
-    apiJSON('GET', '/api/provider'),
+    loadProvider(),
   ]);
   if (settingsResult.status === 'rejected') showError(settingsResult.reason.message);
   if (currentResult.status === 'rejected') showError(currentResult.reason.message);
-  if (providerResult.status === 'fulfilled') {
-    const data = providerResult.value;
-    providerStatus = data.status || providerStatus;
-    provider = data.instance ? data : null;
-  } else {
+  if (providerResult.status === 'rejected') {
     provider = S && S.provider ? { instance: S.provider, fields: [] } : null;
     showError(providerResult.reason.message);
   }
@@ -48,4 +44,14 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').cat
   // smoothly between the 30 s fetches (uses cached data + the current clock).
   setInterval(renderSchedule, 1_000);
 })();
+
+async function loadProvider() {
+  const data = await apiJSON('GET', '/api/provider');
+  providerStatus = data.status || providerStatus;
+  provider = data.instance ? data : null;
+  renderProviderStatus();
+  if (id('settings-popup').classList.contains('show')) renderProviderControls();
+  applyFeatureToggles();
+  return data;
+}
 

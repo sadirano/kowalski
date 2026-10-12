@@ -63,20 +63,7 @@ async function showSettings() {
     id('set-open-launch').checked = pref('ui_open_on_launch', '1') === '1';
     id('set-autofill').checked = pref('ui_autofill_obs', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
-    id('set-post-sessions-row').style.display = provider?.sessions ? '' : 'none';
-    id('set-account-row').style.display = provider ? '' : 'none';
-    const providerRow = id('set-provider-status');
-    providerRow.style.display = providerStatus.state === 'none' ? 'none' : '';
-    const providerText = id('set-provider-status-text');
-    providerText.textContent = providerStatus.state === 'unavailable'
-      ? t('provider_unavailable', { reason: providerStatus.reason })
-      : [providerStatus.name, providerStatus.build].filter(Boolean).join(' ');
-    providerText.classList.toggle('warn', providerStatus.state === 'unavailable');
-    renderProviderSettings();
-    const fields = (provider?.fields || []).slice().sort((a, b) => a.order - b.order);
-    const hiddenTabs = chartHiddenGroups();
-    id('set-chart-tabs-row').style.display = fields.length ? '' : 'none';
-    id('set-chart-tabs').innerHTML = fields.map(f => `<label class="set-sw"><input type="checkbox" class="sw" data-group="${escAttr(f.name)}"${hiddenTabs.includes(f.name) ? '' : ' checked'}><span>${esc(providerLabel(f))}</span></label>`).join('');
+    renderProviderControls();
     id('set-zone').value = pref('reporting_zone', '');
     id('set-port').textContent = pref('http_port', location.port || '47100');
     renderPaidRows(false);
@@ -90,6 +77,119 @@ async function showSettings() {
   id('settings-overlay').classList.add('show');
   id('settings-popup').classList.add('show');
   setTimeout(() => id('set-daily-h').focus(), 50);
+}
+
+function renderProviderControls() {
+  id('set-post-sessions-row').style.display = provider?.sessions ? '' : 'none';
+  id('set-account-row').style.display = provider ? '' : 'none';
+  renderProviderStatus();
+  renderProviderSettings();
+  const fields = (provider?.fields || []).slice().sort((a, b) => a.order - b.order);
+  const hiddenTabs = chartHiddenGroups();
+  id('set-chart-tabs-row').style.display = fields.length ? '' : 'none';
+  id('set-chart-tabs').innerHTML = fields.map(f => `<label class="set-sw"><input type="checkbox" class="sw" data-group="${escAttr(f.name)}"${hiddenTabs.includes(f.name) ? '' : ' checked'}><span>${esc(providerLabel(f))}</span></label>`).join('');
+}
+
+function renderProviderStatus() {
+  id('set-provider-status').style.display = providerStatus.state === 'none' && !providerStatus.candidate ? 'none' : '';
+  const providerText = id('set-provider-status-text');
+  providerText.textContent = providerStatus.state === 'unavailable'
+    ? t('provider_unavailable', { reason: providerStatus.reason })
+    : [providerStatus.name, providerStatus.build].filter(Boolean).join(' ');
+  providerText.classList.toggle('warn', providerStatus.state === 'unavailable');
+  const candidate = providerStatus.candidate;
+  id('set-provider-waiting').textContent = candidate ? t('provider_waiting', { file: candidate.file }) : '';
+  id('set-provider-review').style.display = candidate ? '' : 'none';
+}
+
+let _approvalCandidate = null;
+let _approvalBusy = false;
+let _approvalAcceptArmed = false;
+
+function showProviderApproval() {
+  const candidate = providerStatus.candidate;
+  if (!candidate) return;
+  _approvalCandidate = candidate;
+  _approvalAcceptArmed = false;
+  const modified = new Date(candidate.modified_ms);
+  const size = candidate.size >= 1024 * 1024
+    ? `${(candidate.size / (1024 * 1024)).toLocaleString(locale(), { maximumFractionDigits: 1 })} MB`
+    : `${(candidate.size / 1024).toLocaleString(locale(), { maximumFractionDigits: 1 })} KB`;
+  id('approve-details').innerHTML = `<strong>${esc(candidate.file)}</strong>
+    <span>${esc(t('approve_size'))}: ${esc(size)}</span>
+    <span>${esc(t('approve_modified'))}: ${esc(modified.toLocaleDateString(locale(), { year: 'numeric', month: 'short', day: 'numeric' }))} ${esc(padHHMM(modified))}</span>`;
+  const version = candidate.version || {};
+  const claims = [
+    ['approve_product', version.product_name],
+    ['approve_version', version.file_version],
+    ['approve_company', version.company_name],
+  ].filter(([, value]) => value);
+  id('approve-claims').innerHTML = `<h4>${esc(t('approve_claims'))}</h4>` + claims.map(([key, value]) =>
+    `<div><span>${esc(t(key))}:</span> ${esc(value)}</div>`).join('');
+  id('approve-hash').textContent = candidate.sha256;
+  id('approve-paste').value = '';
+  id('approve-match').textContent = '';
+  id('approve-match').className = 'approve-match';
+  id('approve-compared').disabled = true;
+  id('approve-accept').textContent = t('approve_accept');
+  id('approve-overlay').classList.add('show');
+  id('approve-popup').classList.add('show');
+  setTimeout(() => id('approve-paste').focus(), 50);
+}
+
+function hideProviderApproval() {
+  if (_approvalBusy) return;
+  _approvalCandidate = null;
+  _approvalAcceptArmed = false;
+  id('approve-paste').value = '';
+  id('approve-overlay').classList.remove('show');
+  id('approve-popup').classList.remove('show');
+}
+
+function updateProviderHashMatch() {
+  const pasted = id('approve-paste').value.trim();
+  const matches = !!_approvalCandidate && pasted.toLowerCase() === _approvalCandidate.sha256.toLowerCase();
+  const result = id('approve-match');
+  result.textContent = pasted ? t(matches ? 'approve_match' : 'approve_nomatch') : '';
+  result.className = 'approve-match' + (pasted ? matches ? ' matches' : ' differs' : '');
+  id('approve-compared').disabled = !matches || _approvalBusy;
+}
+
+function trustProviderAsIs() {
+  if (_approvalBusy || !_approvalCandidate) return;
+  if (!_approvalAcceptArmed) {
+    _approvalAcceptArmed = true;
+    id('approve-accept').textContent = t('approve_accept_confirm');
+    return;
+  }
+  applyProviderApproval('accepted');
+}
+
+async function applyProviderApproval(how) {
+  if (_approvalBusy || !_approvalCandidate || (how === 'compared' && id('approve-compared').disabled)) return;
+  _approvalBusy = true;
+  id('approve-compared').disabled = true;
+  id('approve-accept').disabled = true;
+  try {
+    const result = await apiJSON('POST', '/api/provider/approve', { sha256: _approvalCandidate.sha256, how });
+    _approvalBusy = false;
+    hideProviderApproval();
+    await loadProvider();
+    if (result.restart) showToast(t('approve_restart'));
+  } catch (e) {
+    if (e.status === 409) {
+      _approvalBusy = false;
+      hideProviderApproval();
+      try { await loadProvider(); } catch (refreshError) { showError(refreshError.message); return; }
+      showError(t('approve_changed'));
+    } else {
+      showError(e.message);
+    }
+  } finally {
+    _approvalBusy = false;
+    id('approve-accept').disabled = false;
+    updateProviderHashMatch();
+  }
 }
 
 // Settings the provider declares, saved as `provider.<name>`.

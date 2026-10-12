@@ -97,6 +97,8 @@
   .set-sw{display:inline-flex;align-items:center;gap:7px;margin-left:12px;font-size:12.5px;cursor:pointer}
   .set-ro{font:12.5px var(--mono);color:var(--muted);padding:0 9px}
   .set-ro.warn{color:var(--warn)}
+  .set-provider-ctl{flex-direction:column;align-items:flex-end;gap:4px}
+  .set-provider-waiting{font-size:12px;color:var(--warn);text-align:right}
   .set-btn{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;background:none;border:1px solid var(--brd);color:var(--txt);border-radius:4px;font:500 12.5px system-ui,sans-serif;cursor:pointer}
   .set-btn:hover{border-color:var(--acc)}
   .set-foot{display:flex;justify-content:flex-end;align-items:center;gap:10px;padding:12px 24px;border-top:1px solid var(--brd)}
@@ -371,6 +373,19 @@
    pushed off-screen (and unreachable) on a short window. */
   .newtask-popup{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--surf);border:1px solid var(--brd);border-radius:var(--rad);padding:20px 22px;z-index:200;display:none;flex-direction:column;gap:11px;min-width:min(300px,94vw);max-width:94vw;max-height:88vh;overflow:auto;box-shadow:0 12px 32px #0009}
   .newtask-popup.show{display:flex}
+  .approve-overlay{z-index:210}
+  .approve-popup{z-index:211;width:min(520px,94vw)}
+  .approve-details{display:flex;flex-direction:column;gap:4px;font-size:12px}
+  .approve-details strong{font-size:13px;overflow-wrap:anywhere}
+  .approve-claims{font-size:12px;line-height:1.6}
+  .approve-claims h4{margin:0 0 3px;font-size:11px;color:var(--muted)}
+  .approve-claims span{color:var(--muted)}
+  .approve-hash{display:block;padding:9px;background:var(--bg);border:1px solid var(--brd);border-radius:4px;font:12px var(--mono);overflow-wrap:anywhere;user-select:text}
+  .approve-match{min-height:16px;font-size:12px;color:var(--muted)}
+  .approve-match.matches{color:var(--grn)}
+  .approve-match.differs{color:var(--red)}
+  .approve-accept{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
+  .approve-accept small{font-size:11px;line-height:1.4;color:var(--muted)}
   .confirm-overlay{z-index:300}
   .confirm-popup{z-index:301;width:min(420px,94vw)}
   .confirm-text{font-size:13px;line-height:1.5;color:var(--txt)}
@@ -493,7 +508,7 @@
   .cal-cell.has-data::after{content:'';position:absolute;bottom:4px;left:50%;transform:translateX(-50%);width:4px;height:4px;border-radius:50%;background:var(--grn)}
 
 
-  .toast{position:fixed;bottom:20px;right:20px;background:var(--grn);color:#000;padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:200}
+  .toast{position:fixed;bottom:20px;right:20px;background:var(--grn);color:#000;padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:400}
   .toast.show{opacity:1}
   .toast.error{background:var(--red);color:#fff}
 

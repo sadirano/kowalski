@@ -185,7 +185,9 @@
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-post-sessions"></div></div>
       <div id="set-provider-rows"></div>
       <div class="set-row" id="set-provider-status"><div class="set-lbl"><span data-i18n="set_provider">Provider</span></div>
-        <div class="set-ctl"><span class="set-ro" id="set-provider-status-text"></span></div></div>
+        <div class="set-ctl set-provider-ctl"><span class="set-ro" id="set-provider-status-text"></span>
+          <span class="set-provider-waiting" id="set-provider-waiting"></span>
+          <button type="button" class="set-btn" id="set-provider-review" onclick="showProviderApproval()" data-i18n="provider_review" style="display:none">Review</button></div></div>
       <div class="set-row" id="set-account-row"><div class="set-lbl"><span data-i18n="set_account">Provider account</span></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="showLogin()"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span data-i18n="login_submit">Sign in</span></button></div></div>
     </section>
@@ -296,6 +298,21 @@
     <span class="cancel-link" onclick="hideLogin()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
   </div>
 </form>
+<!-- Provider DLL approval -->
+<div class="newtask-overlay approve-overlay" id="approve-overlay" onclick="hideProviderApproval()"></div>
+<div class="newtask-popup approve-popup" id="approve-popup" role="dialog" aria-modal="true" aria-labelledby="approve-title">
+  <h3 id="approve-title" data-i18n="approve_title">Approve provider</h3>
+  <div class="approve-details" id="approve-details"></div>
+  <div class="approve-claims" id="approve-claims"></div>
+  <code class="approve-hash" id="approve-hash"></code>
+  <label><span data-i18n="approve_paste">Paste the hash its publisher gave you</span>
+    <input id="approve-paste" type="text" spellcheck="false" autocomplete="off" oninput="updateProviderHashMatch()"></label>
+  <div class="approve-match" id="approve-match" aria-live="polite"></div>
+  <div class="popup-row"><button type="button" class="apply-btn" id="approve-compared" onclick="applyProviderApproval('compared')" disabled data-i18n="approve_compared">Approve</button>
+    <button type="button" class="cancel-link" onclick="hideProviderApproval()" data-i18n="cancel">Cancel</button></div>
+  <div class="approve-accept"><button type="button" class="cancel-link" id="approve-accept" onclick="trustProviderAsIs()" data-i18n="approve_accept">Trust this file as it is</button>
+    <small data-i18n="approve_accept_hint">Without comparing it to a published hash. Only do this for a file you built or got directly from its publisher.</small></div>
+</div>
 <!-- Keyboard shortcuts cheatsheet (the ? key) -->
 <div class="newtask-overlay" id="keys-overlay" onclick="hideKeys()"></div>
 <div class="newtask-popup keys-popup" id="keys-popup">

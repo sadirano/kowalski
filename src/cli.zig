@@ -546,8 +546,19 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         if (r.status.candidate) |candidate| {
             const safe_file = try ctx.a.dupe(u8, candidate.file);
             for (safe_file) |*c| if (!std.ascii.isPrint(c.*)) { c.* = '?'; };
-            try ctx.out.print("candidate  {s} ({d} bytes, modified {d} ms)\n", .{ safe_file, candidate.size, candidate.modified_ms });
-            try ctx.out.print("claimed product  {s}\nclaimed version  {s}\nclaimed company  {s}\n", .{ candidate.version.product_name, candidate.version.file_version, candidate.version.company_name });
+            const z = try currentZone(ctx);
+            const modified = try z.localOf(candidate.modified_ms);
+            try ctx.out.print("candidate  {s} ({d} bytes, modified {d:0>4}-{d:0>2}-{d:0>2} ", .{ safe_file, candidate.size, modified.year, modified.month, modified.day });
+            try clockTime(ctx.out, &z, candidate.modified_ms);
+            try ctx.out.writeAll(")\n");
+            const version = candidate.version;
+            if (version.product_name.len == 0 and version.file_version.len == 0 and version.company_name.len == 0) {
+                try ctx.out.writeAll("claimed  (none)\n");
+            } else {
+                if (version.product_name.len != 0) try ctx.out.print("claimed product  {s}\n", .{version.product_name});
+                if (version.file_version.len != 0) try ctx.out.print("claimed version  {s}\n", .{version.file_version});
+                if (version.company_name.len != 0) try ctx.out.print("claimed company  {s}\n", .{version.company_name});
+            }
             try ctx.out.print("sha256  {s}\n", .{candidate.sha256});
             try ctx.out.print("approve after comparison: kowalski provider trust {s}\n", .{candidate.sha256});
             try ctx.out.writeAll("accept as is: kowalski provider trust --current\n");
