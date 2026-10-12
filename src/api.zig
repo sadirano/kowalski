@@ -243,7 +243,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return bindTask(app, a, id, req.body);
     }
     if (is(req, .GET, path, "/api/provider")) {
-        if (app.provider == null) return send(a, .ok, .{ .instance = null, .fields = [_]u8{}, .settings = [_]u8{}, .post_options = [_]u8{}, .sessions = false, .status = app.provider_status });
+        if (app.provider == null) return send(a, .ok, .{ .instance = null, .fields = [0]std.json.Value{}, .settings = [0]std.json.Value{}, .post_options = [0]std.json.Value{}, .sessions = false, .status = app.provider_status });
         return .{ .status = .ok, .body = "", .followup = .fields };
     }
     if (is(req, .GET, path, "/api/postings")) return offers(app, a, try param(a, params, "date"));
@@ -838,7 +838,7 @@ fn spreadByDay(a: std.mem.Allocator, z: *const zone.Zone, totals: *std.StringArr
 
 fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     const q = std.mem.trim(u8, try param(a, params, "q") orelse "", " \t");
-    if (q.len == 0) return send(a, .ok, .{ .results = [_]u8{} });
+    if (q.len == 0) return send(a, .ok, .{ .results = [0]std.json.Value{} });
     const limit = try intParam(a, params, "limit", 25, 100) orelse return badRequest(a, "limit");
     const z = try loadZone(app, a);
     const now = app.clock();
@@ -2241,6 +2241,7 @@ test "provider status is included with and without a provider" {
     try f.init();
     defer f.deinit();
     try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"status\":{\"state\":\"none\""));
+    try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"fields\":[],\"settings\":[],\"post_options\":[]"));
     f.app.provider = "fake";
     f.app.provider_status = .{ .state = .loaded, .name = "Fake", .build = "test" };
     try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"status\":{\"state\":\"loaded\""));
