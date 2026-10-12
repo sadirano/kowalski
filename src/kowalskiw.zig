@@ -16,7 +16,13 @@ extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, ms: u32) callco
 extern "kernel32" fn CloseHandle(handle: windows.HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
-const Args = struct { db: ?[]const u8 = null, background: bool = false, after: ?u32 = null };
+const Args = struct { db: ?[]const u8 = null, background: bool = false, after: ?u32 = null, trial: ?[]const u8 = null };
+
+fn validNonce(nonce: []const u8) bool {
+    if (nonce.len != 32) return false;
+    for (nonce) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
 
 fn parseArgs(args: []const []const u8) !Args {
     var result: Args = .{};
@@ -31,6 +37,11 @@ fn parseArgs(args: []const []const u8) !Args {
             const pid = std.fmt.parseInt(u32, args[i + 1], 10) catch return error.Usage;
             if (pid == 0) return error.Usage;
             result.after = pid;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--trial") and i + 1 < args.len and result.trial == null) {
+            if (!validNonce(args[i + 1])) return error.Usage;
+            result.trial = args[i + 1];
+            result.background = true;
             i += 1;
         } else return error.Usage;
     }
@@ -70,7 +81,7 @@ fn run(init: std.process.Init) !void {
     }
     if (!options.background) return opener.openOrAlert(init.io, a, db, options.db);
     const log_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(db) orelse ".", "daemon.log" });
-    try daemon.serve(init.io, init.gpa, .{ .db_path = db, .log_path = log_path });
+    try daemon.serve(init.io, init.gpa, .{ .db_path = db, .log_path = log_path, .trial_nonce = options.trial });
 }
 
 test "parse delayed background start with and without db" {
@@ -82,4 +93,6 @@ test "parse delayed background start with and without db" {
     try std.testing.expectEqualStrings("scratch\\k.db", second.db.?);
     try std.testing.expectEqual(@as(?u32, 123), second.after);
     try std.testing.expectError(error.Usage, parseArgs(&.{ "kowalskiw.exe", "--after", "oops" }));
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", (try parseArgs(&.{ "kowalskiw.exe", "--trial", "0123456789abcdef0123456789abcdef" })).trial.?);
+    try std.testing.expectError(error.Usage, parseArgs(&.{ "kowalskiw.exe", "--trial", "bad" }));
 }

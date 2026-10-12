@@ -35,6 +35,8 @@ pub const App = struct {
     store: *Store,
     port: u16,
     clock: *const fn () i64,
+    trial_nonce: ?[]const u8 = null,
+    trial_ready: bool = false,
     /// Set by POST /api/shutdown; the daemon stops after answering.
     stop_requested: bool = false,
     /// Binding instance of the loaded provider; null without one.
@@ -205,7 +207,44 @@ pub fn handle(app: *App, a: std.mem.Allocator, req: Request) Response {
     const question = std.mem.indexOfScalar(u8, req.target, '?');
     const path = if (question) |at| req.target[0..at] else req.target;
     const params = if (question) |at| req.target[at + 1 ..] else "";
+    if (is(req, .GET, path, "/api/update/ready")) {
+        const nonce = app.trial_nonce orelse return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
+        if (!app.trial_ready) return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
+        return send(a, .ok, .{ .nonce = nonce, .pid = GetCurrentProcessId(), .version = @import("build_options").version });
+    }
+    if (is(req, .POST, path, "/api/update/commit")) {
+        const nonce = app.trial_nonce orelse return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
+        const body = (parseBody(struct { nonce: []const u8 }, a, req.body) catch return badRequest(a, "body")) orelse return badRequest(a, "body");
+        if (!std.mem.eql(u8, nonce, body.nonce)) return .{ .status = .conflict, .body = "{\"error\":\"nonce\"}" };
+        app.trial_nonce = null;
+        return .{ .status = .ok, .body = "{\"committed\":true}" };
+    }
+    if (app.trial_nonce != null and req.method != .GET) return .{ .status = .service_unavailable, .body = "{\"error\":\"updating\"}" };
     return route(app, a, req, path, params) catch |err| errorResponse(a, err);
+}
+
+test "trial gates mutations and commits only matching nonce" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const nonce = "0123456789abcdef0123456789abcdef";
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.GET, "/api/update/ready", "").status);
+    f.app.trial_nonce = nonce;
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.GET, "/api/update/ready", "").status);
+    f.app.trial_ready = true;
+    const ready = f.call(.GET, "/api/update/ready", "");
+    try std.testing.expectEqual(std.http.Status.ok, ready.status);
+    try std.testing.expect(std.mem.indexOf(u8, ready.body, nonce) != null);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.GET, "/api/health", "").status);
+    const gated = f.call(.POST, "/api/pause", "");
+    try std.testing.expectEqual(std.http.Status.service_unavailable, gated.status);
+    try std.testing.expectEqualStrings("{\"error\":\"updating\"}", gated.body);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/update/commit", "{\"nonce\":\"wrong\"}").status);
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, f.arena.allocator(), .{ .method = .POST, .target = "/api/update/commit", .host = "127.0.0.1:47100", .body = "{\"nonce\":\"0123456789abcdef0123456789abcdef\"}" }).status);
+    const committed = f.call(.POST, "/api/update/commit", "{\"nonce\":\"0123456789abcdef0123456789abcdef\"}");
+    try std.testing.expectEqual(std.http.Status.ok, committed.status);
+    try std.testing.expectEqualStrings("{\"committed\":true}", committed.body);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/pause", "").status);
 }
 
 fn is(req: Request, method: std.http.Method, path: []const u8, want: []const u8) bool {

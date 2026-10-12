@@ -39,6 +39,7 @@ const max_log_bytes: i64 = 1024 * 1024;
 
 pub const Options = struct {
     db_path: []const u8,
+    trial_nonce: ?[]const u8 = null,
     /// Append the log here instead of stderr (the windowless daemon has none).
     log_path: ?[]const u8 = null,
 };
@@ -150,6 +151,7 @@ fn onEvent(context: *anyopaque, kind: events.Kind) void {
     }
     d.mutex.lockUncancelable(d.io);
     defer d.mutex.unlock(d.io);
+    if (!shouldHeartbeat(&d.app)) return;
     const now = clock.nowMs();
     const store = d.app.store;
     switch (kind) {
@@ -220,7 +222,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
 
     var traits_arena = std.heap.ArenaAllocator.init(gpa);
     defer traits_arena.deinit();
-    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .running_post = worker.runningPost } };
+    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .running_post = worker.runningPost, .trial_nonce = options.trial_nonce } };
     // The tour's sandbox sits next to the database and never outlives a run.
     const tour_path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", tour_mod.file_name });
     defer gpa.free(tour_path);
@@ -253,10 +255,11 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     };
 
     var connections: Io.Group = .init;
+    d.app.trial_ready = true;
     var accept_future = try io.concurrent(acceptLoop, .{ &d, &listener, &connections });
     var heartbeat_future = try io.concurrent(heartbeatLoop, .{&d});
     log("listening on http://127.0.0.1:{d} (database {s})", .{ port, options.db_path });
-    update.cleanup(gpa, io, options.db_path) catch |err| log("update cleanup failed: {s}", .{@errorName(err)});
+    if (options.trial_nonce == null) update.cleanup(gpa, io, options.db_path) catch |err| log("update cleanup failed: {s}", .{@errorName(err)});
 
     d.stop.waitUncancelable(io);
 
@@ -266,7 +269,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     {
         d.mutex.lockUncancelable(io);
         defer d.mutex.unlock(io);
-        store.onHeartbeat(clock.nowMs()) catch |err| log("final heartbeat failed: {s}", .{@errorName(err)});
+        if (shouldHeartbeat(&d.app)) store.onHeartbeat(clock.nowMs()) catch |err| log("final heartbeat failed: {s}", .{@errorName(err)});
     }
     log("stopped", .{});
     d.stopped.set(io);
@@ -514,9 +517,20 @@ fn heartbeatLoop(d: *Daemon) Io.Cancelable!void {
         try d.io.sleep(.fromMilliseconds(heartbeat_ms), .awake);
         try d.mutex.lock(d.io);
         defer d.mutex.unlock(d.io);
-        d.app.store.onHeartbeat(clock.nowMs()) catch |err| log("heartbeat failed: {s}", .{@errorName(err)});
-        if (d.tour) |t| t.store.onHeartbeat(clock.nowMs()) catch {};
+        if (shouldHeartbeat(&d.app)) {
+            d.app.store.onHeartbeat(clock.nowMs()) catch |err| log("heartbeat failed: {s}", .{@errorName(err)});
+            if (d.tour) |t| t.store.onHeartbeat(clock.nowMs()) catch {};
+        }
     }
+}
+
+fn shouldHeartbeat(app: *const api.App) bool { return app.trial_nonce == null; }
+
+test "trial suppresses heartbeat until commit" {
+    var app: api.App = .{ .store = undefined, .port = 0, .clock = clock.nowMs, .trial_nonce = "0123456789abcdef0123456789abcdef" };
+    try std.testing.expect(!shouldHeartbeat(&app));
+    app.trial_nonce = null;
+    try std.testing.expect(shouldHeartbeat(&app));
 }
 
 /// POST /api/tour/start {"lang":".."} opens a fresh sandbox (replacing any
@@ -820,6 +834,10 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
     }
 
     defer @memset(@constCast(request.body), 0);
+    if (d.app.trial_nonce != null and request.method != .GET and !std.mem.eql(u8, request.target, "/api/update/commit")) {
+        if (api.refused(d.app.port, a, request)) |r| return respond(&req, r.status, r.body);
+        return respond(&req, .service_unavailable, "{\"error\":\"updating\"}");
+    }
     if (in_tour) {
         // The tour's provider answers at once, so it runs under the lock:
         // a finish cannot pull the sandbox out from under it.

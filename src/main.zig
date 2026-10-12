@@ -13,6 +13,9 @@ const zone_mod = @import("zone.zig");
 
 test { _ = @import("kowalskiw.zig"); }
 test { _ = @import("update.zig"); }
+test { _ = @import("update_journal.zig"); }
+test { _ = @import("update_lock.zig"); }
+test { _ = @import("update_snapshot.zig"); }
 
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
 pub fn main(init: std.process.Init) void {
