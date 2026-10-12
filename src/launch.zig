@@ -68,12 +68,16 @@ pub fn exeDir(a: std.mem.Allocator) ![]u8 {
 }
 
 /// The command line that runs the windowless daemon quietly (no browser);
-/// `--db` only when the caller chose a database other than the default.
-pub fn backgroundCommand(a: std.mem.Allocator, db: ?[]const u8) ![]u8 {
+/// `--db` when the caller supplies a path; `--after` waits for an old daemon.
+pub fn backgroundCommand(a: std.mem.Allocator, db: ?[]const u8, after: ?u32) ![]u8 {
     const dir = try exeDir(a);
     const exe = try std.fs.path.join(a, &.{ dir, background_exe });
-    if (db) |path| return std.fmt.allocPrint(a, "\"{s}\" --background --db \"{s}\"", .{ exe, path });
-    return std.fmt.allocPrint(a, "\"{s}\" --background", .{exe});
+    const base = if (db) |path|
+        try std.fmt.allocPrint(a, "\"{s}\" --background --db \"{s}\"", .{ exe, path })
+    else
+        try std.fmt.allocPrint(a, "\"{s}\" --background", .{exe});
+    if (after) |pid| return std.fmt.allocPrint(a, "{s} --after {d}", .{ base, pid });
+    return base;
 }
 
 /// Opens `url` in the default browser.
@@ -146,8 +150,10 @@ test "autostart round trip on a scratch key" {
     defer _ = RegDeleteKeyW(hkey_current_user, scratch_key);
     try removeAutostart(a, scratch);
     try std.testing.expect((try getAutostart(a, scratch)) == null);
-    const command = try backgroundCommand(a, "C:\\data\\k.db");
-    try std.testing.expect(std.mem.endsWith(u8, command, "\\kowalskiw.exe\" --background --db \"C:\\data\\k.db\""));
+    const command = try backgroundCommand(a, "scratch\\k.db", null);
+    try std.testing.expect(std.mem.endsWith(u8, command, "\\kowalskiw.exe\" --background --db \"scratch\\k.db\""));
+    const after = try backgroundCommand(a, "scratch\\k.db", 1234);
+    try std.testing.expect(std.mem.endsWith(u8, after, "\\kowalskiw.exe\" --background --db \"scratch\\k.db\" --after 1234"));
     try setAutostart(a, scratch, command);
     try std.testing.expectEqualStrings(command, (try getAutostart(a, scratch)).?);
     try removeAutostart(a, scratch);

@@ -14,9 +14,11 @@ const contract = @import("kowalski_provider");
 const provider_loader = @import("provider_loader.zig");
 const tour_mod = @import("tour.zig");
 const demo = @import("demo.zig");
+const launch = @import("launch.zig");
 
 extern "kernel32" fn CreateMutexW(attributes: ?*anyopaque, initial_owner: i32, name: [*:0]const u16) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 extern "kernel32" fn CloseHandle(handle: windows.HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn SetConsoleCtrlHandler(?*const fn (u32) callconv(.winapi) i32, i32) callconv(.winapi) i32;
 extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?windows.HANDLE) callconv(.winapi) windows.HANDLE;
@@ -123,6 +125,18 @@ fn openLog(gpa: std.mem.Allocator, path: []const u8) !void {
         if (handle == windows.INVALID_HANDLE_VALUE) return error.LogFile;
     }
     log_file = handle;
+}
+
+/// Log a failed delayed start before the new daemon has opened its own log.
+pub fn logBeforeStart(gpa: std.mem.Allocator, db_path: []const u8, message: []const u8) !void {
+    const path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(db_path) orelse ".", "daemon.log" });
+    defer gpa.free(path);
+    try openLog(gpa, path);
+    defer if (log_file) |file| {
+        log_file = null;
+        _ = CloseHandle(file);
+    };
+    log("{s}", .{message});
 }
 
 fn onEvent(context: *anyopaque, kind: events.Kind) void {
@@ -569,6 +583,25 @@ fn providerCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.
     return api.answer(a, .ok, .{ .restart = restart, .status = d.app.provider_status });
 }
 
+/// Start a successor that waits for this process to release the DLL and mutex.
+/// Called with the database lock held; stopping still happens after the reply.
+fn restartCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
+    const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
+    if (!std.mem.eql(u8, path, "/api/restart")) return null;
+    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
+    const command = launch.backgroundCommand(a, d.db_path, GetCurrentProcessId()) catch |err| {
+        log("restart command failed: {s}", .{@errorName(err)});
+        return api.answer(a, .internal_server_error, .{ .@"error" = "restart_spawn" });
+    };
+    launch.spawn(a, command) catch |err| {
+        log("restart spawn failed: {s}", .{@errorName(err)});
+        return api.answer(a, .internal_server_error, .{ .@"error" = "restart_spawn" });
+    };
+    d.app.stop_requested = true;
+    return api.answer(a, .ok, .{ .restarting = true });
+}
+
 fn acceptLoop(d: *Daemon, listener: *Io.net.Server, connections: *Io.Group) Io.Cancelable!void {
     while (true) {
         const stream = listener.accept(d.io) catch |err| switch (err) {
@@ -739,6 +772,7 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
         try d.mutex.lock(d.io);
         defer d.mutex.unlock(d.io);
         if (tourCommand(d, a, request)) |r| break :blk r;
+        if (restartCommand(d, a, request)) |r| break :blk r;
         if (providerCommand(d, a, request)) |r| break :blk r;
         break :blk api.handle(&d.app, a, request);
     };

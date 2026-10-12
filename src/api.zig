@@ -1708,6 +1708,7 @@ test "requests need loopback host, marker and same origin" {
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .GET, .target = "/api/health", .host = "127.0.0.1:47101" }).status);
     try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, .{ .method = .GET, .target = "/api/health", .host = "localhost:47100" }).status);
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .POST, .target = "/api/pause", .host = "127.0.0.1:47100" }).status);
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .POST, .target = "/api/restart", .host = "127.0.0.1:47100" }).status);
     try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, .{ .method = .POST, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true, .origin = "http://evil.test" }).status);
     try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, .{ .method = .POST, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true, .origin = "http://127.0.0.1:47100" }).status);
     try std.testing.expectEqual(std.http.Status.method_not_allowed, handle(&f.app, a, .{ .method = .PUT, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true }).status);

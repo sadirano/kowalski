@@ -11,6 +11,8 @@ const demo = @import("demo.zig");
 const tour_mod = @import("tour.zig");
 const zone_mod = @import("zone.zig");
 
+test { _ = @import("kowalskiw.zig"); }
+
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
 pub fn main(init: std.process.Init) void {
     const code = run(init) catch |err| blk: {
@@ -103,7 +105,7 @@ fn start(ctx: *cli.Context, db: ?[]const u8) !u8 {
         std.debug.print("kowalski: the daemon is already running\n", .{});
         return 0;
     }
-    try launch.spawn(ctx.a, try launch.backgroundCommand(ctx.a, db));
+    try launch.spawn(ctx.a, try launch.backgroundCommand(ctx.a, db, null));
     for (0..50) |_| {
         try ctx.io.sleep(.fromMilliseconds(100), .awake);
         if (cli.ping(ctx)) {
@@ -120,7 +122,7 @@ fn autostart(init: std.process.Init, db: ?[]const u8, args: []const []const u8) 
     if (args.len > 1) return usageError();
     if (args.len == 1) {
         if (std.mem.eql(u8, args[0], "on")) {
-            try launch.setAutostart(a, launch.run_key, try launch.backgroundCommand(a, db));
+            try launch.setAutostart(a, launch.run_key, try launch.backgroundCommand(a, db, null));
         } else if (std.mem.eql(u8, args[0], "off")) {
             try launch.removeAutostart(a, launch.run_key);
         } else return usageError();

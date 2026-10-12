@@ -226,10 +226,10 @@ file as it is without that comparison, run `kowalski provider trust
 --current`. Both commands require the daemon to be running.
 
 When you drop in a new version, kowalski keeps using the last approved
-version while the new one waits for approval. After approving it, restart
-the daemon to load it. This catches a DLL changed by accident or without
-you noticing; it does not protect against software already running as your
-Windows user.
+version while the new one waits for approval. After approving it, use
+`kowalski restart` or the **Restart now** button in Settings to load it.
+This catches a DLL changed by accident or without you noticing; it does
+not protect against software already running as your Windows user.
 
 ## Post hours
 
@@ -281,6 +281,7 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 - The reporting time zone (a Windows zone name; days start and end at its
   midnight) and the HTTP port, which is changed with `kowalski set
   http_port <n>`.
+- **Restart kowalski** stops and starts the background service.
 
 ## Keyboard shortcuts
 

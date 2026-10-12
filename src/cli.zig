@@ -44,6 +44,7 @@ pub const usage =
     \\                               post a task's focus time for a day
     \\  resolve <posting> posted|not-posted     settle a posting whose outcome is unknown
     \\  shutdown                     stop the daemon
+    \\  restart                      restart the daemon to load an approved provider
     \\  demo [--lang en|pt|ja] [--at YYYY-MM-DDTHH:MM] [--port N]
     \\                               fill an empty database with made-up history
     \\
@@ -657,6 +658,23 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         if (!try settle(ctx, reply)) return .ok;
         try ctx.out.writeAll("daemon stopping\n");
         return .ok;
+    }
+    if (eql(u8, command, "restart")) {
+        if (args.len != 0) return error.Usage;
+        const reply = try call(ctx, "POST", "/api/restart", "");
+        _ = try settle(ctx, reply);
+        var stopped = false;
+        for (0..70) |_| {
+            try ctx.io.sleep(.fromMilliseconds(500), .awake);
+            const answering = ping(ctx);
+            if (!answering) stopped = true;
+            if (stopped and answering) {
+                if (!ctx.json) try ctx.out.writeAll("daemon restarted\n");
+                return .ok;
+            }
+        }
+        try ctx.err.writeAll("kowalski: daemon did not restart within 35 s (run kowalski start)\n");
+        return .failed;
     }
     return error.Usage;
 }

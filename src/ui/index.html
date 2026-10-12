@@ -187,7 +187,9 @@
       <div class="set-row" id="set-provider-status"><div class="set-lbl"><span data-i18n="set_provider">Provider</span></div>
         <div class="set-ctl set-provider-ctl"><span class="set-ro" id="set-provider-status-text"></span>
           <span class="set-provider-waiting" id="set-provider-waiting"></span>
-          <button type="button" class="set-btn" id="set-provider-review" onclick="showProviderApproval()" data-i18n="provider_review" style="display:none">Review</button></div></div>
+          <button type="button" class="set-btn" id="set-provider-review" onclick="showProviderApproval()" data-i18n="provider_review" style="display:none">Review</button>
+          <span class="restart-prompt" id="provider-restart-prompt" style="display:none"><span data-i18n="approve_restart">Restart kowalski to load the new provider.</span>
+            <button type="button" class="set-btn" onclick="restartKowalski()" data-i18n="restart_now">Restart now</button></span></div></div>
       <div class="set-row" id="set-account-row"><div class="set-lbl"><span data-i18n="set_account">Provider account</span></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="showLogin()"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span data-i18n="login_submit">Sign in</span></button></div></div>
     </section>
@@ -197,6 +199,8 @@
         <div class="set-ctl"><input type="text" id="set-zone" class="wide" spellcheck="false" autocomplete="off"></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="set_port">HTTP port</span><small data-i18n="set_port_hint">Change it with kowalski set http_port, then restart kowalski and install the app again.</small></div>
         <div class="set-ctl"><span class="set-ro" id="set-port"></span></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="restart_btn">Restart kowalski</span><small data-i18n="restart_hint">Stops and starts the background service, for example to load a newly approved provider.</small></div>
+        <div class="set-ctl"><button type="button" class="set-btn" onclick="restartKowalski()" data-i18n="restart_btn">Restart kowalski</button></div></div>
     </details>
   </div>
   <div class="set-foot">
@@ -204,6 +208,7 @@
     <button type="button" class="set-save" onclick="applySettings()" data-i18n="save_changes">Save changes</button>
   </div>
 </div>
+<div class="restart-banner" id="restart-banner" role="status" aria-live="polite"></div>
 <!-- Post hours dialog -->
 <div class="newtask-overlay" id="horas-overlay" onclick="hideHoras()"></div>
 <div class="newtask-popup horas-popup" id="horas-popup">

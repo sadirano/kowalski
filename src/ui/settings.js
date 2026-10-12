@@ -175,7 +175,7 @@ async function applyProviderApproval(how) {
     _approvalBusy = false;
     hideProviderApproval();
     await loadProvider();
-    if (result.restart) showToast(t('approve_restart'));
+    if (result.restart) id('provider-restart-prompt').style.display = 'flex';
   } catch (e) {
     if (e.status === 409) {
       _approvalBusy = false;
@@ -189,6 +189,34 @@ async function applyProviderApproval(how) {
     _approvalBusy = false;
     id('approve-accept').disabled = false;
     updateProviderHashMatch();
+  }
+}
+
+let _restarting = false;
+async function restartKowalski() {
+  if (_restarting) return;
+  _restarting = true;
+  const banner = id('restart-banner');
+  banner.textContent = t('restarting');
+  banner.classList.add('show');
+  try {
+    await apiJSON('POST', '/api/restart');
+    let oldDaemonStopped = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      try {
+        await apiJSON('GET', '/api/state');
+        if (oldDaemonStopped) { location.reload(); return; }
+      } catch (_) {
+        oldDaemonStopped = true;
+      }
+    }
+    banner.textContent = t('restart_failed');
+  } catch (e) {
+    banner.classList.remove('show');
+    showError(e.message);
+  } finally {
+    _restarting = false;
   }
 }
 

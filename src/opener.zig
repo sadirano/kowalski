@@ -16,7 +16,7 @@ pub fn open(io: std.Io, a: std.mem.Allocator, db_path: []const u8, db_flag: ?[]c
     var err: std.Io.Writer.Allocating = .init(a);
     var ctx: cli.Context = .{ .io = io, .a = a, .db_path = db_path, .json = false, .out = &out.writer, .err = &err.writer };
     if (!cli.ping(&ctx)) {
-        try launch.spawn(a, try launch.backgroundCommand(a, db_flag));
+        try launch.spawn(a, try launch.backgroundCommand(a, db_flag, null));
         var up = false;
         for (0..50) |_| {
             try io.sleep(.fromMilliseconds(100), .awake);
