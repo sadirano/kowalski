@@ -119,6 +119,7 @@ pub const Request = struct {
     host: ?[]const u8,
     origin: ?[]const u8 = null,
     marker: bool = false,
+    local_file: bool = false,
     body: []const u8 = "",
 };
 

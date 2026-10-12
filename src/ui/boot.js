@@ -20,6 +20,7 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').cat
   }
   setLangFrom(settings);
   applyLang();
+  showUpdateOutcome().catch(() => {});
   initLayout();
   applyFeatureToggles();
   renderChartGroups();

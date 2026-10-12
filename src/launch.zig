@@ -45,6 +45,8 @@ const ProcessInformation = extern struct {
 };
 extern "kernel32" fn CreateProcessW(app: ?[*:0]const u16, command: [*:0]u16, process_attributes: ?*anyopaque, thread_attributes: ?*anyopaque, inherit: i32, flags: u32, environment: ?*anyopaque, cwd: ?[*:0]const u16, startup: *const StartupInfoW, info: *ProcessInformation) callconv(.winapi) i32;
 extern "kernel32" fn CloseHandle(handle: windows.HANDLE) callconv(.winapi) i32;
+extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, milliseconds: u32) callconv(.winapi) u32;
+extern "kernel32" fn TerminateProcess(handle: windows.HANDLE, code: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetConsoleProcessList(list: [*]u32, count: u32) callconv(.winapi) u32;
 extern "kernel32" fn FreeConsole() callconv(.winapi) i32;
 extern "shell32" fn ShellExecuteW(hwnd: ?*anyopaque, operation: ?[*:0]const u16, file: [*:0]const u16, parameters: ?[*:0]const u16, directory: ?[*:0]const u16, show: i32) callconv(.winapi) ?*anyopaque;
@@ -107,11 +109,28 @@ pub fn alert(a: std.mem.Allocator, text: []const u8) void {
 
 /// Starts a detached process and does not wait for it.
 pub fn spawn(a: std.mem.Allocator, command: []const u8) !void {
+    var child = try spawnTracked(a, command);
+    child.close();
+}
+
+pub const Child = struct {
+    handle: windows.HANDLE,
+    pid: u32,
+
+    pub fn alive(self: Child) bool { return WaitForSingleObject(self.handle, 0) == 0x102; }
+    pub fn terminate(self: Child) void {
+        if (self.alive()) _ = TerminateProcess(self.handle, 1);
+        _ = WaitForSingleObject(self.handle, 10_000);
+    }
+    pub fn close(self: *Child) void { _ = CloseHandle(self.handle); self.* = undefined; }
+};
+
+pub fn spawnTracked(a: std.mem.Allocator, command: []const u8) !Child {
     const line = try wide(a, command);
     var info: ProcessInformation = undefined;
     if (CreateProcessW(null, line.ptr, null, null, 0, detached_process | create_new_process_group, null, null, &.{}, &info) == 0) return error.Spawn;
     _ = CloseHandle(info.hThread);
-    _ = CloseHandle(info.hProcess);
+    return .{ .handle = info.hProcess, .pid = info.dwProcessId };
 }
 
 /// The logon command stored under `subkey`, or null when there is none.

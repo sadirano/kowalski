@@ -626,6 +626,11 @@ fn disabledUpdateResponse(a: std.mem.Allocator, repo: []const u8, method: std.ht
         api.answer(a, .bad_request, .{ .@"error" = "update_disabled", .message = "updates are turned off in this build" });
 }
 
+fn removeUpdateJournal(a: std.mem.Allocator, io: Io, db_path: []const u8) void {
+    const path = std.fs.path.join(a, &.{ std.fs.path.dirname(db_path) orelse ".", "update.json" }) catch return;
+    Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
 test "empty update repo gives a disabled API answer" {
     const a = std.testing.allocator;
     try std.testing.expect(disabledUpdateResponse(a, "someone/fork", .GET) == null);
@@ -637,26 +642,43 @@ test "empty update repo gives a disabled API answer" {
 
 fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
-    if (!std.mem.eql(u8, path, "/api/update")) return null;
+    const is_update = std.mem.eql(u8, path, "/api/update");
+    const is_ack = std.mem.eql(u8, path, "/api/update/ack");
+    if (!is_update and !is_ack) return null;
     if (api.updateRefused(d.app.port, a, request)) |r| return r;
-    if (disabledUpdateResponse(a, update.release_repo, request.method)) |r| return r;
+    if (is_ack) {
+        if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
+        const Ack = struct { id: []const u8 };
+        const body = std.json.parseFromSliceLeaky(Ack, a, request.body, .{ .ignore_unknown_fields = true }) catch return api.answer(a, .bad_request, .{ .@"error" = "body" });
+        var last = (@import("update_journal.zig").read(a, d.io, d.db_path) catch return api.answer(a, .internal_server_error, .{ .@"error" = "journal" })) orelse return api.answer(a, .not_found, .{ .@"error" = "not_found" });
+        if (!std.mem.eql(u8, last.id, body.id) or (last.phase != .committed and last.phase != .rolled_back)) return api.answer(a, .conflict, .{ .@"error" = "id" });
+        last.ack = true;
+        @import("update_journal.zig").write(a, d.io, d.db_path, last) catch return api.answer(a, .internal_server_error, .{ .@"error" = "journal" });
+        return api.answer(a, .ok, .{ .ack = true });
+    }
     const fetcher: update.Fetcher = .{ .context = @ptrCast(d), .get = update.httpGet };
     if (request.method == .GET) {
+        const saved = @import("update_journal.zig").read(a, d.io, d.db_path) catch return api.answer(a, .internal_server_error, .{ .@"error" = "journal" });
+        const last = update.outcome(saved);
+        if (std.mem.eql(u8, request.target, "/api/update?outcome=1")) return api.answer(a, .ok, .{ .last = last });
+        if (disabledUpdateResponse(a, update.release_repo, request.method) != null) return api.answer(a, .ok, .{ .state = "disabled", .last = last });
         const result = update.check(a, d.io, fetcher) catch |err| {
             log("update check failed: {s}", .{@errorName(err)});
             return api.answer(a, .bad_gateway, .{ .@"error" = "update_check", .message = @errorName(err) });
         };
         return switch (result) {
-            .up_to_date => api.answer(a, .ok, .{ .state = "up_to_date", .version = update.current_version, .repo = update.release_repo }),
-            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest, .signed = release.signed, .repo = update.release_repo }),
+            .up_to_date => api.answer(a, .ok, .{ .state = "up_to_date", .version = update.current_version, .repo = update.release_repo, .last = last }),
+            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest, .signed = release.signed, .repo = update.release_repo, .last = last }),
         };
     }
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
-    const Body = struct { version: []const u8 };
+    const Body = struct { version: ?[]const u8 = null, file: ?[]const u8 = null };
     const body = std.json.parseFromSliceLeaky(Body, a, request.body, .{ .ignore_unknown_fields = true }) catch
         return api.answer(a, .bad_request, .{ .@"error" = "body" });
-    if (update.parseVersion(body.version) == null) return api.answer(a, .bad_request, .{ .@"error" = "version" });
-    const swap = update.install(a, d.io, fetcher, d.app.store.db, d.db_path, body.version) catch |err| {
+    const version = if (body.file) |file| update.versionFromFile(file) orelse return api.answer(a, .bad_request, .{ .@"error" = "file" }) else body.version orelse return api.answer(a, .bad_request, .{ .@"error" = "version" });
+    if (body.file != null and !request.local_file) return api.answer(a, .forbidden, .{ .@"error" = "file_cli_only" });
+    if (update.parseVersion(version) == null) return api.answer(a, .bad_request, .{ .@"error" = "version" });
+    var installed = update.install(a, d.io, fetcher, d.db_path, version, body.file) catch |err| {
         log("update install failed: {s}", .{@errorName(err)});
         const message: []const u8 = switch (err) {
             error.UnsignedRelease => "this release is not signed; kowalski will not install it",
@@ -670,16 +692,61 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
         };
         return api.answer(a, .internal_server_error, .{ .@"error" = code, .message = message });
     };
-    const command = launch.backgroundCommand(a, d.db_path, GetCurrentProcessId()) catch |err| {
-        swap.rollback(a, d.io);
+    const new_journal = update.newJournal(a, version) catch |err| {
+        installed.swap.rollback(a, d.io);
+        installed.lock.release();
+        return api.answer(a, .internal_server_error, .{ .@"error" = "journal", .message = @errorName(err) });
+    };
+    @import("update_journal.zig").write(a, d.io, d.db_path, new_journal) catch |err| {
+        installed.swap.rollback(a, d.io);
+        installed.lock.release();
+        return api.answer(a, .internal_server_error, .{ .@"error" = "journal", .message = @errorName(err) });
+    };
+    const command = std.fmt.allocPrint(a, "\"{s}\\kowalskiw.exe.old\" --update-guard --db \"{s}\" --after {d}", .{ installed.swap.exe_dir, d.db_path, GetCurrentProcessId() }) catch |err| {
+        installed.swap.rollback(a, d.io);
+        installed.lock.release();
+        removeUpdateJournal(a, d.io, d.db_path);
         return api.answer(a, .internal_server_error, .{ .@"error" = "restart_spawn", .message = @errorName(err) });
     };
     launch.spawn(a, command) catch |err| {
-        swap.rollback(a, d.io);
+        installed.swap.rollback(a, d.io);
+        installed.lock.release();
+        removeUpdateJournal(a, d.io, d.db_path);
         return api.answer(a, .internal_server_error, .{ .@"error" = "restart_spawn", .message = @errorName(err) });
     };
+    installed.lock.release();
     d.app.stop_requested = true;
     return api.answer(a, .ok, .{ .restarting = true });
+}
+
+test "update outcome API reports once and acknowledges matching id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const db_path = try std.fs.path.join(a, &.{ root, "work.db" });
+    const value: @import("update_journal.zig").Journal = .{
+        .id = "0123456789abcdef0123456789abcdef", .from = "1.0.0", .to = "1.1.0", .phase = .rolled_back,
+        .nonce = "abcdef0123456789abcdef0123456789", .snapshot = "snapshot.db", .exe_dir = ".",
+        .reason = "readiness timeout", .started_ms = 1,
+    };
+    try @import("update_journal.zig").write(a, io, db_path, value);
+    var d: Daemon = .{ .io = io, .gpa = a, .app = .{ .store = undefined, .port = api.default_port, .clock = clock.nowMs }, .db_path = db_path, .traits_allocator = a };
+    const get: api.Request = .{ .method = .GET, .target = "/api/update?outcome=1", .host = "127.0.0.1:47100", .marker = true };
+    const before = updateCommand(&d, a, get).?;
+    try std.testing.expectEqual(std.http.Status.ok, before.status);
+    try std.testing.expect(std.mem.indexOf(u8, before.body, "readiness timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, before.body, "\"nonce\"") == null);
+    const wrong = updateCommand(&d, a, .{ .method = .POST, .target = "/api/update/ack", .host = get.host, .marker = true, .body = "{\"id\":\"bad\"}" }).?;
+    try std.testing.expectEqual(std.http.Status.conflict, wrong.status);
+    const ack = updateCommand(&d, a, .{ .method = .POST, .target = "/api/update/ack", .host = get.host, .marker = true, .body = "{\"id\":\"0123456789abcdef0123456789abcdef\"}" }).?;
+    try std.testing.expectEqual(std.http.Status.ok, ack.status);
+    const after = updateCommand(&d, a, get).?;
+    try std.testing.expectEqualStrings("{\"last\":null}", after.body);
 }
 
 fn acceptLoop(d: *Daemon, listener: *Io.net.Server, connections: *Io.Group) Io.Cancelable!void {
@@ -802,6 +869,8 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
             request.origin = a.dupe(u8, header.value) catch return;
         } else if (std.ascii.eqlIgnoreCase(header.name, "x-kowalski")) {
             request.marker = std.mem.eql(u8, header.value, "1");
+        } else if (std.ascii.eqlIgnoreCase(header.name, "x-kowalski-local-file")) {
+            request.local_file = std.mem.eql(u8, header.value, "1");
         }
     }
     if (hosts != 1) request.host = null;

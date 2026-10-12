@@ -1,9 +1,11 @@
 //! User-initiated release checks and installation. No request runs at startup.
 const std = @import("std");
 const Io = std.Io;
-const sqlite = @import("sqlite.zig");
-const clock = @import("clock.zig");
 const launch = @import("launch.zig");
+const journal = @import("update_journal.zig");
+const update_lock = @import("update_lock.zig");
+const clock = @import("clock.zig");
+extern "bcrypt" fn BCryptGenRandom(?*anyopaque, [*]u8, u32, u32) callconv(.winapi) i32;
 
 pub const current_version = @import("build_options").version;
 pub const release_repo = @import("build_options").update_repo;
@@ -23,6 +25,16 @@ pub fn parseVersion(text: []const u8) ?Version {
     const patch = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
     if (parts.next() != null) return null;
     return .{ .major = major, .minor = minor, .patch = patch };
+}
+
+pub fn versionFromFile(path: []const u8) ?[]const u8 {
+    const name = std.fs.path.basename(path);
+    const prefix = "kowalski-v";
+    const suffix = "-windows-x86_64.zip";
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
+    const version = name[prefix.len .. name.len - suffix.len];
+    if (parseVersion(version) == null) return null;
+    return version;
 }
 
 fn newerThan(tag: []const u8, running: []const u8) bool {
@@ -193,35 +205,6 @@ pub fn extractExecutables(a: std.mem.Allocator, io: Io, zip_path: []const u8, st
     if (!found_console or !found_window) return error.MissingExe;
 }
 
-fn backupDatabase(a: std.mem.Allocator, io: Io, db: *sqlite.Db, db_path: []const u8, version: []const u8) !void {
-    var checkpoint = try db.prepare("PRAGMA wal_checkpoint(TRUNCATE)");
-    defer checkpoint.finalize();
-    if (try checkpoint.step() != .row or checkpoint.columnI64(0) != 0) return error.CheckpointBusy;
-    const root = std.fs.path.dirname(db_path) orelse ".";
-    const name = std.fs.path.basename(db_path);
-    const seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(@divFloor(clock.nowMs(), 1000)) };
-    const day = seconds.getEpochDay().calculateYearDay();
-    const month = day.calculateMonthDay();
-    const time = seconds.getDaySeconds();
-    const folder = try std.fmt.allocPrint(a, "backup-before-{s}-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}", .{
-        version, day.year, month.month.numeric(), month.day_index + 1, time.getHoursIntoDay(), time.getMinutesIntoHour(),
-    });
-    const dest = try join(a, &.{ root, folder });
-    const cwd = Io.Dir.cwd();
-    try cwd.createDirPath(io, dest);
-    var source_dir = try cwd.openDir(io, root, .{ .iterate = true });
-    defer source_dir.close(io);
-    var entries = source_dir.iterate();
-    var copied_db = false;
-    while (try entries.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, name)) continue;
-        const target = try join(a, &.{ dest, entry.name });
-        try Io.Dir.copyFile(source_dir, entry.name, cwd, target, io, .{});
-        if (std.mem.eql(u8, entry.name, name)) copied_db = true;
-    }
-    if (!copied_db) return error.BackupMissingDatabase;
-}
-
 pub const Swap = struct {
     exe_dir: []const u8,
     stage: []const u8,
@@ -273,46 +256,97 @@ pub fn swapExecutables(a: std.mem.Allocator, io: Io, exe_dir: []const u8, stage:
     return .{ .exe_dir = exe_dir, .stage = stage };
 }
 
-/// Freshly verifies the chosen release, stages it, backs up the live database,
-/// and swaps the executable names. The caller spawns the successor or rolls back.
-pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db: *sqlite.Db, db_path: []const u8, version: []const u8) anyerror!Swap {
-    if (release_repo.len == 0) return error.UpdatesDisabled;
-    const latest = try check(a, io, fetcher);
-    const release = switch (latest) {
-        .up_to_date => return error.NoUpdate,
-        .available => |r| r,
-    };
-    if (!std.mem.eql(u8, version, release.version)) return error.UpdateChanged;
-    const signature_url = release.signature_url orelse return error.UnsignedRelease;
-    if (!std.mem.startsWith(u8, release.download_url, "https://")) return error.BadRelease;
-    if (!std.mem.startsWith(u8, signature_url, "https://")) return error.BadRelease;
-    if (release.size > 256 * 1024 * 1024) return error.UpdateTooLarge;
-    const signature = try fetcher.get(fetcher.context, a, io, signature_url, true, 1024);
-    const bytes = try fetcher.get(fetcher.context, a, io, release.download_url, true, @intCast(release.size));
-    try validDownload(bytes, release);
-    try verifySignature(a, release.asset_name, bytes, signature, release_public_key);
+/// Verifies and stages a release, then swaps executables under the update lock.
+pub const Installed = struct { swap: Swap, lock: update_lock.Lock };
+pub const Outcome = struct {
+    id: []const u8,
+    from: []const u8,
+    to: []const u8,
+    phase: journal.Phase,
+    reason: []const u8,
+    ack: bool,
+};
+
+pub fn outcome(value: ?journal.Journal) ?Outcome {
+    const j = value orelse return null;
+    if (j.ack or (j.phase != .committed and j.phase != .rolled_back)) return null;
+    return .{ .id = j.id, .from = j.from, .to = j.to, .phase = j.phase, .reason = j.reason, .ack = j.ack };
+}
+
+pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db_path: []const u8, version: []const u8, local_file: ?[]const u8) anyerror!Installed {
+    var lock = update_lock.tryAcquire() orelse return error.UpdateInProgress;
+    errdefer lock.release();
+    const cwd = Io.Dir.cwd();
+    var bytes: []const u8 = undefined;
+    var signature: []const u8 = undefined;
+    var asset_name: []const u8 = undefined;
+    if (local_file) |file| {
+        if (!std.fs.path.isAbsolute(file)) return error.LocalFileMustBeAbsolute;
+        asset_name = std.fs.path.basename(file);
+        const expected = try std.fmt.allocPrint(a, "kowalski-v{s}-windows-x86_64.zip", .{version});
+        if (!std.mem.eql(u8, asset_name, expected) or parseVersion(version) == null) return error.BadReleaseName;
+        bytes = try cwd.readFileAlloc(io, file, a, .limited(256 * 1024 * 1024));
+        signature = try cwd.readFileAlloc(io, try std.fmt.allocPrint(a, "{s}.sig", .{file}), a, .limited(1024));
+    } else {
+        if (release_repo.len == 0) return error.UpdatesDisabled;
+        const latest = try check(a, io, fetcher);
+        const release = switch (latest) {
+            .up_to_date => return error.NoUpdate,
+            .available => |r| r,
+        };
+        if (!std.mem.eql(u8, version, release.version)) return error.UpdateChanged;
+        const signature_url = release.signature_url orelse return error.UnsignedRelease;
+        if (!std.mem.startsWith(u8, release.download_url, "https://") or !std.mem.startsWith(u8, signature_url, "https://")) return error.BadRelease;
+        if (release.size > 256 * 1024 * 1024) return error.UpdateTooLarge;
+        signature = try fetcher.get(fetcher.context, a, io, signature_url, true, 1024);
+        bytes = try fetcher.get(fetcher.context, a, io, release.download_url, true, @intCast(release.size));
+        try validDownload(bytes, release);
+        asset_name = release.asset_name;
+    }
+    try verifySignature(a, asset_name, bytes, signature, release_public_key);
     const root = std.fs.path.dirname(db_path) orelse ".";
     const update_dir = try join(a, &.{ root, "update" });
     const stage = try join(a, &.{ update_dir, version });
     const zip_path = try join(a, &.{ update_dir, try std.fmt.allocPrint(a, "{s}.zip", .{version}) });
-    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, stage) catch |err| if (err != error.FileNotFound) return err;
     try cwd.createDirPath(io, stage);
     try cwd.writeFile(io, .{ .sub_path = zip_path, .data = bytes });
     try extractExecutables(a, io, zip_path, stage, version);
-    try backupDatabase(a, io, db, db_path, version);
-    return swapExecutables(a, io, try launch.exeDir(a), stage);
+    return .{ .swap = try swapExecutables(a, io, try launch.exeDir(a), stage), .lock = lock };
+}
+
+pub fn newJournal(a: std.mem.Allocator, version: []const u8) !journal.Journal {
+    var random: [32]u8 = undefined;
+    if (BCryptGenRandom(null, &random, random.len, 2) != 0) return error.RandomFailed;
+    const id = std.fmt.bytesToHex(random[0..16].*, .lower);
+    const nonce = std.fmt.bytesToHex(random[16..32].*, .lower);
+    return .{
+        .id = try a.dupe(u8, &id), .from = current_version, .to = version, .phase = .swapped,
+        .nonce = try a.dupe(u8, &nonce),
+        .snapshot = try std.fmt.allocPrint(a, "update-snapshot-{s}.db", .{id}),
+        .exe_dir = ".", .started_ms = clock.nowMs(),
+    };
 }
 
 /// Called only after a successful daemon start; stale backups stay untouched.
 pub fn cleanup(a: std.mem.Allocator, io: Io, db_path: []const u8) !void {
     const cwd = Io.Dir.cwd();
+    const value = try journal.read(a, io, db_path);
+    if (value) |j| if (journal.needsRecovery(j)) return;
     const exe_dir = try launch.exeDir(a);
     inline for (.{ "kowalski.exe.old", "kowalskiw.exe.old" }) |name| {
         const path = try join(a, &.{ exe_dir, name });
-        cwd.deleteFile(io, path) catch |err| if (err != error.FileNotFound) return err;
+        // The guard can still be running from kowalskiw.exe.old.
+        cwd.deleteFile(io, path) catch {};
     }
     const stage = try join(a, &.{ std.fs.path.dirname(db_path) orelse ".", "update" });
-    cwd.deleteTree(io, stage) catch |err| if (err != error.FileNotFound) return err;
+    cwd.deleteTree(io, stage) catch {};
+    if (value) |j| {
+        if (!std.fs.path.isAbsolute(j.snapshot) and std.mem.eql(u8, j.snapshot, std.fs.path.basename(j.snapshot))) {
+            const path = try join(a, &.{ std.fs.path.dirname(db_path) orelse ".", j.snapshot });
+            cwd.deleteFile(io, path) catch {};
+        }
+    }
 }
 
 test "version comparison ignores malformed and prerelease tags" {
@@ -386,14 +420,38 @@ test "unsigned release returns before fetching ZIP" {
             return "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
         }
     }.get };
-    var dummy_db: sqlite.Db = undefined;
     if (release_repo.len == 0) {
-        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, &dummy_db, "unused.db", "0.2.0"));
+        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, "unused.db", "0.2.0", null));
         try std.testing.expectEqual(@as(usize, 0), calls);
     } else {
-        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, &dummy_db, "unused.db", "0.2.0"));
+        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, "unused.db", "0.2.0", null));
         try std.testing.expectEqual(@as(usize, 1), calls);
     }
+}
+
+test "install refuses a held update lock" {
+    const State = struct {
+        ready: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn hold(state: *@This()) void {
+            var lock = update_lock.tryAcquire().?;
+            state.ready.store(true, .release);
+            while (!state.done.load(.acquire)) std.Thread.yield() catch {};
+            lock.release();
+        }
+        fn noFetch(_: *anyopaque, _: std.mem.Allocator, _: Io, _: []const u8, _: bool, _: usize) ![]const u8 {
+            return error.UnexpectedFetch;
+        }
+    };
+    var state: State = .{};
+    const thread = try std.Thread.spawn(.{}, State.hold, .{&state});
+    defer {
+        state.done.store(true, .release);
+        thread.join();
+    }
+    while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
+    const fetcher: Fetcher = .{ .context = &state, .get = State.noFetch };
+    try std.testing.expectError(error.UpdateInProgress, install(std.testing.allocator, std.testing.io, fetcher, "unused.db", "1.0.0", "missing.zip"));
 }
 
 test "digest mismatch rejects download" {

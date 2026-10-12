@@ -7,6 +7,10 @@ const windows = std.os.windows;
 const daemon = @import("daemon.zig");
 const paths = @import("paths.zig");
 const opener = @import("opener.zig");
+const update_guard = @import("update_guard.zig");
+const update_lock = @import("update_lock.zig");
+const update_journal = @import("update_journal.zig");
+const launch = @import("launch.zig");
 
 const synchronize: u32 = 0x00100000;
 const wait_timeout: u32 = 258;
@@ -16,7 +20,7 @@ extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, ms: u32) callco
 extern "kernel32" fn CloseHandle(handle: windows.HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
-const Args = struct { db: ?[]const u8 = null, background: bool = false, after: ?u32 = null, trial: ?[]const u8 = null };
+const Args = struct { db: ?[]const u8 = null, background: bool = false, after: ?u32 = null, trial: ?[]const u8 = null, guard: bool = false };
 
 fn validNonce(nonce: []const u8) bool {
     if (nonce.len != 32) return false;
@@ -30,6 +34,8 @@ fn parseArgs(args: []const []const u8) !Args {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--background")) {
             result.background = true;
+        } else if (std.mem.eql(u8, args[i], "--update-guard")) {
+            result.guard = true;
         } else if (std.mem.eql(u8, args[i], "--db") and i + 1 < args.len and result.db == null) {
             result.db = args[i + 1];
             i += 1;
@@ -77,6 +83,36 @@ fn run(init: std.process.Init) !void {
             else
                 "could not wait for previous daemon; not starting") catch {};
             return err;
+        };
+    }
+    if (options.guard) {
+        var lock: ?update_lock.Lock = null;
+        for (0..120) |_| {
+            lock = update_lock.tryAcquire();
+            if (lock != null) break;
+            try init.io.sleep(.fromMilliseconds(250), .awake);
+        }
+        var held = lock orelse return error.UpdateInProgress;
+        defer held.release();
+        const dir = try launch.exeDir(a);
+        update_guard.trial(a, init.io, db, dir, update_guard.realProbe()) catch |err| {
+            if (try update_journal.read(a, init.io, db)) |saved| {
+                if (update_journal.needsRecovery(saved)) {
+                    var value = saved;
+                    try update_guard.rollback(a, init.io, db, dir, &value, @errorName(err));
+                    try launch.spawn(a, try std.fmt.allocPrint(a, "\"{s}\\kowalskiw.exe\" --background --db \"{s}\"", .{ dir, db }));
+                }
+            }
+            return err;
+        };
+        return;
+    }
+    if (options.trial == null) {
+        const pending = try update_journal.read(a, init.io, db);
+        if (try update_guard.recoverOnLaunch(a, init.io, db)) return;
+        if (pending) |value| if (update_journal.needsRecovery(value) and !std.mem.eql(u8, value.from, @import("build_options").version)) {
+            try launch.spawn(a, try launch.backgroundCommand(a, db, null));
+            return;
         };
     }
     if (!options.background) return opener.openOrAlert(init.io, a, db, options.db);

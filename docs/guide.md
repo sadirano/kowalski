@@ -220,13 +220,22 @@ last row starts a new task with what you typed.
 
 To check for a newer kowalski release, run `kowalski update` or use
 **Settings > Advanced > Check for updates**. Kowalski contacts GitHub only
-when you ask. Unsigned releases are refused. If you approve an update, it downloads the Windows release ZIP,
-checks its signature, size and the published SHA-256 when available, copies the database
-to a `backup-before-<version>-<date>/` folder, replaces the executables, and
-restarts. To return to the previous release, download that release ZIP and
-restore its executables. Restore the matching database copy too if the new
-version upgraded its schema. The `.old` executables are deleted on the next
-start.
+when you ask. Unsigned releases are refused. To install a signed ZIP without
+network access, put its `.sig` beside it and run `kowalski update --from
+<absolute path to ZIP>`. The filename must be
+`kowalski-vX.Y.Z-windows-x86_64.zip`.
+
+After signature checks, kowalski swaps the executables and starts the previous
+daemon as an update guard. The guard snapshots the database only after the old
+daemon stops, then starts the candidate. It waits for readiness and a stable
+10-second period before committing. If the candidate fails, the guard restores
+both executables and the database snapshot and restarts the previous version.
+Sessions, notes, day summaries and posted hours from before the update remain.
+`update.json` beside the database records the transaction and its result; an
+interrupted update is finished on the next launch. The Settings update row and
+`kowalski update` report the result once. After a committed update, the
+`.old` executables, staging files and snapshot are removed on a later normal
+start, when the guard has exited.
 
 ## Attaching a provider
 

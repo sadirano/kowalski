@@ -10,12 +10,14 @@ const opener = @import("opener.zig");
 const demo = @import("demo.zig");
 const tour_mod = @import("tour.zig");
 const zone_mod = @import("zone.zig");
+const update_guard = @import("update_guard.zig");
 
 test { _ = @import("kowalskiw.zig"); }
 test { _ = @import("update.zig"); }
 test { _ = @import("update_journal.zig"); }
 test { _ = @import("update_lock.zig"); }
 test { _ = @import("update_snapshot.zig"); }
+test { _ = @import("update_guard.zig"); }
 
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
 pub fn main(init: std.process.Init) void {
@@ -105,6 +107,7 @@ fn usageError() u8 {
 
 /// Starts kowalskiw and waits until it answers. `db` is the --db choice, if any.
 fn start(ctx: *cli.Context, db: ?[]const u8) !u8 {
+    if (try update_guard.recoverOnLaunch(ctx.a, ctx.io, ctx.db_path)) return 0;
     if (cli.ping(ctx)) {
         std.debug.print("kowalski: the daemon is already running\n", .{});
         return 0;

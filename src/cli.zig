@@ -45,7 +45,7 @@ pub const usage =
     \\  resolve <posting> posted|not-posted     settle a posting whose outcome is unknown
     \\  shutdown                     stop the daemon
     \\  restart                      restart the daemon to load an approved provider
-    \\  update [--yes]               check for a newer release and optionally install it
+    \\  update [--yes] | --from <zip> check for a release or install a signed local ZIP
     \\  demo [--lang en|pt|ja] [--at YYYY-MM-DDTHH:MM] [--port N]
     \\                               fill an empty database with made-up history
     \\
@@ -86,6 +86,7 @@ fn call(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8
     var writer = stream.writer(ctx.io, &write_buffer);
     const payload = body orelse "";
     try writer.interface.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nX-Kowalski: 1\r\nConnection: close\r\n", .{ method, target, port });
+    if (body) |data| if (std.mem.indexOf(u8, data, "\"file\":") != null) try writer.interface.writeAll("X-Kowalski-Local-File: 1\r\n");
     if (body != null) try writer.interface.print("Content-Type: application/json\r\nContent-Length: {d}\r\n", .{payload.len});
     try writer.interface.writeAll("\r\n");
     try writer.interface.writeAll(payload);
@@ -669,10 +670,31 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         const before = daemonPid(ctx);
         const reply = try call(ctx, "POST", "/api/restart", "");
         if (!try settle(ctx, reply)) return .failed;
-        return waitForRestart(ctx, before);
+        return waitForRestart(ctx, before, 70);
     }
     if (eql(u8, command, "update")) {
-        if (args.len > 1 or (args.len == 1 and !eql(u8, args[0], "--yes"))) return error.Usage;
+        const local_file: ?[]const u8 = if (args.len == 2 and eql(u8, args[0], "--from")) args[1] else null;
+        if (local_file == null and (args.len > 1 or (args.len == 1 and !eql(u8, args[0], "--yes")))) return error.Usage;
+        const outcome_reply = try call(ctx, "GET", "/api/update?outcome=1", null);
+        if (!try settle(ctx, outcome_reply)) return .failed;
+        const Outcome = struct { id: []const u8, from: []const u8, to: []const u8, phase: []const u8, reason: []const u8 };
+        const outcome_info = try parse(struct { last: ?Outcome = null }, ctx, outcome_reply.body);
+        if (outcome_info.last) |last| {
+            if (eql(u8, last.phase, "committed")) {
+                try ctx.out.print("Updated to {s}\n", .{last.to});
+            } else {
+                try ctx.out.print("The update to {s} did not start and was rolled back to {s}: {s}\n", .{ last.to, last.from, last.reason });
+            }
+            const ack = try call(ctx, "POST", "/api/update/ack", try jsonBody(ctx, .{ .id = last.id }));
+            if (!try settle(ctx, ack)) return .failed;
+        }
+        if (local_file) |file| {
+            if (!std.fs.path.isAbsolute(file)) return error.Usage;
+            const before = daemonPid(ctx);
+            const installed = try call(ctx, "POST", "/api/update", try jsonBody(ctx, .{ .file = file }));
+            if (!try settle(ctx, installed)) return .failed;
+            return waitForRestart(ctx, before, 320);
+        }
         const yes = args.len == 1;
         const reply = try call(ctx, "GET", "/api/update", null);
         if (!try settle(ctx, reply)) return .ok;
@@ -721,7 +743,7 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         const before = daemonPid(ctx);
         const installed = try call(ctx, "POST", "/api/update", try jsonBody(ctx, .{ .version = info.version }));
         if (!try settle(ctx, installed)) return .failed;
-        return waitForRestart(ctx, before);
+        return waitForRestart(ctx, before, 320);
     }
     return error.Usage;
 }
@@ -740,8 +762,8 @@ fn daemonPid(ctx: *Context) ?u32 {
 }
 
 /// Done when a different daemon answers: a restart can finish between polls.
-fn waitForRestart(ctx: *Context, before: ?u32) !Exit {
-    for (0..70) |_| {
+fn waitForRestart(ctx: *Context, before: ?u32, attempts: usize) !Exit {
+    for (0..attempts) |_| {
         try ctx.io.sleep(.fromMilliseconds(500), .awake);
         const now = daemonPid(ctx) orelse continue;
         if (before == null or now != before.?) {
@@ -749,7 +771,7 @@ fn waitForRestart(ctx: *Context, before: ?u32) !Exit {
             return .ok;
         }
     }
-    try ctx.err.writeAll("kowalski: daemon did not restart within 35 s (run kowalski start)\n");
+    try ctx.err.print("kowalski: daemon did not restart within {d} s (run kowalski start)\n", .{attempts / 2});
     return .failed;
 }
 

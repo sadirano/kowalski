@@ -7,6 +7,14 @@ Use a Windows machine with Zig 0.17, the release signing key, and `gh`.
 3. Run `zig build sign -- kowalski-vX.Y.Z-windows-x86_64.zip`. The command writes `kowalski-vX.Y.Z-windows-x86_64.zip.sig` and prints its path and SHA-256. Use `--key <path>` after the ZIP path to select another key file.
 4. Publish both assets with `gh release create vX.Y.Z kowalski-vX.Y.Z-windows-x86_64.zip kowalski-vX.Y.Z-windows-x86_64.zip.sig`.
 
+For an offline install, put the ZIP and matching `.sig` together and run
+`kowalski update --from <absolute path to ZIP>`. The updater verifies the same
+signature and archive layout as a downloaded release. The previous daemon
+guards the new one, taking a database snapshot after shutdown. If the candidate
+does not become ready and stay healthy, it restores the previous executables
+and snapshot. `update.json` beside the database records the result and lets the
+next launch finish an interrupted rollback. Preserve it during diagnosis.
+
 The signing seed lives outside the repository at `<Roaming AppData>\sadirano\kowalski-dev\release-signing-key.txt`, resolved through the Windows known-folder API. It has an offline backup. Losing both copies means users must reinstall by hand. Key rotation requires a release signed with the old key that carries the new public key.
 
 ## For forks

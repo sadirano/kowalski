@@ -68,8 +68,12 @@ async function showSettings() {
     id('set-port').textContent = pref('http_port', location.port || '47100');
     apiJSON('GET', '/api/version').then(data => {
       id('set-version').textContent = data.version;
-      id('update-row').style.display = data.update_repo ? '' : 'none';
-      if (!data.update_repo) id('update-result').style.display = 'none';
+      id('update-row').style.display = data.update_repo || _lastUpdateOutcome ? '' : 'none';
+      if (!data.update_repo && !_lastUpdateOutcome) id('update-result').style.display = 'none';
+      else if (_lastUpdateOutcome) {
+        id('update-result').style.display = 'flex';
+        id('update-message').textContent = updateOutcomeText(_lastUpdateOutcome);
+      }
     }).catch(e => showError(e.message));
     renderPaidRows(false);
     renderLockRows(false);
@@ -218,10 +222,10 @@ async function restartKowalski() {
 
 // A restart can finish between two polls, so wait for a different process
 // to answer rather than for the old one to go quiet.
-async function waitForDaemon(before) {
+async function waitForDaemon(before, attempts = 80) {
   const banner = id('restart-banner');
   banner.textContent = t('restarting');
-  for (let attempt = 0; attempt < 80; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 500));
     try {
       if ((await apiJSON('GET', '/api/version')).pid !== before) { location.reload(); return; }
@@ -233,6 +237,19 @@ async function waitForDaemon(before) {
 let _updateRelease = null;
 let _updateConfirm = false;
 let _updateBusy = false;
+let _lastUpdateOutcome = null;
+function updateOutcomeText(last) {
+  return last.phase === 'committed'
+    ? t('update_done', { to: last.to })
+    : t('update_rolled_back', { to: last.to, from: last.from, reason: last.reason });
+}
+async function showUpdateOutcome() {
+  const result = await apiJSON('GET', '/api/update?outcome=1');
+  if (!result.last) return;
+  _lastUpdateOutcome = result.last;
+  showToast(updateOutcomeText(result.last), result.last.phase === 'rolled_back');
+  await apiJSON('POST', '/api/update/ack', { id: result.last.id });
+}
 async function checkKowalskiUpdate() {
   if (_updateBusy) return;
   _updateBusy = true;
@@ -271,7 +288,7 @@ async function installKowalskiUpdate() {
   try {
     const before = (await apiJSON('GET', '/api/version')).pid;
     await apiJSON('POST', '/api/update', { version: _updateRelease.version });
-    await waitForDaemon(before);
+    await waitForDaemon(before, 320);
   } catch (e) {
     banner.classList.remove('show');
     showError(e.data?.error === 'update_bad_signature' ? t('update_bad_signature')
