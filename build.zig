@@ -4,19 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const sqlite = b.dependency("sqlite", .{});
-    // A private build compiles its provider in; the public build has none.
-    // A package that depends on kowalski passes its own file as `provider`.
-    const provider_path = b.option(std.Build.LazyPath, "provider", "Zig file of a private provider (see src/provider_api.zig)");
     const contract = b.addModule("kowalski_provider", .{ .root_source_file = b.path("src/provider_api.zig"), .target = target, .optimize = optimize });
     const provider_check = b.addModule("kowalski_provider_check", .{ .root_source_file = b.path("src/provider_check.zig"), .target = target, .optimize = optimize });
     provider_check.addImport("kowalski_provider", contract);
-    const provider = b.createModule(.{
-        .root_source_file = provider_path orelse b.path("src/provider_none.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    provider.addImport("kowalski_provider", contract);
-    const seams: Seams = .{ .sqlite = sqlite, .contract = contract, .provider = provider };
+    const seams: Seams = .{ .sqlite = sqlite, .contract = contract };
 
     const exe = b.addExecutable(.{
         .name = "kowalski",
@@ -53,12 +44,18 @@ pub fn build(b: *std.Build) void {
     example_module.addImport("kowalski_provider", contract);
     contract_tests.root_module.addImport("example_provider", example_module);
     test_step.dependOn(&b.addRunArtifact(contract_tests).step);
+    const example_dll = b.addLibrary(.{ .name = "example-provider", .linkage = .dynamic, .root_module = example_module });
+    const provider_test_options = b.addOptions();
+    provider_test_options.addOptionPath("example_dll", example_dll.getEmittedBin());
+    tests.root_module.addOptions("provider_test_options", provider_test_options);
+    const example_step = b.step("example-provider", "Build and install the example provider DLL");
+    const install_example = b.addInstallArtifact(example_dll, .{});
+    example_step.dependOn(&install_example.step);
 }
 
 const Seams = struct {
     sqlite: *std.Build.Dependency,
     contract: *std.Build.Module,
-    provider: *std.Build.Module,
 };
 
 fn makeModule(
@@ -75,7 +72,6 @@ fn makeModule(
         .link_libc = true,
     });
     module.addImport("kowalski_provider", seams.contract);
-    module.addImport("provider_impl", seams.provider);
     // The release version has one home: build.zig.zon.
     const options = b.addOptions();
     options.addOption([]const u8, "version", @import("build.zig.zon").version);

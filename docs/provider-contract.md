@@ -1,11 +1,17 @@
 # Provider contract v3
 
-This is the normative contract for providers compiled into kowalski with
-`zig build -Dprovider=<file>`. The provider imports `kowalski_provider` and
-exports `kowalskiProvider` and `kowalskiProviderInfo`. Runtime loading is not
-part of this version.
+This is the normative contract for provider DLLs loaded by kowalski. Build
+one Windows x86_64 DLL that imports `kowalski_provider` and exports
+`kowalskiProvider` and `kowalskiProviderInfo`. The example builds with
+`zig build example-provider`.
 
-Only the daemon process loads and calls the provider; the CLI uses the daemon.
+Place one DLL directly in the `providers` folder beside the database. The
+daemon copies it into its private cache, verifies its SHA-256, and loads it
+only after the user approves that exact hash. DLL dependencies may be loaded
+only from System32. A Windows version resource is recommended: its
+ProductName, FileVersion, and CompanyName are displayed as publisher claims
+before approval. Only the daemon process loads and calls the provider; the
+CLI uses the daemon.
 
 ## ABI and versioning
 

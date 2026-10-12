@@ -1,5 +1,5 @@
 //! Provider ABI v3. Full rules: docs/provider-contract.md.
-//! A compiled-in provider exports kowalskiProvider and kowalskiProviderInfo.
+//! A provider DLL exports kowalskiProvider and kowalskiProviderInfo.
 
 /// Bumped on any incompatible change to the table or the JSON shapes below.
 pub const version: u32 = 3;

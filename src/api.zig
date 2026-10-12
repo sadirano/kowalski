@@ -35,7 +35,7 @@ pub const App = struct {
     clock: *const fn () i64,
     /// Set by POST /api/shutdown; the daemon stops after answering.
     stop_requested: bool = false,
-    /// Binding instance of the compiled-in provider; null without one.
+    /// Binding instance of the loaded provider; null without one.
     provider: ?[]const u8 = null,
     provider_status: ProviderStatus = .{},
     /// The provider's static traits; empty without one.
@@ -44,10 +44,11 @@ pub const App = struct {
 };
 
 pub const ProviderStatus = struct {
-    state: enum { none, loaded, unavailable } = .none,
+    state: enum { none, loaded, unavailable, awaiting_approval } = .none,
     name: []const u8 = "",
     build: []const u8 = "",
     reason: []const u8 = "",
+    candidate: ?@import("provider_loader.zig").Candidate = null,
 };
 
 const SessionRecord = struct { id: i64, session: sessions.Session };
@@ -599,7 +600,7 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
 
 pub const PaidBreak = struct { from_min: u16, to_min: u16, minutes: u16 };
 
-/// What the compiled-in provider allows (see `traits` in the contract).
+/// What the loaded provider allows (see `traits` in the contract).
 pub const Traits = struct {
     sessions: bool = false,
     /// Opens a ref: `{ref}` is replaced by the percent-encoded ref.

@@ -34,7 +34,9 @@ pub const usage =
     \\  day [<YYYY-MM-DD>]           totals, hops, timeline and summary
     \\  summary [<YYYY-MM-DD>] [<text>]  show or set a day's summary ("" clears)
     \\  settings | set <key> <value> | unset <key>
-    \\  provider                     the compiled-in provider and its fields
+    \\  provider                     provider status and fields
+    \\  provider trust <sha256>      approve a DLL against a known SHA-256
+    \\  provider trust --current     accept the current DLL as it is
     \\  provider login               sign in to the provider (prompts for the details)
     \\  bind <#id> <ref>             bind a task to an external ref (fields come from the provider)
     \\  postings [<YYYY-MM-DD>]      what can be posted for a day, and what was
@@ -514,6 +516,22 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
     }
     if (eql(u8, command, "provider")) {
         if (args.len == 1 and eql(u8, args[0], "login")) return providerLogin(ctx);
+        if (args.len == 2 and eql(u8, args[0], "trust")) {
+            const current = eql(u8, args[1], "--current");
+            const sha = if (current) blk: {
+                const status_reply = try call(ctx, "GET", "/api/provider", null);
+                if (!try settle(ctx, status_reply)) return .ok;
+                const provider_reply = try parse(struct { status: api.ProviderStatus }, ctx, status_reply.body);
+                break :blk if (provider_reply.status.candidate) |candidate| candidate.sha256 else return error.Usage;
+            } else args[1];
+            if (!@import("provider_loader.zig").validHash(sha)) return error.Usage;
+            const approved = try call(ctx, "POST", "/api/provider/approve", try jsonBody(ctx, .{ .sha256 = sha, .how = if (current) "accepted" else "compared" }));
+            if (!try settle(ctx, approved)) return .ok;
+            const result = try parse(struct { restart: bool }, ctx, approved.body);
+            if (current) try ctx.out.writeAll("trusted the current file as it is, without comparing it with a published hash\n") else try ctx.out.writeAll("provider hash approved\n");
+            if (result.restart) try ctx.out.writeAll("restart the daemon to load the approved provider\n");
+            return .ok;
+        }
         if (args.len != 0) return error.Usage;
         const reply = try call(ctx, "GET", "/api/provider", null);
         if (!try settle(ctx, reply)) return .ok;
@@ -523,6 +541,16 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
             .none => try ctx.out.writeAll("no provider\n"),
             .unavailable => try ctx.out.print("provider unavailable: {s}\n", .{r.status.reason}),
             .loaded => try ctx.out.print("provider  {s} {s} (loaded)\n", .{ r.status.name, r.status.build }),
+            .awaiting_approval => try ctx.out.writeAll("provider awaiting approval\n"),
+        }
+        if (r.status.candidate) |candidate| {
+            const safe_file = try ctx.a.dupe(u8, candidate.file);
+            for (safe_file) |*c| if (!std.ascii.isPrint(c.*)) { c.* = '?'; };
+            try ctx.out.print("candidate  {s} ({d} bytes, modified {d} ms)\n", .{ safe_file, candidate.size, candidate.modified_ms });
+            try ctx.out.print("claimed product  {s}\nclaimed version  {s}\nclaimed company  {s}\n", .{ candidate.version.product_name, candidate.version.file_version, candidate.version.company_name });
+            try ctx.out.print("sha256  {s}\n", .{candidate.sha256});
+            try ctx.out.print("approve after comparison: kowalski provider trust {s}\n", .{candidate.sha256});
+            try ctx.out.writeAll("accept as is: kowalski provider trust --current\n");
         }
         const instance = r.instance orelse {
             return .ok;

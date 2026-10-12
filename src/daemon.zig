@@ -11,7 +11,7 @@ const clock = @import("clock.zig");
 const events = @import("events.zig");
 const worker = @import("worker.zig");
 const contract = @import("kowalski_provider");
-const provider_impl = @import("provider_impl");
+const provider_loader = @import("provider_loader.zig");
 const tour_mod = @import("tour.zig");
 const demo = @import("demo.zig");
 
@@ -48,6 +48,9 @@ const Daemon = struct {
     app: api.App,
     provider: ?worker.Worker = null,
     provider_table: ?*contract.Table = null,
+    provider_file: ?provider_loader.Verified = null,
+    db_path: []const u8,
+    traits_allocator: std.mem.Allocator,
     /// One request's provider call at a time; the worker refuses a second.
     provider_turn: Io.Mutex = .init,
     stop: Io.Event = .unset,
@@ -202,58 +205,21 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
 
     var traits_arena = std.heap.ArenaAllocator.init(gpa);
     defer traits_arena.deinit();
-    var d: Daemon = .{ .io = io, .gpa = gpa, .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .running_post = worker.runningPost } };
+    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .running_post = worker.runningPost } };
     // The tour's sandbox sits next to the database and never outlives a run.
     const tour_path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", tour_mod.file_name });
     defer gpa.free(tour_path);
     tour_mod.removeFiles(io, tour_path);
     d.tour_path = tour_path;
     defer if (d.tour) |t| t.destroy(io);
+    defer if (d.provider_file) |file| provider_loader.close(file);
     defer if (d.provider_table) |table| {
         if (worker.idle()) {
             table.deinit(table.context);
             std.heap.page_allocator.destroy(table);
         }
     };
-    if (provider_impl.kowalskiProvider(contract.version)) |table| {
-        if (table.version != contract.version) {
-            d.app.provider_status = .{ .state = .unavailable, .reason = "provider speaks a different contract version" };
-            log("provider answered version {d}, need {d}; running without it", .{ table.version, contract.version });
-        } else {
-            const InfoShape = struct { contracts: []const u32, name: []const u8, build: []const u8 };
-            const info = std.json.parseFromSliceLeaky(InfoShape, traits_arena.allocator(), provider_impl.kowalskiProviderInfo().slice(), .{ .ignore_unknown_fields = true }) catch null;
-            if (info) |metadata| {
-                d.app.provider_status.name = try printableAscii(traits_arena.allocator(), metadata.name, 128);
-                d.app.provider_status.build = try printableAscii(traits_arena.allocator(), metadata.build, 128);
-                log("provider info: {s} ({s})", .{ d.app.provider_status.name, d.app.provider_status.build });
-            } else log("provider info: invalid JSON", .{});
-            const data_dir = try std.fs.path.resolve(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", "providers", table.instance.slice() });
-            defer gpa.free(data_dir);
-            try std.Io.Dir.cwd().createDirPath(io, data_dir);
-            const config = try std.json.Stringify.valueAlloc(gpa, .{ .contract = contract.version, .data_dir = data_dir }, .{});
-            defer gpa.free(config);
-            var context: ?*anyopaque = null;
-            const status = table.init(table.context, .of(config), &context);
-            defer if (status.message.ptr != null) table.free(context, status.message);
-            if (status.code != 0) {
-                const message = try printableAscii(traits_arena.allocator(), status.message.slice(), 200);
-                d.app.provider_status.state = .unavailable;
-                d.app.provider_status.reason = try std.fmt.allocPrint(traits_arena.allocator(), "init failed: {s}", .{message});
-                log("provider init failed ({d}): {s}; running without it", .{ status.code, message });
-            } else {
-                const copy = try std.heap.page_allocator.create(contract.Table);
-                copy.* = table.*;
-                copy.context = context;
-                d.provider_table = copy;
-                d.provider = .{ .table = copy, .io = io, .late = onLate, .late_context = &d };
-                d.app.provider = copy.instance.slice();
-                d.app.provider_status.state = .loaded;
-                try store.setSetting("provider_instance", copy.instance.slice(), clock.nowMs());
-                d.app.traits = api.parseTraits(traits_arena.allocator(), copy.traits.slice());
-                log("provider: {s}", .{copy.instance.slice()});
-            }
-        }
-    }
+    try startProvider(&d);
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
     var listener = address.listen(io, .{}) catch |err| {
         log("cannot listen on 127.0.0.1:{d}: {s}", .{ port, @errorName(err) });
@@ -298,10 +264,233 @@ fn printableAscii(a: std.mem.Allocator, source: []const u8, limit: usize) ![]con
     return result;
 }
 
+const Trust = struct { sha: []const u8, last_good: ?[]const u8, loading: ?[]const u8 };
+
+fn readTrust(db: *sqlite.Db, a: std.mem.Allocator) !?Trust {
+    var stmt = try db.prepare("SELECT sha256,last_good,loading FROM provider_trust WHERE id=1");
+    defer stmt.finalize();
+    if (try stmt.step() == .done) return null;
+    return .{
+        .sha = try a.dupe(u8, stmt.columnText(0).?),
+        .last_good = if (stmt.columnText(1)) |value| try a.dupe(u8, value) else null,
+        .loading = if (stmt.columnText(2)) |value| try a.dupe(u8, value) else null,
+    };
+}
+
+fn markLoading(db: *sqlite.Db, sha: ?[]const u8) !void {
+    var stmt = try db.prepare("UPDATE provider_trust SET loading=?1 WHERE id=1");
+    defer stmt.finalize();
+    try stmt.bindOptionalText(1, sha);
+    _ = try stmt.step();
+}
+
+fn markGood(db: *sqlite.Db, sha: []const u8) !void {
+    var stmt = try db.prepare("UPDATE provider_trust SET loading=NULL,last_good=?1 WHERE id=1");
+    defer stmt.finalize();
+    try stmt.bindText(1, sha);
+    _ = try stmt.step();
+}
+
+fn approveTrust(db: *sqlite.Db, sha: []const u8, how: []const u8) !void {
+    var stmt = try db.prepare("INSERT INTO provider_trust(id,sha256,how,approved_ms,loading) VALUES(1,?1,?2,?3,NULL) ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256,how=excluded.how,approved_ms=excluded.approved_ms,loading=NULL");
+    defer stmt.finalize();
+    try stmt.bindText(1, sha);
+    try stmt.bindText(2, how);
+    try stmt.bindI64(3, clock.nowMs());
+    _ = try stmt.step();
+}
+
+fn startProvider(d: *Daemon) !void {
+    const a = d.traits_allocator;
+    const result = provider_loader.scan(d.io, a, d.db_path) catch |err| {
+        d.app.provider_status = .{ .state = .unavailable, .reason = try std.fmt.allocPrint(a, "provider scan failed: {s}", .{@errorName(err)}) };
+        return;
+    };
+    switch (result) {
+        .none => return,
+        .multiple => d.app.provider_status = .{ .state = .unavailable, .reason = "more than one DLL in the providers folder" },
+        .candidate => |scanned| {
+            var candidate = scanned;
+            // Verify the cache even before displaying metadata as an approvable candidate.
+            const checked = provider_loader.verified(a, d.db_path, candidate.sha256) catch |err| {
+                d.app.provider_status = .{ .state = .unavailable, .reason = try std.fmt.allocPrint(a, "provider cache failed: {s}", .{@errorName(err)}) };
+                return;
+            };
+            candidate.version = try provider_loader.versionInfo(a, checked.path);
+            provider_loader.close(checked);
+            const trust = try readTrust(d.app.store.db, a);
+            if (trust == null or !std.mem.eql(u8, trust.?.sha, candidate.sha256)) {
+                d.app.provider_status = .{ .state = .awaiting_approval, .candidate = candidate };
+                if (trust) |previous| if (previous.last_good) |good| {
+                    if (provider_loader.validHash(good)) {
+                        try loadHash(d, good);
+                        if (d.app.provider != null) d.app.provider_status.candidate = candidate;
+                    }
+                };
+                return;
+            }
+            if (trust.?.loading) |loading| if (std.mem.eql(u8, loading, candidate.sha256)) {
+                d.app.provider_status = .{ .state = .unavailable, .reason = "the provider stopped kowalski while starting; approve it again to retry", .candidate = candidate };
+                return;
+            };
+            try loadHash(d, candidate.sha256);
+        },
+    }
+}
+
+fn loadHash(d: *Daemon, sha: []const u8) !void {
+    const a = d.traits_allocator;
+    const trust = try readTrust(d.app.store.db, a);
+    if (trust) |current| if (current.loading) |loading| if (std.mem.eql(u8, loading, sha)) {
+        d.app.provider_status.state = .unavailable;
+        d.app.provider_status.reason = "the provider stopped kowalski while starting; approve it again to retry";
+        return;
+    };
+    const verified = provider_loader.verified(a, d.db_path, sha) catch |err| {
+        d.app.provider_status.state = .unavailable;
+        d.app.provider_status.reason = try std.fmt.allocPrint(a, "provider cache failed: {s}", .{@errorName(err)});
+        return;
+    };
+    var keep_file = false;
+    defer if (!keep_file) provider_loader.close(verified);
+    try markLoading(d.app.store.db, sha);
+    defer markLoading(d.app.store.db, null) catch {};
+    const module = provider_loader.load(a, verified) catch |err| {
+        d.app.provider_status.state = .unavailable;
+        d.app.provider_status.reason = try std.fmt.allocPrint(a, "provider DLL failed: {s}", .{@errorName(err)});
+        return;
+    };
+    // Once Windows has loaded the module, retain the read lock for this process.
+    d.provider_file = verified;
+    keep_file = true;
+    const table = module.entry(contract.version) orelse {
+        d.app.provider_status = .{ .state = .unavailable, .reason = "provider speaks a different contract version", .candidate = d.app.provider_status.candidate };
+        return;
+    };
+    if (table.version != contract.version) {
+        d.app.provider_status = .{ .state = .unavailable, .reason = "provider speaks a different contract version", .candidate = d.app.provider_status.candidate };
+        return;
+    }
+    const instance = table.instance.slice();
+    if (instance.len == 0 or instance.len > 128) {
+        d.app.provider_status.state = .unavailable;
+        d.app.provider_status.reason = "invalid provider instance";
+        return;
+    }
+    for (instance) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
+        d.app.provider_status.state = .unavailable;
+        d.app.provider_status.reason = "invalid provider instance";
+        return;
+    };
+    const InfoShape = struct { name: []const u8, build: []const u8 };
+    const info = std.json.parseFromSliceLeaky(InfoShape, a, module.info().slice(), .{ .ignore_unknown_fields = true }) catch null;
+    if (info) |metadata| {
+        d.app.provider_status.name = try printableAscii(a, metadata.name, 128);
+        d.app.provider_status.build = try printableAscii(a, metadata.build, 128);
+    }
+    const data_dir = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(d.db_path) orelse ".", "providers", instance });
+    try std.Io.Dir.cwd().createDirPath(d.io, data_dir);
+    const config = try std.json.Stringify.valueAlloc(a, .{ .contract = contract.version, .data_dir = data_dir }, .{});
+    var context: ?*anyopaque = null;
+    const status = table.init(table.context, .of(config), &context);
+    defer if (status.message.ptr != null) table.free(context, status.message);
+    if (status.code != 0) {
+        const message = try printableAscii(a, status.message.slice(), 200);
+        d.app.provider_status.state = .unavailable;
+        d.app.provider_status.reason = try std.fmt.allocPrint(a, "init failed: {s}", .{message});
+        return;
+    }
+    const copy = try std.heap.page_allocator.create(contract.Table);
+    copy.* = table.*;
+    copy.context = context;
+    d.provider_table = copy;
+    d.provider = .{ .table = copy, .io = d.io, .late = onLate, .late_context = d };
+    d.app.provider = copy.instance.slice();
+    d.app.provider_status.state = .loaded;
+    d.app.provider_status.reason = "";
+    try d.app.store.setSetting("provider_instance", copy.instance.slice(), clock.nowMs());
+    d.app.traits = api.parseTraits(a, copy.traits.slice());
+    try markGood(d.app.store.db, sha);
+    log("provider: {s}", .{copy.instance.slice()});
+}
+
 test "provider status text is printable and capped" {
     const value = try printableAscii(std.testing.allocator, "a\x00\n\xffb", 4);
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("a???", value);
+}
+
+test "provider DLL discovery, approval, fallback and retry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const db_path = try std.fs.path.join(a, &.{ root, "work.db" });
+    const drop_dir = try std.fs.path.join(a, &.{ root, "providers" });
+    const drop = try std.fs.path.join(a, &.{ drop_dir, "sample.dll" });
+    var db: sqlite.Db = .{};
+    try db.open(db_path);
+    defer db.close();
+    var store = try store_mod.Store.init(&db, a);
+    var first: Daemon = .{ .io = io, .gpa = a, .db_path = db_path, .traits_allocator = a, .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs } };
+    try startProvider(&first);
+    try std.testing.expectEqual(.none, first.app.provider_status.state);
+
+    try std.Io.Dir.cwd().createDirPath(io, drop_dir);
+    const source = @import("provider_test_options").example_dll;
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), drop, io, .{});
+    const source_bytes = try std.Io.Dir.cwd().readFileAlloc(io, source, a, .limited(16 * 1024 * 1024));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_bytes, &digest, .{});
+    const expected_hex = std.fmt.bytesToHex(digest, .lower);
+    try startProvider(&first);
+    try std.testing.expectEqual(.awaiting_approval, first.app.provider_status.state);
+    const candidate = first.app.provider_status.candidate.?;
+    try std.testing.expectEqualStrings(&expected_hex, candidate.sha256);
+    try std.testing.expectEqual(@as(u64, source_bytes.len), candidate.size);
+    const wrong = api.Request{ .method = .POST, .target = "/api/provider/approve", .host = "127.0.0.1:47100", .marker = true, .body = "{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"how\":\"compared\"}" };
+    try std.testing.expectEqual(std.http.Status.conflict, providerCommand(&first, a, wrong).?.status);
+    const approval_body = try std.json.Stringify.valueAlloc(a, .{ .sha256 = candidate.sha256, .how = "compared" }, .{});
+    const approval = api.Request{ .method = .POST, .target = "/api/provider/approve", .host = "127.0.0.1:47100", .marker = true, .body = approval_body };
+    const approved = providerCommand(&first, a, approval).?;
+    try std.testing.expectEqual(std.http.Status.ok, approved.status);
+    try std.testing.expect(std.mem.indexOf(u8, approved.body, "\"restart\":false") != null);
+    try std.testing.expectEqual(.loaded, first.app.provider_status.state);
+    try std.testing.expectEqualStrings("example", first.app.provider_status.name);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = drop, .data = "different bytes" });
+    var second: Daemon = .{ .io = io, .gpa = a, .db_path = db_path, .traits_allocator = a, .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs } };
+    try startProvider(&second);
+    try std.testing.expectEqual(.loaded, second.app.provider_status.state);
+    try std.testing.expect(second.app.provider_status.candidate != null);
+    try std.testing.expect(!std.mem.eql(u8, candidate.sha256, second.app.provider_status.candidate.?.sha256));
+
+    const extra = try std.fs.path.join(a, &.{ drop_dir, "extra.dll" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = extra, .data = "other" });
+    var third: Daemon = .{ .io = io, .gpa = a, .db_path = db_path, .traits_allocator = a, .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs } };
+    try startProvider(&third);
+    try std.testing.expectEqual(.unavailable, third.app.provider_status.state);
+    try std.testing.expectEqualStrings("more than one DLL in the providers folder", third.app.provider_status.reason);
+
+    try std.Io.Dir.cwd().deleteFile(io, extra);
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), drop, io, .{ .replace = true });
+    try markLoading(&db, candidate.sha256);
+    var fourth: Daemon = .{ .io = io, .gpa = a, .db_path = db_path, .traits_allocator = a, .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs } };
+    try startProvider(&fourth);
+    try std.testing.expectEqual(.unavailable, fourth.app.provider_status.state);
+    try std.testing.expect(fourth.app.provider_status.candidate != null);
+    try std.testing.expectEqual(std.http.Status.ok, providerCommand(&fourth, a, approval).?.status);
+    try std.testing.expectEqual(.loaded, fourth.app.provider_status.state);
+    for ([_]*Daemon{ &first, &second, &fourth }) |d| {
+        if (d.provider_table) |table| {
+            table.deinit(table.context);
+            std.heap.page_allocator.destroy(table);
+        }
+        if (d.provider_file) |file| provider_loader.close(file);
+    }
 }
 
 fn heartbeatLoop(d: *Daemon) Io.Cancelable!void {
@@ -338,6 +527,46 @@ fn tourCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Resp
     };
     log("tour started ({s})", .{@tagName(lang)});
     return api.answer(a, .ok, .{ .ok = true });
+}
+
+/// Approval is handled by the daemon because it owns the DLL and the trust row.
+/// Called with the database lock held.
+fn providerCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
+    const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
+    if (!std.mem.eql(u8, path, "/api/provider/approve")) return null;
+    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
+    const Body = struct { sha256: []const u8, how: []const u8 };
+    const body = std.json.parseFromSliceLeaky(Body, a, request.body, .{ .ignore_unknown_fields = true }) catch
+        return api.answer(a, .bad_request, .{ .@"error" = "body" });
+    if (!provider_loader.validHash(body.sha256) or
+        !(std.mem.eql(u8, body.how, "compared") or std.mem.eql(u8, body.how, "accepted")))
+        return api.answer(a, .bad_request, .{ .@"error" = "body" });
+    const previous = d.app.provider_status.candidate orelse
+        return api.answer(a, .conflict, .{ .@"error" = "candidate_changed" });
+    if (!std.mem.eql(u8, body.sha256, previous.sha256))
+        return api.answer(a, .conflict, .{ .@"error" = "candidate_changed" });
+    const scanned = provider_loader.scan(d.io, a, d.db_path) catch
+        return api.answer(a, .internal_server_error, .{ .@"error" = "provider_scan" });
+    const current = switch (scanned) {
+        .candidate => |candidate| candidate,
+        else => return api.answer(a, .conflict, .{ .@"error" = "candidate_changed" }),
+    };
+    if (!std.mem.eql(u8, body.sha256, current.sha256))
+        return api.answer(a, .conflict, .{ .@"error" = "candidate_changed" });
+    const checked = provider_loader.verified(a, d.db_path, current.sha256) catch
+        return api.answer(a, .conflict, .{ .@"error" = "candidate_changed" });
+    provider_loader.close(checked);
+    approveTrust(d.app.store.db, body.sha256, body.how) catch
+        return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+    const restart = d.app.provider != null;
+    if (restart) {
+        d.app.provider_status.candidate = null;
+    } else {
+        startProvider(d) catch
+            return api.answer(a, .internal_server_error, .{ .@"error" = "provider_load" });
+    }
+    return api.answer(a, .ok, .{ .restart = restart, .status = d.app.provider_status });
 }
 
 fn acceptLoop(d: *Daemon, listener: *Io.net.Server, connections: *Io.Group) Io.Cancelable!void {
@@ -510,6 +739,7 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
         try d.mutex.lock(d.io);
         defer d.mutex.unlock(d.io);
         if (tourCommand(d, a, request)) |r| break :blk r;
+        if (providerCommand(d, a, request)) |r| break :blk r;
         break :blk api.handle(&d.app, a, request);
     };
     // Provider calls run without the database lock.

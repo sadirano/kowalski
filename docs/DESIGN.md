@@ -90,8 +90,8 @@ The data model and behavior of kowalski. Contributor rules are in
   Credential Manager). Passwords and tokens never enter kowalski's store or
   logs. `kowalski provider login` asks the prompts the provider lists
   (secret ones masked with `*`) and hands the answers straight to it.
-- A provider is compiled in (`zig build -Dprovider=<file>`). The public
-  build has none and is a complete tracker.
+- A provider is a user-approved DLL in the `providers` folder. With no
+  provider, kowalski remains a complete tracker.
 - **Posting hours** goes through `sending`, `confirmed`, `unknown` and
   `cancelled`. The provider decides whether and how much to post from the
   day's focus and confirmed postings. Several confirmed postings can share

@@ -39,8 +39,8 @@ hold the design notes.
 
 The public build tracks tasks locally and needs nothing else. An optional
 provider connects tasks to an external ticketing system, for looking up a
-task by its reference and for posting hours. A provider is compiled in with
-`zig build -Dprovider=<file>`; `examples/provider.zig` shows the API.
+task by its reference and for posting hours. See [Attaching a provider](docs/guide.md#attaching-a-provider)
+for installation and approval; `examples/provider.zig` shows the API.
 The [provider contract](docs/provider-contract.md) defines its lifecycle,
 ownership, JSON shapes, and version rules.
 

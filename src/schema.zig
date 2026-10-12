@@ -46,10 +46,14 @@ pub fn ensure(db: *sqlite.Db) !void {
             "ALTER TABLE postings ADD COLUMN covered_end_ms INTEGER CHECK(covered_end_ms IS NULL OR covered_end_ms>covered_start_ms);" ++
             "PRAGMA user_version=3;",
     );
+    if (version < 4) try db.exec(
+        "CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);" ++
+            "PRAGMA user_version=4;",
+    );
     try tx.commit();
 }
 
-pub const current: i64 = 3;
+pub const current: i64 = 4;
 
 test "schema constraints and version" {
     var db: sqlite.Db = .{};
@@ -100,4 +104,17 @@ test "a version 2 database gains posting coverage and keeps its rows" {
     defer stmt.finalize();
     _ = try stmt.step();
     try std.testing.expectEqual(@as(i64, 500000), stmt.columnI64(0));
+}
+
+test "a version 3 database gains provider trust and keeps work history" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    try db.exec("CREATE TABLE postings(id INTEGER PRIMARY KEY, amount_micro INTEGER); INSERT INTO postings VALUES(1,500000); PRAGMA user_version=3;");
+    try ensure(&db);
+    var stmt = try db.prepare("SELECT amount_micro FROM postings WHERE id=1");
+    defer stmt.finalize();
+    try std.testing.expectEqual(.row, try stmt.step());
+    try std.testing.expectEqual(@as(i64, 500000), stmt.columnI64(0));
+    try db.exec("INSERT INTO provider_trust(id,sha256,how,approved_ms) VALUES(1,'abc','compared',1)");
 }

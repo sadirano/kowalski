@@ -205,6 +205,7 @@ test {
     _ = @import("api.zig");
     _ = @import("cli.zig");
     _ = @import("daemon.zig");
+    _ = @import("provider_loader.zig");
     _ = @import("events.zig");
     _ = @import("launch.zig");
     _ = @import("worker.zig");

@@ -3,7 +3,7 @@
 kowalski records your workday as you switch between tasks. Each stretch of
 work on a task becomes a timed interval. The dashboard reports the day, says
 when you can clock out, and posts hours to a ticketing system when a
-provider is built in.
+provider is attached.
 
 The daemon serves the dashboard at `http://127.0.0.1:47100/`. Opening
 `kowalski.exe` starts it and opens the dashboard in your browser (a switch
@@ -216,6 +216,21 @@ the task's time, the days it was worked on (click one to open it) and a ▶
 to switch to it. `↑` and `↓` browse, `Enter` opens the latest day. The
 last row starts a new task with what you typed.
 
+## Attaching a provider
+
+Drop one provider DLL directly in the `providers` folder next to the
+database, then run `kowalski provider` to see its full SHA-256, file size,
+and version claims. Compare the SHA-256 with the hash its publisher gives
+you and run `kowalski provider trust <sha256>`. If you choose to trust the
+file as it is without that comparison, run `kowalski provider trust
+--current`. Both commands require the daemon to be running.
+
+When you drop in a new version, kowalski keeps using the last approved
+version while the new one waits for approval. After approving it, restart
+the daemon to load it. This catches a DLL changed by accident or without
+you noticing; it does not protect against software already running as your
+Windows user.
+
 ## Post hours
 
 ![Post hours for a day](img/post.png)
@@ -320,6 +335,6 @@ kowalski --db <scratch>/kowalski.db start
 ```
 
 Only one daemon runs per user, so stop your own first. `demo` refuses a
-database that already has tasks. Its tasks are bound to the compiled-in
+database that already has tasks. Its tasks are bound to the selected
 provider (or `example`) with the fields Client, System and Situation; a
 provider that declares those fields shows them.

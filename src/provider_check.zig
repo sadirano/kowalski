@@ -1,4 +1,4 @@
-//! Reusable contract checks for a compiled-in provider.
+//! Reusable contract checks for a provider.
 const std = @import("std");
 const contract = @import("kowalski_provider");
 

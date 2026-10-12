@@ -1,7 +1,7 @@
 //! A minimal provider showing the contract in src/provider_api.zig. It talks
-//! to nothing: lookups echo the ref, posts succeed. Build kowalski with it:
+//! to nothing: lookups echo the ref, posts succeed. Build its DLL with:
 //!
-//!     zig build -Dprovider=examples/provider.zig
+//!     zig build example-provider
 //!
 //! A real provider keeps its own HTTP/TLS, sessions and credentials (Windows
 //! Credential Manager) and never hands secrets to kowalski.
@@ -92,10 +92,10 @@ const table: k.Table = .{
     .deinit = deinit,
 };
 
-pub fn kowalskiProvider(requested: u32) callconv(.c) ?*const k.Table {
+pub export fn kowalskiProvider(requested: u32) callconv(.c) ?*const k.Table {
     return if (requested == k.version) &table else null;
 }
 
-pub fn kowalskiProviderInfo() callconv(.c) k.Bytes {
+pub export fn kowalskiProviderInfo() callconv(.c) k.Bytes {
     return .of("{\"contracts\":[3],\"name\":\"example\",\"build\":\"sample\"}");
 }
