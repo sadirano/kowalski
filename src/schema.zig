@@ -57,15 +57,24 @@ pub fn ensure(db: *sqlite.Db) !void {
         "CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);" ++
             "PRAGMA user_version=4;",
     );
-    if (version > 0) try migrateV5(db);
-    try db.exec("PRAGMA user_version=5");
+    if (version > 0 and version < 5) try migrateV5(db);
+    if (version < 6) try db.exec(
+        "ALTER TABLE provider_trust ADD COLUMN mode TEXT NOT NULL DEFAULT 'manual' CHECK(mode IN ('manual','source'));" ++
+            "CREATE TABLE provider_source(id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL, source TEXT NOT NULL, public_key TEXT NOT NULL, provider TEXT NOT NULL, channel TEXT NOT NULL, highest_sequence INTEGER NOT NULL, highest_digest TEXT NOT NULL, enrolled_ms INTEGER NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), last_check_ms INTEGER, last_error TEXT);" ++
+            "CREATE TABLE provider_release(generation INTEGER NOT NULL, sequence INTEGER NOT NULL, digest TEXT NOT NULL, manifest TEXT NOT NULL, signature TEXT NOT NULL, PRIMARY KEY(generation,sequence));" ++
+            "CREATE TABLE provider_generation(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);" ++
+            "INSERT INTO provider_generation(id,value) VALUES(1,0);" ++
+            "CREATE TABLE provider_quarantine(sha256 TEXT PRIMARY KEY);" ++
+            "INSERT OR IGNORE INTO provider_quarantine(sha256) SELECT loading FROM provider_trust WHERE loading IS NOT NULL;",
+    );
+    try db.exec("PRAGMA user_version=6");
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
     if (try check.step() != .done) return error.ForeignKeyViolation;
     try tx.commit();
 }
 
-pub const current: i64 = 5;
+pub const current: i64 = 6;
 
 const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
@@ -184,7 +193,7 @@ fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
 }
 
 fn assertV5(db: *sqlite.Db) !void {
-    try std.testing.expectEqual(@as(i64, 5), try scalar(db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 6), try scalar(db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
     try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
     try std.testing.expectEqual(@as(i64, 12), try scalar(db, "SELECT id FROM intervals"));
@@ -266,4 +275,36 @@ test "file upgrade makes a v4 backup, current file does not" {
         try std.testing.expectEqual(@as(i64, 12), try scalar(&copy, "SELECT id FROM intervals"));
     }
     try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "populated v5 upgrades to v6 without changing history or trust" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/populated.db", .{tmp.sub_path});
+    defer a.free(path);
+    var db: sqlite.Db = .{};
+    try db.open(path);
+    try legacyFixture(&db, 4);
+    try db.exec("PRAGMA foreign_keys=OFF");
+    try migrateV5(&db);
+    try db.exec("PRAGMA foreign_keys=ON");
+    try db.exec("PRAGMA user_version=5");
+    const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try db.exec("INSERT INTO provider_trust(id,sha256,how,approved_ms,last_good,loading) VALUES(1,'" ++ sha ++ "','compared',7,'" ++ sha ++ "','" ++ sha ++ "')");
+    try ensure(&db);
+    try assertV5(&db);
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM provider_trust WHERE mode='manual' AND loading='" ++ sha ++ "' AND last_good='" ++ sha ++ "'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM provider_quarantine WHERE sha256='" ++ sha ++ "'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT value FROM provider_generation WHERE id=1"));
+    try ensure(&db);
+    db.close();
+    var dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    var backups: usize = 0;
+    while (try it.next(std.testing.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "backup-v5-")) backups += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), backups);
 }

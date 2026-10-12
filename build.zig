@@ -12,7 +12,9 @@ pub fn build(b: *std.Build) void {
     const contract = b.addModule("kowalski_provider", .{ .root_source_file = b.path("src/provider_api.zig"), .target = target, .optimize = optimize });
     const provider_check = b.addModule("kowalski_provider_check", .{ .root_source_file = b.path("src/provider_check.zig"), .target = target, .optimize = optimize });
     provider_check.addImport("kowalski_provider", contract);
-    const seams: Seams = .{ .sqlite = sqlite, .contract = contract, .update_repo = update_repo, .update_key = update_key };
+    const manifest_module = b.createModule(.{ .root_source_file = b.path("src/provider_manifest.zig"), .target = target, .optimize = optimize });
+    const no_replace_module = b.createModule(.{ .root_source_file = b.path("src/no_replace.zig"), .target = target, .optimize = optimize });
+    const seams: Seams = .{ .sqlite = sqlite, .contract = contract, .manifest = manifest_module, .no_replace = no_replace_module, .update_repo = update_repo, .update_key = update_key };
 
     const exe = b.addExecutable(.{
         .name = "kowalski",
@@ -53,6 +55,16 @@ pub fn build(b: *std.Build) void {
     const keygen_step = b.step("keygen", "Create an Ed25519 release signing key");
     keygen_step.dependOn(&keygen_run.step);
 
+    const provider_keygen = b.addExecutable(.{ .name = "provider-keygen", .root_module = makeModule(b, seams, target, optimize, "tools/provider_keygen.zig") });
+    const provider_keygen_run = b.addRunArtifact(provider_keygen);
+    provider_keygen_run.addPassthruArgs();
+    b.step("provider-keygen", "Create a provider signing key").dependOn(&provider_keygen_run.step);
+
+    const provider_publish = b.addExecutable(.{ .name = "provider-publish", .root_module = makeModule(b, seams, target, optimize, "tools/provider_publish.zig") });
+    const provider_publish_run = b.addRunArtifact(provider_publish);
+    provider_publish_run.addPassthruArgs();
+    b.step("provider-publish", "Publish a signed provider DLL").dependOn(&provider_publish_run.step);
+
     const tests = b.addTest(.{
         .root_module = makeModule(b, seams, target, optimize, "src/main.zig"),
     });
@@ -73,6 +85,18 @@ pub fn build(b: *std.Build) void {
     example_module.addImport("kowalski_provider", contract);
     contract_tests.root_module.addImport("example_provider", example_module);
     test_step.dependOn(&b.addRunArtifact(contract_tests).step);
+    const manifest_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/provider_manifest.zig"), .target = target, .optimize = optimize }) });
+    test_step.dependOn(&b.addRunArtifact(manifest_tests).step);
+    const source_tests = b.addTest(.{ .root_module = makeModule(b, seams, target, optimize, "src/provider_source.zig") });
+    test_step.dependOn(&b.addRunArtifact(source_tests).step);
+    const fetch_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/provider_source_fetch.zig"), .target = target, .optimize = optimize }) });
+    test_step.dependOn(&b.addRunArtifact(fetch_tests).step);
+    const publisher_tests = b.addTest(.{ .root_module = makeModule(b, seams, target, optimize, "tools/provider_publish.zig") });
+    test_step.dependOn(&b.addRunArtifact(publisher_tests).step);
+    const source_integration = b.addTest(.{ .root_module = makeModule(b, seams, target, optimize, "src/provider_source_integration_test.zig") });
+    const publisher_module = makeModule(b, seams, target, optimize, "tools/provider_publish.zig");
+    source_integration.root_module.addImport("provider_publish", publisher_module);
+    test_step.dependOn(&b.addRunArtifact(source_integration).step);
     const example_dll = b.addLibrary(.{ .name = "example-provider", .linkage = .dynamic, .root_module = example_module });
     const provider_test_options = b.addOptions();
     provider_test_options.addOptionPath("example_dll", example_dll.getEmittedBin());
@@ -96,6 +120,8 @@ fn addKeygenImports(b: *std.Build, seams: Seams, target: std.Build.ResolvedTarge
 const Seams = struct {
     sqlite: *std.Build.Dependency,
     contract: *std.Build.Module,
+    manifest: *std.Build.Module,
+    no_replace: *std.Build.Module,
     update_repo: []const u8,
     update_key: []const u8,
 };
@@ -114,6 +140,8 @@ fn makeModule(
         .link_libc = true,
     });
     module.addImport("kowalski_provider", seams.contract);
+    module.addImport("provider_manifest", seams.manifest);
+    module.addImport("no_replace", seams.no_replace);
     // The release version has one home: build.zig.zon.
     const options = b.addOptions();
     options.addOption([]const u8, "version", @import("build.zig.zon").version);

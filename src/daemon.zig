@@ -12,6 +12,10 @@ const events = @import("events.zig");
 const worker = @import("worker.zig");
 const contract = @import("kowalski_provider");
 const provider_loader = @import("provider_loader.zig");
+const provider_manifest = @import("provider_manifest");
+const provider_source = @import("provider_source.zig");
+const source_fetch = @import("provider_source_fetch.zig");
+const no_replace = @import("no_replace");
 const tour_mod = @import("tour.zig");
 const demo = @import("demo.zig");
 const launch = @import("launch.zig");
@@ -26,6 +30,7 @@ extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, 
 extern "kernel32" fn WriteFile(file: windows.HANDLE, data: [*]const u8, len: u32, written: ?*u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetFileSizeEx(file: windows.HANDLE, size: *i64) callconv(.winapi) i32;
 extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: u32) callconv(.winapi) i32;
+extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
 
 const error_already_exists: u32 = 183;
 const heartbeat_ms: i64 = 60_000;
@@ -57,11 +62,28 @@ const Daemon = struct {
     traits_allocator: std.mem.Allocator,
     /// One request's provider call at a time; the worker refuses a second.
     provider_turn: Io.Mutex = .init,
+    source_turn: Io.Mutex = .init,
+    source_proposal: ?SourceProposal = null,
+    source_fetcher: source_fetch.Fetcher = .{ .context = undefined, .get = source_fetch.realGet },
+    source_copier: source_fetch.Copier = .{ .context = undefined, .copy = source_fetch.realCopy },
+    source_start_delay_ms: u32 = 1000,
     stop: Io.Event = .unset,
     stopped: Io.Event = .unset,
     /// The guided tour's sandbox while one runs, served under /tour/api/.
     tour: ?*tour_mod.Tour = null,
     tour_path: []const u8 = "",
+};
+
+const SourceProposal = struct {
+    arena: std.heap.ArenaAllocator,
+    token: []const u8,
+    source: []const u8,
+    key: []const u8,
+    how: []const u8,
+    generation: i64,
+    found: FetchedManifest,
+
+    fn deinit(self: *SourceProposal) void { self.arena.deinit(); }
 };
 
 // The console control handler runs on a thread Windows creates; it can only
@@ -230,6 +252,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     d.tour_path = tour_path;
     defer if (d.tour) |t| t.destroy(io);
     defer if (d.provider_file) |file| provider_loader.close(file);
+    defer if (d.source_proposal) |*proposal| proposal.deinit();
     defer if (d.provider_table) |table| {
         if (worker.idle()) {
             table.deinit(table.context);
@@ -258,6 +281,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     d.app.trial_ready = true;
     var accept_future = try io.concurrent(acceptLoop, .{ &d, &listener, &connections });
     var heartbeat_future = try io.concurrent(heartbeatLoop, .{&d});
+    var source_future = try io.concurrent(backgroundSourceCheck, .{&d});
     log("listening on http://127.0.0.1:{d} (database {s})", .{ port, options.db_path });
     if (options.trial_nonce == null) update.cleanup(gpa, io, options.db_path) catch |err| log("update cleanup failed: {s}", .{@errorName(err)});
 
@@ -266,6 +290,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     accept_future.cancel(io) catch {};
     connections.cancel(io);
     heartbeat_future.cancel(io) catch {};
+    source_future.cancel(io);
     {
         d.mutex.lockUncancelable(io);
         defer d.mutex.unlock(io);
@@ -283,16 +308,17 @@ fn printableAscii(a: std.mem.Allocator, source: []const u8, limit: usize) ![]con
     return result;
 }
 
-const Trust = struct { sha: []const u8, last_good: ?[]const u8, loading: ?[]const u8 };
+const Trust = struct { sha: []const u8, last_good: ?[]const u8, loading: ?[]const u8, mode: []const u8 };
 
 fn readTrust(db: *sqlite.Db, a: std.mem.Allocator) !?Trust {
-    var stmt = try db.prepare("SELECT sha256,last_good,loading FROM provider_trust WHERE id=1");
+    var stmt = try db.prepare("SELECT sha256,last_good,loading,mode FROM provider_trust WHERE id=1");
     defer stmt.finalize();
     if (try stmt.step() == .done) return null;
     return .{
         .sha = try a.dupe(u8, stmt.columnText(0).?),
         .last_good = if (stmt.columnText(1)) |value| try a.dupe(u8, value) else null,
         .loading = if (stmt.columnText(2)) |value| try a.dupe(u8, value) else null,
+        .mode = try a.dupe(u8, stmt.columnText(3).?),
     };
 }
 
@@ -310,17 +336,45 @@ fn markGood(db: *sqlite.Db, sha: []const u8) !void {
     _ = try stmt.step();
 }
 
+fn rememberQuarantine(db: *sqlite.Db) !void {
+    try db.exec("INSERT OR IGNORE INTO provider_quarantine(sha256) SELECT loading FROM provider_trust WHERE loading IS NOT NULL");
+}
+
+fn isQuarantined(db: *sqlite.Db, sha: []const u8) !bool {
+    var stmt = try db.prepare("SELECT 1 FROM provider_quarantine WHERE sha256=?1");
+    defer stmt.finalize();
+    try stmt.bindText(1, sha);
+    return try stmt.step() == .row;
+}
+
 fn approveTrust(db: *sqlite.Db, sha: []const u8, how: []const u8) !void {
+    var tx = try db.transaction();
+    defer tx.deinit();
+    try rememberQuarantine(db);
+    var clear = try db.prepare("DELETE FROM provider_quarantine WHERE sha256=?1");
+    defer clear.finalize();
+    try clear.bindText(1, sha);
+    _ = try clear.step();
     var stmt = try db.prepare("INSERT INTO provider_trust(id,sha256,how,approved_ms,loading) VALUES(1,?1,?2,?3,NULL) ON CONFLICT(id) DO UPDATE SET sha256=excluded.sha256,how=excluded.how,approved_ms=excluded.approved_ms,loading=NULL");
     defer stmt.finalize();
     try stmt.bindText(1, sha);
     try stmt.bindText(2, how);
     try stmt.bindI64(3, clock.nowMs());
     _ = try stmt.step();
+    try tx.commit();
 }
 
 fn startProvider(d: *Daemon) !void {
     const a = d.traits_allocator;
+    try rememberQuarantine(d.app.store.db);
+    if (try provider_source.read(d.app.store.db, a)) |enrolled| {
+        const trust = try readTrust(d.app.store.db, a);
+        if (trust) |approved| {
+            if (provider_loader.validHash(approved.sha)) try loadHash(d, approved.sha);
+        }
+        if (d.app.provider == null) d.app.provider_status = .{ .state = .unavailable, .reason = try std.fmt.allocPrint(a, "a DLL in the providers folder is ignored: the provider comes from {s}", .{enrolled.source}) };
+        return;
+    }
     const result = provider_loader.scan(d.io, a, d.db_path) catch |err| {
         d.app.provider_status = .{ .state = .unavailable, .reason = try std.fmt.allocPrint(a, "provider scan failed: {s}", .{@errorName(err)}) };
         return;
@@ -359,12 +413,11 @@ fn startProvider(d: *Daemon) !void {
 
 fn loadHash(d: *Daemon, sha: []const u8) !void {
     const a = d.traits_allocator;
-    const trust = try readTrust(d.app.store.db, a);
-    if (trust) |current| if (current.loading) |loading| if (std.mem.eql(u8, loading, sha)) {
+    if (try isQuarantined(d.app.store.db, sha)) {
         d.app.provider_status.state = .unavailable;
         d.app.provider_status.reason = "the provider stopped kowalski while starting; approve it again to retry";
         return;
-    };
+    }
     const verified = provider_loader.verified(a, d.db_path, sha) catch |err| {
         d.app.provider_status.state = .unavailable;
         d.app.provider_status.reason = try std.fmt.allocPrint(a, "provider cache failed: {s}", .{@errorName(err)});
@@ -512,6 +565,131 @@ test "provider DLL discovery, approval, fallback and retry" {
     }
 }
 
+test "source proposal binds verified bytes, identity, explicit recovery, and manual stop" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const db_path = try std.fs.path.join(a, &.{ root, "work.db" });
+    const folder = try std.fs.path.join(a, &.{ root, "source" });
+    try Io.Dir.cwd().createDirPath(io, folder);
+    var db: sqlite.Db = .{};
+    try db.open(db_path);
+    defer db.close();
+    var store = try store_mod.Store.init(&db, a);
+    var d: Daemon = .{ .io = io, .gpa = a, .db_path = db_path, .traits_allocator = a, .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs } };
+    defer if (d.source_proposal) |*proposal| proposal.deinit();
+    const seed: [32]u8 = @splat(3);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const key = std.fmt.bytesToHex(pair.public_key.toBytes(), .lower);
+    const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const before = try std.json.Stringify.valueAlloc(a, .{ .source = folder, .key = &key, .confirmed = false }, .{});
+    const incomplete: api.Request = .{ .method = .POST, .target = "/api/provider/source", .host = "127.0.0.1", .marker = true, .body = before };
+    try std.testing.expectError(error.BadEnrollment, sourceCommandInner(&d, a, incomplete, true, false, false));
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .format = 1, .provider = "first", .channel = "stable", .sequence = 4, .version = "4", .contract = 3, .arch = "x86_64-windows", .file = "first-4.dll", .size = 1, .sha256 = sha, .next_key = @as(?[]const u8, null) }, .{});
+    const signature = try pair.sign(try provider_manifest.message(a, bytes), null);
+    const sig_text = try std.fmt.allocPrint(a, "{x}\n", .{&signature.toBytes()});
+    const json_path = try std.fs.path.join(a, &.{ folder, "manifest.json" });
+    const sig_path = try std.fs.path.join(a, &.{ folder, "manifest.sig" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = bytes });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sig_path, .data = sig_text });
+    const proposal_body = try std.json.Stringify.valueAlloc(a, .{ .source = folder, .key = &key, .how = "compared", .confirmed = true, .yes = false }, .{});
+    const proposal_req: api.Request = .{ .method = .POST, .target = "/api/provider/source", .host = "127.0.0.1", .marker = true, .body = proposal_body };
+    const proposal = try sourceCommandInner(&d, a, proposal_req, true, false, false);
+    const parsed = try std.json.parseFromSliceLeaky(struct { proposal_token: []const u8, enrolled: bool }, a, proposal.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expect(!parsed.enrolled);
+    const swapped = try std.json.Stringify.valueAlloc(a, .{ .format = 1, .provider = "second", .channel = "stable", .sequence = 5, .version = "5", .contract = 3, .arch = "x86_64-windows", .file = "second-5.dll", .size = 1, .sha256 = sha, .next_key = @as(?[]const u8, null) }, .{});
+    const swapped_signature = try pair.sign(try provider_manifest.message(a, swapped), null);
+    const swapped_sig_text = try std.fmt.allocPrint(a, "{x}\n", .{&swapped_signature.toBytes()});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = swapped });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sig_path, .data = swapped_sig_text });
+    const confirm_body = try std.json.Stringify.valueAlloc(a, .{ .source = folder, .key = &key, .how = "compared", .confirmed = true, .yes = true, .proposal_token = parsed.proposal_token }, .{});
+    const confirm_req: api.Request = .{ .method = .POST, .target = "/api/provider/source", .host = "127.0.0.1", .marker = true, .body = confirm_body };
+    const confirmed = try sourceCommandInner(&d, a, confirm_req, true, false, false);
+    try std.testing.expect(std.mem.indexOf(u8, confirmed.body, "\"enrolled\":true") != null);
+    try std.testing.expectEqualStrings("first", (try provider_source.read(&db, a)).?.provider);
+    const drop_dir = try std.fs.path.join(a, &.{ root, "providers" });
+    try Io.Dir.cwd().createDirPath(io, drop_dir);
+    const drop = try std.fs.path.join(a, &.{ drop_dir, "manual.dll" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = drop, .data = "manual candidate" });
+    try startProvider(&d);
+    try std.testing.expectEqual(.unavailable, d.app.provider_status.state);
+    try std.testing.expect(std.mem.indexOf(u8, d.app.provider_status.reason, "ignored") != null);
+    try std.testing.expect(d.app.provider_status.candidate == null);
+    try std.testing.expectError(error.StaleProposal, sourceCommandInner(&d, a, confirm_req, true, false, false));
+    const check_req: api.Request = .{ .method = .POST, .target = "/api/provider/source/check", .host = "127.0.0.1", .marker = true, .body = "{}" };
+    try std.testing.expectError(error.IdentityChanged, sourceCommandInner(&d, a, check_req, false, true, false));
+    try db.exec("INSERT INTO provider_trust(id,sha256,how,approved_ms,loading,mode) VALUES(1,'" ++ sha ++ "','compared',1,'" ++ sha ++ "','source')");
+    try db.exec("INSERT INTO provider_quarantine(sha256) VALUES('" ++ sha ++ "')");
+    const other_body = "{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"how\":\"compared\"}";
+    const other_req: api.Request = .{ .method = .POST, .target = "/api/provider/approve", .host = "127.0.0.1:47100", .marker = true, .body = other_body };
+    try std.testing.expectEqual(std.http.Status.conflict, providerCommand(&d, a, other_req).?.status);
+    const recovery_body = try std.json.Stringify.valueAlloc(a, .{ .sha256 = sha, .how = "compared" }, .{});
+    const recovery_req: api.Request = .{ .method = .POST, .target = "/api/provider/approve", .host = "127.0.0.1:47100", .marker = true, .body = recovery_body };
+    try std.testing.expectEqual(std.http.Status.ok, providerCommand(&d, a, recovery_req).?.status);
+    try std.testing.expectEqual(@as(i64, 0), try sourceScalar(&db, "SELECT count(*) FROM provider_quarantine"));
+    const stop_req: api.Request = .{ .method = .DELETE, .target = "/api/provider/source", .host = "127.0.0.1", .marker = true, .body = "" };
+    _ = try sourceCommandInner(&d, a, stop_req, true, false, false);
+    try std.testing.expect((try provider_source.read(&db, a)) == null);
+    try std.testing.expectEqual(@as(i64, 1), try sourceScalar(&db, "SELECT count(*) FROM provider_trust WHERE mode='manual' AND sha256='" ++ sha ++ "'"));
+    try startProvider(&d);
+    try std.testing.expectEqual(.awaiting_approval, d.app.provider_status.state);
+    const manual_body = try std.json.Stringify.valueAlloc(a, .{ .sha256 = d.app.provider_status.candidate.?.sha256, .how = "compared" }, .{});
+    const manual_req: api.Request = .{ .method = .POST, .target = "/api/provider/approve", .host = "127.0.0.1:47100", .marker = true, .body = manual_body };
+    try std.testing.expectEqual(std.http.Status.ok, providerCommand(&d, a, manual_req).?.status);
+    try std.testing.expectEqual(@as(i64, 1), try sourceScalar(&db, "SELECT count(*) FROM provider_trust WHERE mode='manual'"));
+}
+
+test "background source check leaves database work responsive during a slow read" {
+    const Fake = struct {
+        var started = std.atomic.Value(bool).init(false);
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: Io, _: []const u8, _: usize) ![]const u8 {
+            started.store(true, .release);
+            Sleep(300);
+            return "late";
+        }
+    };
+    Fake.started.store(false, .release);
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var store = try store_mod.Store.init(&db, a);
+    const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const m: provider_manifest.Manifest = .{ .provider = "sample", .channel = "stable", .sequence = 1, .version = "1", .file = "sample-1.dll", .size = 1, .sha256 = sha };
+    try provider_source.enroll(&db, 0, "folder", sha, "compared", m, "one", "sig", 1);
+    var d: Daemon = .{ .io = io, .gpa = a, .db_path = "unused.db", .traits_allocator = a,
+        .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs },
+        .source_fetcher = .{ .context = undefined, .get = Fake.get }, .source_start_delay_ms = 0 };
+    var future = try io.concurrent(backgroundSourceCheck, .{&d});
+    for (0..40) |_| {
+        if (Fake.started.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expect(Fake.started.load(.acquire));
+    const before = Io.Clock.awake.now(io);
+    d.mutex.lockUncancelable(io);
+    const count = try sourceScalar(&db, "SELECT count(*) FROM provider_source");
+    d.mutex.unlock(io);
+    try std.testing.expectEqual(@as(i64, 1), count);
+    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - before.toMilliseconds() < 200);
+    future.cancel(io);
+    try io.sleep(.fromMilliseconds(350), .awake);
+}
+
+fn sourceScalar(db: *sqlite.Db, sql: []const u8) !i64 {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    if (try stmt.step() != .row) return error.Sqlite;
+    return stmt.columnI64(0);
+}
+
 fn heartbeatLoop(d: *Daemon) Io.Cancelable!void {
     while (true) {
         try d.io.sleep(.fromMilliseconds(heartbeat_ms), .awake);
@@ -525,6 +703,19 @@ fn heartbeatLoop(d: *Daemon) Io.Cancelable!void {
 }
 
 fn shouldHeartbeat(app: *const api.App) bool { return app.trial_nonce == null; }
+
+fn backgroundSourceCheck(d: *Daemon) void {
+    d.io.sleep(.fromMilliseconds(d.source_start_delay_ms), .awake) catch return;
+    var arena = std.heap.ArenaAllocator.init(d.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    d.mutex.lockUncancelable(d.io);
+    const present = (provider_source.read(d.app.store.db, a) catch null) != null;
+    d.mutex.unlock(d.io);
+    if (!present) return;
+    const request: api.Request = .{ .method = .POST, .target = "/api/provider/source/check", .host = "127.0.0.1", .marker = true, .body = "{}" };
+    _ = sourceCommandInner(d, a, request, false, true, false) catch {};
+}
 
 test "trial suppresses heartbeat until commit" {
     var app: api.App = .{ .store = undefined, .port = 0, .clock = clock.nowMs, .trial_nonce = "0123456789abcdef0123456789abcdef" };
@@ -572,6 +763,23 @@ fn providerCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.
     if (!provider_loader.validHash(body.sha256) or
         !(std.mem.eql(u8, body.how, "compared") or std.mem.eql(u8, body.how, "accepted")))
         return api.answer(a, .bad_request, .{ .@"error" = "body" });
+    if ((provider_source.read(d.app.store.db, a) catch null) != null) {
+        const current_trust = readTrust(d.app.store.db, a) catch null orelse
+            return api.answer(a, .conflict, .{ .@"error" = "source_enrolled" });
+        if (!std.mem.eql(u8, current_trust.sha, body.sha256) or !(isQuarantined(d.app.store.db, body.sha256) catch false))
+            return api.answer(a, .conflict, .{ .@"error" = "source_enrolled" });
+        var tx = d.app.store.db.transaction() catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+        defer tx.deinit();
+        var clear = d.app.store.db.prepare("DELETE FROM provider_quarantine WHERE sha256=?1") catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+        defer clear.finalize();
+        clear.bindText(1, body.sha256) catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+        _ = clear.step() catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+        d.app.store.db.exec("UPDATE provider_trust SET loading=NULL WHERE id=1") catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+        tx.commit() catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_trust" });
+        const restart = d.app.provider != null;
+        if (!restart) startProvider(d) catch return api.answer(a, .internal_server_error, .{ .@"error" = "provider_load" });
+        return api.answer(a, .ok, .{ .restart = restart, .status = d.app.provider_status });
+    }
     const previous = d.app.provider_status.candidate orelse
         return api.answer(a, .conflict, .{ .@"error" = "candidate_changed" });
     if (!std.mem.eql(u8, body.sha256, previous.sha256))
@@ -597,6 +805,181 @@ fn providerCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.
             return api.answer(a, .internal_server_error, .{ .@"error" = "provider_load" });
     }
     return api.answer(a, .ok, .{ .restart = restart, .status = d.app.provider_status });
+}
+
+const FetchedManifest = struct { bytes: []const u8, signature: []const u8, parsed: provider_manifest.Manifest };
+
+fn fetchManifest(d: *Daemon, a: std.mem.Allocator, source: []const u8, key: []const u8) !FetchedManifest {
+    const deadline = Io.Clock.awake.now(d.io).addDuration(.fromMilliseconds(15_000));
+    const json_path = try source_fetch.location(a, source, "manifest.json");
+    const bytes = try source_fetch.boundedGet(d.io, a, d.source_fetcher, json_path, provider_manifest.max_manifest, deadline);
+    const sig_path = try source_fetch.location(a, source, "manifest.sig");
+    const signature = try source_fetch.boundedGet(d.io, a, d.source_fetcher, sig_path, provider_manifest.max_manifest, deadline);
+    return .{ .bytes = bytes, .signature = signature, .parsed = try provider_manifest.verify(a, bytes, signature, key) };
+}
+
+fn hasDropDll(d: *Daemon, a: std.mem.Allocator) bool {
+    const path = std.fs.path.join(a, &.{ std.fs.path.dirname(d.db_path) orelse ".", "providers" }) catch return false;
+    var dir = Io.Dir.cwd().openDir(d.io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(d.io);
+    var it = dir.iterate();
+    while (it.next(d.io) catch return false) |entry| {
+        if (entry.kind == .file and std.ascii.endsWithIgnoreCase(entry.name, ".dll")) return true;
+    }
+    return false;
+}
+
+fn sourceCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
+    const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
+    const base = std.mem.eql(u8, path, "/api/provider/source");
+    const checking = std.mem.eql(u8, path, "/api/provider/source/check");
+    const installing = std.mem.eql(u8, path, "/api/provider/source/install");
+    if (!base and !checking and !installing) return null;
+    if (api.refused(d.app.port, a, request)) |r| return r;
+    return sourceCommandInner(d, a, request, base, checking, installing) catch |err|
+        api.answer(a, switch (err) {
+            error.SourceChanged, error.ReleaseChanged, error.CheckBusy, error.ManifestChangedWithoutSequence, error.IdentityChanged, error.StaleProposal => .conflict,
+            error.BadSource, error.BadManifest, error.BadSignature, error.BadEnrollment, error.KeyRotationUnsupported, error.NotOlder => .bad_request,
+            else => .service_unavailable,
+        }, .{ .@"error" = @errorName(err) });
+}
+
+fn sourceCommandInner(d: *Daemon, a: std.mem.Allocator, request: api.Request, base: bool, checking: bool, installing: bool) !api.Response {
+    if (base and request.method == .GET) {
+        d.mutex.lockUncancelable(d.io);
+        defer d.mutex.unlock(d.io);
+        const enrolled = try provider_source.read(d.app.store.db, a);
+        if (enrolled == null) return api.answer(a, .ok, .{ .enrollment = @as(?provider_source.Enrollment, null), .available = @as(?provider_manifest.Manifest, null) });
+        const current = enrolled.?;
+        const latest = try provider_source.release(d.app.store.db, a, current.generation, current.highest_sequence);
+        const latest_manifest: ?provider_manifest.Manifest = if (latest) |r| try provider_manifest.verify(a, r.bytes, r.signature, current.public_key) else null;
+        const trust = try readTrust(d.app.store.db, a);
+        const available: ?provider_manifest.Manifest = if (latest_manifest) |m| if (trust == null or !std.mem.eql(u8, trust.?.mode, "source") or !std.mem.eql(u8, trust.?.sha, m.sha256)) m else null else null;
+        return api.answer(a, .ok, .{ .enrollment = enrolled, .available = available, .ignored_drop_folder = hasDropDll(d, a) });
+    }
+    if (base and request.method == .DELETE) {
+        try d.source_turn.lock(d.io);
+        defer d.source_turn.unlock(d.io);
+        if (d.source_proposal) |*proposal| proposal.deinit();
+        d.source_proposal = null;
+        d.mutex.lockUncancelable(d.io);
+        defer d.mutex.unlock(d.io);
+        try provider_source.stop(d.app.store.db);
+        if (d.app.provider == null) try startProvider(d);
+        return api.answer(a, .ok, .{ .stopped = true });
+    }
+    if (base and request.method == .POST) {
+        const Body = struct { source: []const u8, key: []const u8, how: []const u8 = "compared", confirmed: bool = false, yes: bool = false, proposal_token: ?[]const u8 = null };
+        const body = std.json.parseFromSliceLeaky(Body, a, request.body, .{ .ignore_unknown_fields = false }) catch return error.BadEnrollment;
+        if (!body.confirmed or !source_fetch.validSource(body.source) or !provider_manifest.validHex(body.key, 64)) return error.BadEnrollment;
+        if (!std.mem.eql(u8, body.how, "compared") and !std.mem.eql(u8, body.how, "accepted")) return error.BadEnrollment;
+        try d.source_turn.lock(d.io);
+        defer d.source_turn.unlock(d.io);
+        if (body.yes) {
+            const token = body.proposal_token orelse return error.StaleProposal;
+            var proposal = d.source_proposal orelse return error.StaleProposal;
+            d.source_proposal = null;
+            defer proposal.deinit();
+            if (!std.mem.eql(u8, token, proposal.token) or !std.mem.eql(u8, body.source, proposal.source) or
+                !std.mem.eql(u8, body.key, proposal.key) or !std.mem.eql(u8, body.how, proposal.how)) return error.StaleProposal;
+            d.mutex.lockUncancelable(d.io);
+            defer d.mutex.unlock(d.io);
+            try provider_source.enroll(d.app.store.db, proposal.generation, proposal.source, proposal.key, proposal.how,
+                proposal.found.parsed, proposal.found.bytes, proposal.found.signature, clock.nowMs());
+            if (d.app.provider == null) d.app.provider_status = .{ .state = .unavailable, .reason = "source enrolled; run provider install" };
+            return api.answer(a, .ok, .{ .proposal = proposal.found.parsed, .enrolled = true });
+        }
+        const generation = blk: {
+            d.mutex.lockUncancelable(d.io);
+            defer d.mutex.unlock(d.io);
+            break :blk try provider_source.currentGeneration(d.app.store.db);
+        };
+        if (d.source_proposal) |*old| old.deinit();
+        d.source_proposal = null;
+        var proposal: SourceProposal = .{ .arena = std.heap.ArenaAllocator.init(d.gpa), .token = undefined,
+            .source = undefined, .key = undefined, .how = undefined, .generation = generation, .found = undefined };
+        errdefer proposal.deinit();
+        const pa = proposal.arena.allocator();
+        proposal.source = try pa.dupe(u8, body.source);
+        proposal.key = try pa.dupe(u8, body.key);
+        proposal.how = try pa.dupe(u8, body.how);
+        proposal.found = try fetchManifest(d, pa, proposal.source, proposal.key);
+        var nonce: [16]u8 = undefined;
+        d.io.random(&nonce);
+        proposal.token = try pa.dupe(u8, &std.fmt.bytesToHex(nonce, .lower));
+        const answer = api.answer(a, .ok, .{ .proposal = proposal.found.parsed, .proposal_token = proposal.token, .enrolled = false });
+        d.source_proposal = proposal;
+        return answer;
+    }
+    if (checking and request.method == .POST) {
+        try d.source_turn.lock(d.io);
+        defer d.source_turn.unlock(d.io);
+        const enrolled = blk: {
+            d.mutex.lockUncancelable(d.io);
+            defer d.mutex.unlock(d.io);
+            break :blk (try provider_source.read(d.app.store.db, a)) orelse return error.SourceChanged;
+        };
+        const found = fetchManifest(d, a, enrolled.source, enrolled.public_key) catch |err| {
+            d.mutex.lockUncancelable(d.io);
+            defer d.mutex.unlock(d.io);
+            try provider_source.recordError(d.app.store.db, enrolled.generation, @errorName(err), clock.nowMs());
+            return err;
+        };
+        d.mutex.lockUncancelable(d.io);
+        defer d.mutex.unlock(d.io);
+        const outcome = provider_source.check(d.app.store.db, a, enrolled.generation, found.parsed, found.bytes, found.signature, clock.nowMs()) catch |err| {
+            try provider_source.recordError(d.app.store.db, enrolled.generation, @errorName(err), clock.nowMs());
+            return err;
+        };
+        return api.answer(a, .ok, .{ .outcome = @tagName(outcome), .release = found.parsed });
+    }
+    if (installing and request.method == .POST) {
+        const Body = struct { sequence: ?i64 = null, yes: bool = false };
+        const body = std.json.parseFromSliceLeaky(Body, a, if (request.body.len == 0) "{}" else request.body, .{ .ignore_unknown_fields = false }) catch return error.BadManifest;
+        if (!body.yes) return error.BadEnrollment;
+        try d.source_turn.lock(d.io);
+        defer d.source_turn.unlock(d.io);
+        const captured = blk: {
+            d.mutex.lockUncancelable(d.io);
+            defer d.mutex.unlock(d.io);
+            const enrolled = (try provider_source.read(d.app.store.db, a)) orelse return error.SourceChanged;
+            const sequence = body.sequence orelse enrolled.highest_sequence;
+            const snapshot = (try provider_source.release(d.app.store.db, a, enrolled.generation, sequence)) orelse return error.ReleaseChanged;
+            break :blk .{ .enrolled = enrolled, .sequence = sequence, .snapshot = snapshot };
+        };
+        const enrolled = captured.enrolled;
+        const sequence = captured.sequence;
+        const snapshot = captured.snapshot;
+        const m = try provider_manifest.verify(a, snapshot.bytes, snapshot.signature, enrolled.public_key);
+        if (m.sequence != sequence or !std.mem.eql(u8, m.provider, enrolled.provider) or !std.mem.eql(u8, m.channel, enrolled.channel)) return error.BadManifest;
+        const dll_path = try source_fetch.location(a, enrolled.source, m.file);
+        const cache_dir = try provider_loader.cacheDir(a, d.db_path);
+        try Io.Dir.cwd().createDirPath(d.io, cache_dir);
+        var nonce: [8]u8 = undefined;
+        d.io.random(&nonce);
+        const stage = try std.fs.path.join(a, &.{ cache_dir, try std.fmt.allocPrint(a, "incoming-{x}.tmp", .{&nonce}) });
+        const stage_file = try Io.Dir.cwd().createFile(d.io, stage, .{ .exclusive = true });
+        defer Io.Dir.cwd().deleteFile(d.io, stage) catch {};
+        const deadline = Io.Clock.awake.now(d.io).addDuration(.fromMilliseconds(15_000));
+        const copied = try source_fetch.boundedCopy(d.io, d.source_copier, dll_path, stage, stage_file, @intCast(m.size), deadline);
+        try source_fetch.verifyCopy(copied, @intCast(m.size), m.sha256);
+        const dest = try provider_loader.cachePath(a, d.db_path, m.sha256);
+        no_replace.move(a, stage, dest) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const checked = try provider_loader.verified(a, d.db_path, m.sha256);
+        provider_loader.close(checked);
+        const cached_stat = try Io.Dir.cwd().statFile(d.io, dest, .{});
+        if (cached_stat.size != m.size) return error.DllSizeMismatch;
+        d.mutex.lockUncancelable(d.io);
+        defer d.mutex.unlock(d.io);
+        try provider_source.installTrust(d.app.store.db, a, enrolled.generation, snapshot.bytes, m, clock.nowMs(), body.sequence != null);
+        const restart = d.app.provider != null;
+        if (!restart) try startProvider(d);
+        return api.answer(a, .ok, .{ .installed = m, .restart = restart });
+    }
+    return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
 }
 
 /// Start a successor that waits for this process to release the DLL and mutex.
@@ -921,6 +1304,7 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
         return respond(&req, response.status, response.body);
     }
 
+    if (sourceCommand(d, a, request)) |source_response| return respond(&req, source_response.status, source_response.body);
     var response = blk: {
         try d.mutex.lock(d.io);
         defer d.mutex.unlock(d.io);

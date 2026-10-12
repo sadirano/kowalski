@@ -37,6 +37,11 @@ pub const usage =
     \\  provider                     provider status and fields
     \\  provider trust <sha256>      approve a DLL against a known SHA-256
     \\  provider trust --current     accept the current DLL as it is
+    \\  provider source <S> --key <hex> [--yes]  enroll a signed source
+    \\  provider source --from-setup --key <hex>|--accept-as-is [--yes]
+    \\  provider source --stop       return to manual DLL discovery
+    \\  provider check               check the signed source
+    \\  provider install [--sequence N] [--yes]  install a verified release
     \\  provider login               sign in to the provider (prompts for the details)
     \\  bind <#id> <ref>             bind a task to an external ref (fields come from the provider)
     \\  postings [<YYYY-MM-DD>]      what can be posted for a day, and what was
@@ -63,6 +68,7 @@ pub const Context = struct {
     json: bool,
     out: *Io.Writer,
     err: *Io.Writer,
+    call_override: ?*const fn (*Context, []const u8, []const u8, ?[]const u8) anyerror!Reply = null,
 };
 
 const Reply = struct { status: u16, body: []const u8 };
@@ -78,6 +84,7 @@ pub fn readPort(ctx: *Context) !u16 {
 }
 
 fn call(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+    if (ctx.call_override) |override| return override(ctx, method, target, body);
     const port = try readPort(ctx);
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
     const stream = address.connect(ctx.io, .{ .mode = .stream }) catch return error.NoDaemon;
@@ -523,6 +530,17 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
     }
     if (eql(u8, command, "provider")) {
         if (args.len == 1 and eql(u8, args[0], "login")) return providerLogin(ctx);
+        if (args.len > 0 and eql(u8, args[0], "source")) return providerSource(ctx, args[1..]);
+        if (args.len == 1 and eql(u8, args[0], "check")) {
+            const reply = try call(ctx, "POST", "/api/provider/source/check", "{}");
+            if (!try settle(ctx, reply)) return .failed;
+            if (ctx.json) return .ok;
+            const result = try parse(struct { outcome: []const u8, release: struct { sequence: i64, version: []const u8 } }, ctx, reply.body);
+            if (eql(u8, result.outcome, "older")) try ctx.out.print("older release offered (sequence {d}); ignored\n", .{result.release.sequence})
+            else try ctx.out.print("{s}: {s} (sequence {d})\n", .{ result.outcome, result.release.version, result.release.sequence });
+            return .ok;
+        }
+        if (args.len > 0 and eql(u8, args[0], "install")) return providerInstall(ctx, args[1..]);
         if (args.len == 2 and eql(u8, args[0], "trust")) {
             const current = eql(u8, args[1], "--current");
             const sha = if (current) blk: {
@@ -549,6 +567,14 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
             .unavailable => try ctx.out.print("provider unavailable: {s}\n", .{r.status.reason}),
             .loaded => try ctx.out.print("provider  {s} {s} (loaded)\n", .{ r.status.name, r.status.build }),
             .awaiting_approval => try ctx.out.writeAll("provider awaiting approval\n"),
+        }
+        const source_reply = try call(ctx, "GET", "/api/provider/source", null);
+        if (source_reply.status == 200) {
+            const source_state = try parse(struct { enrollment: ?struct { source: []const u8 }, ignored_drop_folder: bool = false }, ctx, source_reply.body);
+            if (source_state.ignored_drop_folder and source_state.enrollment != null) {
+                try ctx.out.writeAll("a DLL in the providers folder is ignored: the provider comes from ");
+                try asciiLine(ctx.out, source_state.enrollment.?.source);
+            }
         }
         if (r.status.candidate) |candidate| {
             const safe_file = try ctx.a.dupe(u8, candidate.file);
@@ -746,6 +772,141 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return waitForRestart(ctx, before, 320);
     }
     return error.Usage;
+}
+
+fn confirm(ctx: *Context, label: []const u8) !bool {
+    const input = GetStdHandle(0xfffffff6) orelse return false;
+    var mode: u32 = 0;
+    if (GetConsoleMode(input, &mode) == 0) return false;
+    try Io.File.stdout().writeStreamingAll(ctx.io, label);
+    var buffer: [16]u8 = undefined;
+    const answer = try readLine(input, &buffer);
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
+}
+
+fn providerSource(ctx: *Context, args: []const []const u8) !Exit {
+    const eql = std.mem.eql;
+    if (args.len == 0) {
+        const reply = try call(ctx, "GET", "/api/provider/source", null);
+        if (!try settle(ctx, reply)) return .failed;
+        if (ctx.json) return .ok;
+        const r = try parse(struct { enrollment: ?struct { source: []const u8, provider: []const u8, channel: []const u8, highest_sequence: i64, last_error: ?[]const u8 = null } }, ctx, reply.body);
+        if (r.enrollment) |e| {
+            try asciiLine(ctx.out, e.source);
+            try ctx.out.print("  {s}/{s}  sequence {d}\n", .{ e.provider, e.channel, e.highest_sequence });
+            if (e.last_error) |problem| try ctx.out.print("last check: {s}\n", .{problem});
+        } else try ctx.out.writeAll("no provider source enrolled\n");
+        return .ok;
+    }
+    if (args.len == 1 and eql(u8, args[0], "--stop")) {
+        const reply = try call(ctx, "DELETE", "/api/provider/source", null);
+        if (!try settle(ctx, reply)) return .failed;
+        if (!ctx.json) try ctx.out.writeAll("provider source stopped; manual discovery resumed\n");
+        return .ok;
+    }
+    const from_setup = eql(u8, args[0], "--from-setup");
+    var source: []const u8 = undefined;
+    var setup_key: ?[]const u8 = null;
+    if (from_setup) {
+        const path = try std.fs.path.join(ctx.a, &.{ std.fs.path.dirname(ctx.db_path) orelse ".", "providers", "source.json" });
+        const bytes = try Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.a, .limited(64 * 1024));
+        const setup = std.json.parseFromSliceLeaky(struct { source: []const u8, key: []const u8 }, ctx.a, bytes, .{ .ignore_unknown_fields = false }) catch return error.Usage;
+        source = setup.source;
+        setup_key = setup.key;
+        if (!ctx.json) {
+            try ctx.out.writeAll("unverified source proposal: ");
+            try asciiLine(ctx.out, source);
+            try ctx.out.print("public key: {s}\n", .{setup.key});
+        }
+    } else source = args[0];
+    var typed_key: ?[]const u8 = null;
+    var accepted = false;
+    var yes = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (eql(u8, args[i], "--key") and i + 1 < args.len) {
+            i += 1;
+            typed_key = args[i];
+        } else if (eql(u8, args[i], "--accept-as-is")) accepted = true
+        else if (eql(u8, args[i], "--yes")) yes = true
+        else return error.Usage;
+    }
+    if (accepted and (!from_setup or typed_key != null)) return error.Usage;
+    if (from_setup and typed_key != null and !eql(u8, typed_key.?, setup_key.?)) return error.Usage;
+    if (from_setup and !accepted and typed_key == null) return error.Usage;
+    const key = typed_key orelse setup_key orelse return error.Usage;
+    if (!@import("provider_manifest").validHex(key, 64)) return error.Usage;
+    const how: []const u8 = if (accepted) "accepted" else "compared";
+    const proposal = try call(ctx, "POST", "/api/provider/source", try jsonBody(ctx, .{ .source = source, .key = key, .how = how, .confirmed = true, .yes = false }));
+    if (proposal.status < 200 or proposal.status >= 300) {
+        _ = try settle(ctx, proposal);
+        return .failed;
+    }
+    const r = try parse(struct { proposal: struct { provider: []const u8, channel: []const u8, version: []const u8, sequence: i64 }, proposal_token: []const u8 }, ctx, proposal.body);
+    if (!ctx.json) try ctx.out.print("{s}/{s}  {s}  sequence {d}\n", .{ r.proposal.provider, r.proposal.channel, r.proposal.version, r.proposal.sequence });
+    if (ctx.json and !yes) {
+        try ctx.out.writeAll(proposal.body);
+        try ctx.out.writeAll("\n");
+        return .ok;
+    }
+    if (!yes and !try confirm(ctx, "Enroll this source and pin this provider/channel? [y/N] ")) return .ok;
+    const enrolled = try call(ctx, "POST", "/api/provider/source", try jsonBody(ctx, .{ .source = source, .key = key, .how = how, .confirmed = true, .yes = true, .proposal_token = r.proposal_token }));
+    if (!try settle(ctx, enrolled)) return .ok;
+    if (!ctx.json) try ctx.out.writeAll("provider source enrolled; run kowalski provider install\n");
+    return .ok;
+}
+
+fn providerInstall(ctx: *Context, args: []const []const u8) !Exit {
+    const eql = std.mem.eql;
+    var sequence: ?i64 = null;
+    var yes = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (eql(u8, args[i], "--sequence") and i + 1 < args.len) {
+            i += 1;
+            sequence = std.fmt.parseInt(i64, args[i], 10) catch return error.Usage;
+        } else if (eql(u8, args[i], "--yes")) yes = true
+        else return error.Usage;
+    }
+    if (sequence != null and !yes and !try confirm(ctx, "Install this older verified release? [y/N] ")) return .ok;
+    const reply = try call(ctx, "POST", "/api/provider/source/install", try jsonBody(ctx, .{ .sequence = sequence, .yes = true }));
+    if (!try settle(ctx, reply)) return .failed;
+    if (ctx.json) return .ok;
+    const r = try parse(struct { installed: struct { version: []const u8, sequence: i64 }, restart: bool }, ctx, reply.body);
+    try ctx.out.print("installed {s} (sequence {d})\n", .{ r.installed.version, r.installed.sequence });
+    if (r.restart) try ctx.out.writeAll("restart the daemon to load it\n");
+    return .ok;
+}
+
+test "JSON source enrollment confirms the proposal and prints the final response" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn callSource(_: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            try std.testing.expectEqualStrings("POST", method);
+            try std.testing.expectEqualStrings("/api/provider/source", target);
+            calls += 1;
+            if (calls == 1) {
+                try std.testing.expect(std.mem.indexOf(u8, body.?, "\"yes\":false") != null);
+                return .{ .status = 200, .body = "{\"proposal\":{\"provider\":\"sample\",\"channel\":\"stable\",\"version\":\"1\",\"sequence\":1},\"proposal_token\":\"one-use\",\"enrolled\":false}" };
+            }
+            try std.testing.expect(std.mem.indexOf(u8, body.?, "\"yes\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, body.?, "one-use") != null);
+            return .{ .status = 200, .body = "{\"enrolled\":true}" };
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = true,
+        .out = &out.writer, .err = &err.writer, .call_override = Fake.callSource };
+    const key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectEqual(Exit.ok, try providerSource(&ctx, &.{ "folder", "--key", key, "--yes" }));
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+    try std.testing.expectEqualStrings("{\"enrolled\":true}\n", out.written());
 }
 
 fn asciiLine(w: *Io.Writer, bytes: []const u8) !void {
