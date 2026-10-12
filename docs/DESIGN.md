@@ -112,10 +112,12 @@ The data model and behavior of kowalski. Contributor rules are in
 
 ## Imported history
 
-- Importing from another tool is a provider's job, not the core's. The
-  schema keeps room for it: rows an import brought in carry an
-  `import_id`, and `Store.switchOver` marks the end of importing, after
-  which an importer refuses to run.
+- Importing from another tool is a separate tool's job, not the core's.
+  Up to v0.1.0 kowalski exported its database code as a Zig module for
+  such a tool; it no longer does, so an importer builds against v0.1.0 and
+  newer kowalski upgrades its output. Rows an import brought in keep their
+  `import_id`, and the `imports` and `import_settings` tables stay, so
+  existing databases keep that history.
 
 ## HTTP
 

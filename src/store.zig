@@ -414,24 +414,6 @@ pub const Store = struct {
         try tx.commit();
     }
 
-    pub fn switchOver(s: *Store, now_ms: i64) Error!void {
-        var tx = try s.begin(now_ms, false);
-        defer tx.deinit();
-        var buffer: [32]u8 = undefined;
-        const value = try std.fmt.bufPrint(&buffer, "{d}", .{now_ms});
-        var stmt = try s.db.prepare("INSERT OR IGNORE INTO meta(key,value) VALUES('switched_over_ms',?1)");
-        defer stmt.finalize();
-        try stmt.bindText(1, value);
-        _ = try stmt.step();
-        try tx.commit();
-    }
-
-    pub fn switchedOver(s: *Store) Error!bool {
-        var stmt = try s.db.prepare("SELECT 1 FROM meta WHERE key='switched_over_ms'");
-        defer stmt.finalize();
-        return try stmt.step() == .row;
-    }
-
     pub fn isBlocked(s: *Store, day: []const u8, instance: []const u8, ref: []const u8) Error!bool {
         var stmt = try s.db.prepare("SELECT 1 FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state IN ('sending','unknown') LIMIT 1");
         defer stmt.finalize();
@@ -1460,11 +1442,6 @@ test "settings bindings summaries and switch over" {
     try std.testing.expectEqualStrings("worked", summary);
     try s.setDaySummary("2026-03-10", "", 18);
     try std.testing.expect((try s.daySummary("2026-03-10")) == null);
-    try std.testing.expect(!(try s.switchedOver()));
-    try s.switchOver(20);
-    try s.switchOver(30);
-    try std.testing.expect(try s.switchedOver());
-    try std.testing.expectEqual(@as(i64, 20), try testScalar(&db, "SELECT value FROM meta WHERE key='switched_over_ms'"));
 }
 
 test "screen lock pauses only inside a lock window" {

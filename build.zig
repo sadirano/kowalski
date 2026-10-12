@@ -28,10 +28,6 @@ pub fn build(b: *std.Build) void {
     background.subsystem = .windows;
     b.installArtifact(background);
 
-    // What a dependent package builds tools against (see src/lib.zig).
-    const lib = makeModule(b, seams, target, optimize, "src/lib.zig");
-    b.modules.put(b.graph.arena, "kowalski", lib) catch @panic("OOM");
-
     const run = b.addRunArtifact(exe);
     run.addPassthruArgs();
     const run_step = b.step("run", "Run kowalski");

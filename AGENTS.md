@@ -14,8 +14,8 @@ kowalski is a personal work-session tracker for Windows, written in Zig
   tracker. Another system plugs in by implementing the provider contract,
   with no change to the core.
 - **No vendor identifiers in this repo:** no provider names, URLs, project
-  or business-line ids. Importing from another tool belongs to a provider,
-  not the core.
+  or business-line ids. Importing from another tool belongs to a separate
+  tool, not the core; the core exports no database module for one.
 - **No environment variables** for input or config. Known folders come from
   the Windows API; options live in settings.
 - **Real data never enters the repo.** Check against a copy in a scratch
