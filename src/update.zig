@@ -116,8 +116,10 @@ pub fn httpGet(_: *anyopaque, a: std.mem.Allocator, io: Io, url: []const u8, red
         .location = .{ .url = url },
         .response_writer = &body,
         .redirect_behavior = if (redirects) .init(5) else .not_allowed,
+        // An extra user-agent would go out beside std's own, and GitHub's
+        // asset host rejects the request (400).
+        .headers = .{ .user_agent = .{ .override = agent } },
         .extra_headers = &.{
-            .{ .name = "user-agent", .value = agent },
             .{ .name = "accept", .value = "application/vnd.github+json" },
         },
     }) catch |err| switch (err) {
