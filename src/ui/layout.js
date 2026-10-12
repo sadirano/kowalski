@@ -123,6 +123,6 @@ function setTab(tab, el) {
   document.querySelectorAll('#main-tabs .tab').forEach(t => t.classList.remove('active'));
   if (el) el.classList.add('active');
   updateChartToggleBtn(); // hide the chart toggle in the summary view
-  loadDay(selectedDate);
+  loadDay(selectedDate, { chart: tab === 'report' });
 }
 

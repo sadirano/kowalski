@@ -255,7 +255,7 @@ async function runHoras() {
     if (live()) id('horas-submit-btn').disabled = false;
   }
   showToast(failure || t('post_done'));
-  if (posted) loadDay(selectedDate);
+  if (posted) loadDay(selectedDate, { chart: true });
 }
 
 async function resolveHoras(postingId, posted) {

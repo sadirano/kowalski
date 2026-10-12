@@ -48,7 +48,7 @@ async function mergeBlocks(i, j, gapMs = 0) {
       second: { id: b.id, ...seenOf(b) },
     });
     showToast(t('merged'));
-    loadDay(selectedDate);
+    loadDay(selectedDate, { chart: true });
   } catch (e) {
     showError(e.message);
   }
@@ -60,7 +60,7 @@ async function deleteBlock(i) {
   try {
     await apiJSON('POST', '/api/intervals/' + s.id + '/delete', { seen: seenOf(s) });
     showToast(t('deleted'));
-    loadDay(selectedDate); // refresh totals
+    loadDay(selectedDate, { chart: true }); // refresh totals
   } catch (e) {
     showError(e.message);
   }
@@ -102,7 +102,7 @@ async function applyEditTime() {
     await apiJSON('PATCH', '/api/intervals/' + s.id, { seen: seenOf(s), start_ms, end_ms });
     if (_editBlock === s) closeEditTime();
     showToast(t('times_updated'));
-    loadDay(selectedDate);
+    loadDay(selectedDate, { chart: true });
   } catch (e) {
     showError(e.message);
   }
@@ -170,7 +170,7 @@ async function applyAddEntry() {
     hideAddEntry();
     if (task.lookupError) showError(t('ref_unconfirmed', { ref, e: task.lookupError }));
     else showToast(t('ae_added'));
-    goToDate(date); // jump to (and refresh) the day the entry landed on
+    goToDate(date, { chart: true }); // jump to (and refresh) the day the entry landed on
   } catch (e) {
     showError(t('ae_failed') + ': ' + e.message);
   }
@@ -241,5 +241,5 @@ async function dropOnTask(e, idx) {
   } catch (err) {
     showError(err.data?.error === 'Overlap' ? t('move_overlap') : err.message);
   }
-  loadDay(selectedDate);
+  loadDay(selectedDate, { chart: true });
 }

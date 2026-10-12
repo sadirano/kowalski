@@ -12,7 +12,7 @@ function renderSidebar() {
   const prevScroll = nav.scrollTop;
   const maxMs = Math.max(...days.map(d => d.total_ms), 1);
   nav.innerHTML = days.map(d => {
-    const active = d.date === selectedDate ? 'active' : '';
+    const active = d.date === (D?.date || selectedDate) ? 'active' : '';
     const pct = Math.round(d.total_ms / maxMs * 100);
     const label = d.date === todayStr() ? t('today') : dayName(d.date);
     const clockClass = d.status === 'posted' ? 'synced'
@@ -38,10 +38,8 @@ function renderSidebar() {
   }
 }
 
-function selectDate(date, el) {
+function selectDate(date) {
   selectedDate = date;
-  document.querySelectorAll('.dbtn').forEach(b => b.classList.remove('active'));
-  el.classList.add('active');
   loadDay(date);
 }
 
@@ -102,10 +100,10 @@ function stepDay(dir) {
 
 // Jump to an arbitrary day (from the calendar). Unlike selectDate it doesn't need
 // a sidebar element — loadDay re-renders the sidebar and highlights the active day.
-function goToDate(date) {
+function goToDate(date, options) {
   selectedDate = date;
   hideCalendar();
-  loadDay(date);
+  loadDay(date, options);
 }
 
 async function fetchCalTotals() {

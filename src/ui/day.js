@@ -16,29 +16,31 @@ function setDateTitle(date) {
   el.textContent = fmt(new Date(date + 'T12:00:00'));
 }
 
-async function loadDay(date) {
-  setDateTitle(date);
-  id('table-area').classList.toggle('summary-view', activeTab === 'summary');
-  renderSchedule(); // show on today, hide on past days
-  await loadWeek();
-  renderSidebar();
-  if (activeTab === 'report') await loadReport(date);
-  else await loadSummary(date);
-}
-
-// Each day load takes a generation; a response that is no longer the latest
-// (another date or tab was picked meanwhile) is dropped.
+// Each day load takes a generation; neither response may paint an older day.
 let _dayGen = 0;
 
-async function loadReport(date) {
+async function loadDay(date, { chart = false } = {}) {
   const gen = ++_dayGen;
+  const tab = activeTab;
   try {
-    const day = await apiJSON('GET', '/api/day?date=' + date);
-    if (gen !== _dayGen) return;
+    const [days, day] = await Promise.all([
+      fetchWeek(),
+      apiJSON('GET', '/api/day?date=' + date),
+    ]);
+    if (gen !== _dayGen || selectedDate !== date || activeTab !== tab) return;
+    weekData = days;
     D = day;
+    setDateTitle(date);
+    id('table-area').classList.toggle('summary-view', tab === 'summary');
+    renderSchedule();
+    renderSidebar();
     renderCards(D);
-    renderReport(D);
-    loadChart();
+    if (tab === 'report') {
+      renderReport(D);
+      if (chart) loadChart();
+    } else {
+      loadSummary(D, date);
+    }
   } catch (e) {
     if (gen !== _dayGen) return;
     id('table-area').innerHTML = `<div class="empty">${esc(e.message)}</div>`;

@@ -1,8 +1,12 @@
 'use strict';
 // ── Loaders ──────────────────────────────────────────────────────────────────
 async function loadWeek() {
-  try { weekData = (await apiJSON('GET', '/api/days?count=' + _sidebarDays + '&weekends=' + (_hideWeekends ? 0 : 1))).days; }
-  catch { weekData = []; }
+  weekData = await fetchWeek();
+}
+
+async function fetchWeek() {
+  try { return (await apiJSON('GET', '/api/days?count=' + _sidebarDays + '&weekends=' + (_hideWeekends ? 0 : 1))).days; }
+  catch { return []; }
 }
 
 let _trackerActive = false;
@@ -59,7 +63,7 @@ async function toggleTracker() {
     _skew = S.now_ms - Date.now();
     await loadCurrent();
     loadSchedule();
-    loadDay(selectedDate);
+    loadDay(selectedDate, { chart: true });
   } catch (e) { showError(e.message); }
 }
 

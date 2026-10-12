@@ -199,7 +199,7 @@ async function closeNoteEditor(saved) {
   if (_noteEditors > 0) return;
   if (_reloadPending) {
     _reloadPending = false;
-    await loadDay(selectedDate);
+    await loadDay(selectedDate, { chart: true });
   } else {
     renderReport(D);
   }

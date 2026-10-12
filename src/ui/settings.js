@@ -653,7 +653,7 @@ async function applySettings() {
     if (lang !== _lang) { setLangFrom(settings); relabel(); return; }
     loadCurrent(); // the header picks up the link and time-format choices
     loadSchedule();
-    loadDay(selectedDate); // weekends, sidebar days and day order
+    loadDay(selectedDate, { chart: true }); // weekends, sidebar days and day order
   } catch (e) {
     showError(e.message);
   }

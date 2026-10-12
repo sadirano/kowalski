@@ -11,7 +11,7 @@ async function switchToTask(task) {
     showToast(t('switched', { name: task.ref || task.title }));
     await loadCurrent();
     loadSchedule();
-    loadDay(selectedDate);
+    loadDay(selectedDate, { chart: true });
   } catch (e) {
     showError(e.message);
   }

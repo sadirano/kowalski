@@ -1,20 +1,8 @@
 'use strict';
-async function loadSummary(date) {
-  const gen = ++_dayGen;
-  try {
-    const day = await apiJSON('GET', '/api/day?date=' + date);
-    if (gen !== _dayGen) return;
-    D = day;
-    renderCards(D);
-    if (D.summary) {
-      renderSavedSummary(D.summary, date);
-    } else {
-      renderSummary(D);
-    }
-    id('chart-box').style.display = 'none';
-  } catch (e) {
-    if (gen === _dayGen) id('table-area').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
-  }
+function loadSummary(day, date) {
+  if (day.summary) renderSavedSummary(day.summary, date);
+  else renderSummary(day);
+  id('chart-box').style.display = 'none';
 }
 
 function buildSummaryWrap(content, isSaved) {

@@ -1282,7 +1282,7 @@ function providerHint(x) { return (x.hints && x.hints[_lang]) || x.hint || ''; }
 function relabel() {
   applyLang();
   // Re-render everything that bakes labels into its markup.
-  loadCurrent(); renderSidebar(); renderSchedule(); loadDay(selectedDate); renderChartGroups();
+  loadCurrent(); renderSidebar(); renderSchedule(); loadDay(selectedDate, { chart: true }); renderChartGroups();
   if (isSearchOpen()) renderSearch();
   relabelTour();
 }

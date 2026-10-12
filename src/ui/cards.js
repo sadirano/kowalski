@@ -7,7 +7,7 @@ async function loadSchedule() {
 // renderSchedule paints the strip from the cached payload + the live clock.
 // The clock-out time itself is fixed while you work; only the "left" countdown
 // and progress bar advance, so a 1 s re-render keeps it lively without refetching.
-function scheduleShown() { return selectedDate === todayStr() && !!S; }
+function scheduleShown() { return (D?.date || selectedDate) === todayStr() && !!S; }
 
 function renderSchedule() {
   const box = id('sched-box');

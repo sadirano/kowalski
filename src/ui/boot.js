@@ -33,13 +33,13 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').cat
     if (r.status === 'rejected') showError(r.reason.message);
   }
   renderSidebar();
-  loadDay(selectedDate);
+  loadDay(selectedDate, { chart: true });
   initTour();
   // Poll every 30 s; refresh the full page only once the user has been idle ≥5 m.
   setInterval(() => {
     loadCurrent();  // header ticker — always safe, never re-renders content
     loadSchedule(); // today's projection — cheap, drives the schedule strip
-    if (Date.now() - _lastInteraction >= IDLE_MS) loadDay(selectedDate);
+    if (Date.now() - _lastInteraction >= IDLE_MS) loadDay(selectedDate, { chart: true });
   }, 30_000);
   // Re-render the schedule strip every second so the countdown / clock-out ticks
   // smoothly between the 30 s fetches (uses cached data + the current clock).
