@@ -66,7 +66,11 @@ async function showSettings() {
     renderProviderControls();
     id('set-zone').value = pref('reporting_zone', '');
     id('set-port').textContent = pref('http_port', location.port || '47100');
-    apiJSON('GET', '/api/version').then(data => { id('set-version').textContent = data.version; }).catch(e => showError(e.message));
+    apiJSON('GET', '/api/version').then(data => {
+      id('set-version').textContent = data.version;
+      id('update-row').style.display = data.update_repo ? '' : 'none';
+      if (!data.update_repo) id('update-result').style.display = 'none';
+    }).catch(e => showError(e.message));
     renderPaidRows(false);
     renderLockRows(false);
     _settingsLoaded = true;
@@ -242,7 +246,8 @@ async function checkKowalskiUpdate() {
       ? (result.signed ? t('update_available', { v: result.version, c: result.current }) : t('update_unsigned'))
       : t('update_latest', { v: result.version });
     const notes = id('update-notes');
-    const safeNotes = _updateRelease && /^https:\/\/github\.com\/sadirano\/kowalski\/releases\//.test(result.notes_url);
+    const safeNotes = _updateRelease && result.repo &&
+      result.notes_url.startsWith(`https://github.com/${result.repo}/releases/`);
     notes.style.display = safeNotes ? '' : 'none';
     if (safeNotes) notes.href = result.notes_url;
     id('update-install').style.display = _updateRelease && result.signed ? '' : 'none';

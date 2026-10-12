@@ -214,7 +214,7 @@ fn is(req: Request, method: std.http.Method, path: []const u8, want: []const u8)
 
 fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !Response {
     if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true });
-    if (is(req, .GET, path, "/api/version")) return send(a, .ok, .{ .version = @import("build_options").version, .pid = GetCurrentProcessId() });
+    if (is(req, .GET, path, "/api/version")) return send(a, .ok, .{ .version = @import("build_options").version, .pid = GetCurrentProcessId(), .update_repo = @import("build_options").update_repo });
     if (try history(app, a, req, path)) |r| return r;
     if (is(req, .GET, path, "/api/search")) return search(app, a, params);
     if (is(req, .GET, path, "/api/daytotals")) return dayTotals(app, a, params);

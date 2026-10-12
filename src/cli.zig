@@ -676,7 +676,11 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         const yes = args.len == 1;
         const reply = try call(ctx, "GET", "/api/update", null);
         if (!try settle(ctx, reply)) return .ok;
-        const info = try parse(struct { state: []const u8, version: []const u8, current: []const u8 = "", notes_url: []const u8 = "", signed: bool = false }, ctx, reply.body);
+        const info = try parse(struct { state: []const u8, version: []const u8 = "", current: []const u8 = "", notes_url: []const u8 = "", signed: bool = false }, ctx, reply.body);
+        if (eql(u8, info.state, "disabled")) {
+            try ctx.out.writeAll("updates are turned off in this build\n");
+            return .ok;
+        }
         if (eql(u8, info.state, "up_to_date")) {
             try ctx.out.print("up to date ({s})\n", .{info.version});
             return .ok;

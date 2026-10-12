@@ -8,3 +8,7 @@ Use a Windows machine with Zig 0.17, the release signing key, and `gh`.
 4. Publish both assets with `gh release create vX.Y.Z kowalski-vX.Y.Z-windows-x86_64.zip kowalski-vX.Y.Z-windows-x86_64.zip.sig`.
 
 The signing seed lives outside the repository at `<Roaming AppData>\sadirano\kowalski-dev\release-signing-key.txt`, resolved through the Windows known-folder API. It has an offline backup. Losing both copies means users must reinstall by hand. Key rotation requires a release signed with the old key that carries the new public key.
+
+## For forks
+
+Run `zig build keygen -- <key file path>` to create a private release key outside the repository. Keep an offline backup. The command prints the public key and the exact `-Dupdate-key=<hex>` flag; never commit or share the key file. Build with `zig build -Doptimize=ReleaseSafe -Dupdate-repo=you/yourfork -Dupdate-key=<hex>`, then sign with `zig build sign -Dupdate-key=<hex> -- <zip path> --key <key file path>` and publish the ZIP and `.sig` as above. Fork builds and original builds reject each other's releases; switching between them requires a manual install. Organisations distributing builds themselves can use `-Dupdate-repo=` to turn off the updater.

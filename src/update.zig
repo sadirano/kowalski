@@ -6,10 +6,11 @@ const clock = @import("clock.zig");
 const launch = @import("launch.zig");
 
 pub const current_version = @import("build_options").version;
-pub const releases_url = "https://api.github.com/repos/sadirano/kowalski/releases/latest";
+pub const release_repo = @import("build_options").update_repo;
+pub const releases_url = "https://api.github.com/repos/" ++ release_repo ++ "/releases/latest";
 pub const release_public_key: [32]u8 = blk: {
     var key: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&key, "6434b476d6f442042c85deeeb428620ee428a34dddbab545a183908a738c04b8") catch unreachable;
+    _ = std.fmt.hexToBytes(&key, @import("build_options").update_key) catch unreachable;
     break :blk key;
 };
 
@@ -115,7 +116,8 @@ pub fn httpGet(_: *anyopaque, a: std.mem.Allocator, io: Io, url: []const u8, red
     return body.buffered();
 }
 
-pub fn check(a: std.mem.Allocator, io: Io, fetcher: Fetcher) !Check {
+pub fn check(a: std.mem.Allocator, io: Io, fetcher: Fetcher) anyerror!Check {
+    if (release_repo.len == 0) return error.UpdatesDisabled;
     const bytes = try fetcher.get(fetcher.context, a, io, releases_url, false, 1024 * 1024);
     return parseRelease(a, bytes);
 }
@@ -273,7 +275,8 @@ pub fn swapExecutables(a: std.mem.Allocator, io: Io, exe_dir: []const u8, stage:
 
 /// Freshly verifies the chosen release, stages it, backs up the live database,
 /// and swaps the executable names. The caller spawns the successor or rolls back.
-pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db: *sqlite.Db, db_path: []const u8, version: []const u8) !Swap {
+pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db: *sqlite.Db, db_path: []const u8, version: []const u8) anyerror!Swap {
+    if (release_repo.len == 0) return error.UpdatesDisabled;
     const latest = try check(a, io, fetcher);
     const release = switch (latest) {
         .up_to_date => return error.NoUpdate,
@@ -384,8 +387,13 @@ test "unsigned release returns before fetching ZIP" {
         }
     }.get };
     var dummy_db: sqlite.Db = undefined;
-    try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, &dummy_db, "unused.db", "0.2.0"));
-    try std.testing.expectEqual(@as(usize, 1), calls);
+    if (release_repo.len == 0) {
+        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, &dummy_db, "unused.db", "0.2.0"));
+        try std.testing.expectEqual(@as(usize, 0), calls);
+    } else {
+        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, &dummy_db, "unused.db", "0.2.0"));
+        try std.testing.expectEqual(@as(usize, 1), calls);
+    }
 }
 
 test "digest mismatch rejects download" {
@@ -531,7 +539,12 @@ test "release check uses the HTTP seam without network" {
             return "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
         }
     }.get };
-    const result = try check(arena.allocator(), std.testing.io, fake);
-    try std.testing.expect(called);
-    try std.testing.expect(result == .available);
+    if (release_repo.len == 0) {
+        try std.testing.expectError(error.UpdatesDisabled, check(arena.allocator(), std.testing.io, fake));
+        try std.testing.expect(!called);
+    } else {
+        const result = try check(arena.allocator(), std.testing.io, fake);
+        try std.testing.expect(called);
+        try std.testing.expect(result == .available);
+    }
 }

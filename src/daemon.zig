@@ -604,10 +604,28 @@ fn restartCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.R
     return api.answer(a, .ok, .{ .restarting = true });
 }
 
+fn disabledUpdateResponse(a: std.mem.Allocator, repo: []const u8, method: std.http.Method) ?api.Response {
+    if (repo.len != 0) return null;
+    return if (method == .GET)
+        api.answer(a, .ok, .{ .state = "disabled" })
+    else
+        api.answer(a, .bad_request, .{ .@"error" = "update_disabled", .message = "updates are turned off in this build" });
+}
+
+test "empty update repo gives a disabled API answer" {
+    const a = std.testing.allocator;
+    try std.testing.expect(disabledUpdateResponse(a, "someone/fork", .GET) == null);
+    const response = disabledUpdateResponse(a, "", .GET).?;
+    defer a.free(response.body);
+    try std.testing.expectEqual(std.http.Status.ok, response.status);
+    try std.testing.expectEqualStrings("{\"state\":\"disabled\"}", response.body);
+}
+
 fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     if (!std.mem.eql(u8, path, "/api/update")) return null;
     if (api.updateRefused(d.app.port, a, request)) |r| return r;
+    if (disabledUpdateResponse(a, update.release_repo, request.method)) |r| return r;
     const fetcher: update.Fetcher = .{ .context = @ptrCast(d), .get = update.httpGet };
     if (request.method == .GET) {
         const result = update.check(a, d.io, fetcher) catch |err| {
@@ -615,8 +633,8 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
             return api.answer(a, .bad_gateway, .{ .@"error" = "update_check", .message = @errorName(err) });
         };
         return switch (result) {
-            .up_to_date => api.answer(a, .ok, .{ .state = "up_to_date", .version = update.current_version }),
-            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest, .signed = release.signed }),
+            .up_to_date => api.answer(a, .ok, .{ .state = "up_to_date", .version = update.current_version, .repo = update.release_repo }),
+            .available => |release| api.answer(a, .ok, .{ .state = "available", .current = update.current_version, .version = release.version, .notes_url = release.notes_url, .size = release.size, .digest = release.digest, .signed = release.signed, .repo = update.release_repo }),
         };
     }
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
