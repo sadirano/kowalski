@@ -41,6 +41,10 @@ pub const Outcome = union(enum) {
 var running: std.atomic.Value(bool) = .init(false);
 var running_post: std.atomic.Value(i64) = .init(0);
 
+pub fn idle() bool {
+    return !running.load(.acquire);
+}
+
 pub fn runningPost() ?i64 {
     const id = running_post.load(.acquire);
     return if (id == 0) null else id;
@@ -283,6 +287,17 @@ pub const Fake = struct {
     fn free(_: ?*anyopaque, buffer: contract.Bytes) callconv(.c) void {
         std.heap.page_allocator.free(@constCast(buffer.slice()));
     }
+    fn init(context: ?*anyopaque, _: contract.Bytes, out_context: *?*anyopaque) callconv(.c) contract.Status {
+        out_context.* = context;
+        return .{};
+    }
+    fn deinit(_: ?*anyopaque) callconv(.c) void {}
+    pub fn entry(requested: u32) callconv(.c) ?*const contract.Table {
+        return if (requested == contract.version) &table else null;
+    }
+    pub fn info() callconv(.c) contract.Bytes {
+        return .of("{\"contracts\":[3],\"name\":\"fake\",\"build\":\"test\"}");
+    }
     pub const table: contract.Table = .{
         .version = contract.version,
         .instance = .of("fake"),
@@ -295,6 +310,8 @@ pub const Fake = struct {
         .login_prompts = loginPrompts,
         .login = login,
         .free = free,
+        .init = init,
+        .deinit = deinit,
     };
 };
 

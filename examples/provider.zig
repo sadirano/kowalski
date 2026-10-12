@@ -69,6 +69,13 @@ fn free(_: ?*anyopaque, buffer: k.Bytes) callconv(.c) void {
     allocator.free(@constCast(buffer.slice()));
 }
 
+fn init(context: ?*anyopaque, _: k.Bytes, out_context: *?*anyopaque) callconv(.c) k.Status {
+    out_context.* = context;
+    return .{};
+}
+
+fn deinit(_: ?*anyopaque) callconv(.c) void {}
+
 const table: k.Table = .{
     .version = k.version,
     .instance = .of("example"),
@@ -81,8 +88,14 @@ const table: k.Table = .{
     .login_prompts = loginPrompts,
     .login = login,
     .free = free,
+    .init = init,
+    .deinit = deinit,
 };
 
 pub fn kowalskiProvider(requested: u32) callconv(.c) ?*const k.Table {
     return if (requested == k.version) &table else null;
+}
+
+pub fn kowalskiProviderInfo() callconv(.c) k.Bytes {
+    return .of("{\"contracts\":[3],\"name\":\"example\",\"build\":\"sample\"}");
 }

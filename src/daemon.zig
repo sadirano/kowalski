@@ -47,6 +47,7 @@ const Daemon = struct {
     mutex: Io.Mutex = .init,
     app: api.App,
     provider: ?worker.Worker = null,
+    provider_table: ?*contract.Table = null,
     /// One request's provider call at a time; the worker refuses a second.
     provider_turn: Io.Mutex = .init,
     stop: Io.Event = .unset,
@@ -208,15 +209,45 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
     tour_mod.removeFiles(io, tour_path);
     d.tour_path = tour_path;
     defer if (d.tour) |t| t.destroy(io);
+    defer if (d.provider_table) |table| {
+        if (worker.idle()) {
+            table.deinit(table.context);
+            std.heap.page_allocator.destroy(table);
+        }
+    };
     if (provider_impl.kowalskiProvider(contract.version)) |table| {
         if (table.version != contract.version) {
             log("provider answered version {d}, need {d}; running without it", .{ table.version, contract.version });
         } else {
-            d.provider = .{ .table = table, .io = io, .late = onLate, .late_context = &d };
-            d.app.provider = table.instance.slice();
-            // Static for the daemon's life, like the table itself.
-            d.app.traits = api.parseTraits(traits_arena.allocator(), table.traits.slice());
-            log("provider: {s}", .{table.instance.slice()});
+            const InfoShape = struct { contracts: []const u32, name: []const u8, build: []const u8 };
+            const info = std.json.parseFromSliceLeaky(InfoShape, traits_arena.allocator(), provider_impl.kowalskiProviderInfo().slice(), .{ .ignore_unknown_fields = true }) catch null;
+            if (info) |metadata| {
+                var info_name: [128]u8 = undefined;
+                var build: [128]u8 = undefined;
+                for (metadata.name[0..@min(metadata.name.len, info_name.len)], 0..) |c, i| info_name[i] = if (std.ascii.isPrint(c)) c else '?';
+                for (metadata.build[0..@min(metadata.build.len, build.len)], 0..) |c, i| build[i] = if (std.ascii.isPrint(c)) c else '?';
+                log("provider info: {s} ({s})", .{ info_name[0..@min(metadata.name.len, info_name.len)], build[0..@min(metadata.build.len, build.len)] });
+            } else log("provider info: invalid JSON", .{});
+            const data_dir = try std.fs.path.resolve(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", "providers", table.instance.slice() });
+            defer gpa.free(data_dir);
+            try std.Io.Dir.cwd().createDirPath(io, data_dir);
+            const config = try std.json.Stringify.valueAlloc(gpa, .{ .contract = contract.version, .data_dir = data_dir }, .{});
+            defer gpa.free(config);
+            var context: ?*anyopaque = null;
+            const status = table.init(table.context, .of(config), &context);
+            defer if (status.message.ptr != null) table.free(context, status.message);
+            if (status.code != 0) {
+                log("provider init failed ({d}): {s}; running without it", .{ status.code, status.message.slice() });
+            } else {
+                const copy = try std.heap.page_allocator.create(contract.Table);
+                copy.* = table.*;
+                copy.context = context;
+                d.provider_table = copy;
+                d.provider = .{ .table = copy, .io = io, .late = onLate, .late_context = &d };
+                d.app.provider = copy.instance.slice();
+                d.app.traits = api.parseTraits(traits_arena.allocator(), copy.traits.slice());
+                log("provider: {s}", .{copy.instance.slice()});
+            }
         }
     }
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);

@@ -78,7 +78,7 @@ fn run(init: std.process.Init) !u8 {
         return 0;
     }
     if (std.mem.eql(u8, command, "demo")) return demoData(init, db, args);
-    if (std.mem.eql(u8, command, "provider") and args.len == 1 and std.mem.eql(u8, args[0], "login")) return providerLogin(init);
+    if (std.mem.eql(u8, command, "provider") and args.len == 1 and std.mem.eql(u8, args[0], "login")) return providerLogin(init, db);
 
     var out: std.Io.Writer.Allocating = .init(a);
     var err_out: std.Io.Writer.Allocating = .init(a);
@@ -102,19 +102,30 @@ fn run(init: std.process.Init) !u8 {
     return @backingInt(exit);
 }
 
-fn providerLogin(init: std.process.Init) !u8 {
+fn providerLogin(init: std.process.Init, db_path: []const u8) !u8 {
     const a = init.arena.allocator();
     const table = provider_impl.kowalskiProvider(contract.version) orelse {
         try std.Io.File.stderr().writeStreamingAll(init.io, "no provider in this build\n");
         return 1;
     };
+    if (table.version != contract.version) return loginFailed(init, "provider version mismatch");
+    const data_dir = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(db_path) orelse ".", "providers", table.instance.slice() });
+    try std.Io.Dir.cwd().createDirPath(init.io, data_dir);
+    const config = try std.json.Stringify.valueAlloc(a, .{ .contract = contract.version, .data_dir = data_dir }, .{});
+    var context: ?*anyopaque = null;
+    const started = table.init(table.context, .of(config), &context);
+    defer if (started.message.ptr != null) table.free(context, started.message);
+    if (started.code != 0) return loginFailed(init, started.message.slice());
+    var copy = table.*;
+    copy.context = context;
+    defer copy.deinit(copy.context);
     var listed: contract.Bytes = .{};
-    const listing = table.login_prompts(table.context, &listed);
-    defer if (listing.message.ptr != null) table.free(table.context, listing.message);
+    const listing = copy.login_prompts(copy.context, &listed);
+    defer if (listing.message.ptr != null) copy.free(copy.context, listing.message);
     if (listing.code != 0) return loginFailed(init, listing.message.slice());
     const Prompt = struct { name: []const u8, label: []const u8, secret: bool = false };
     const prompts = std.json.parseFromSliceLeaky([]Prompt, a, listed.slice(), .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-    table.free(table.context, listed);
+    if (listed.ptr != null) copy.free(copy.context, listed);
     const list = prompts catch return loginFailed(init, "invalid login prompts");
     if (list.len == 0) return loginFailed(init, "the provider needs no login");
 
@@ -143,8 +154,8 @@ fn providerLogin(init: std.process.Init) !u8 {
         try json.write(value);
     }
     try json.endObject();
-    const status = table.login(table.context, .of(answers.written()));
-    defer if (status.message.ptr != null) table.free(table.context, status.message);
+    const status = copy.login(copy.context, .of(answers.written()));
+    defer if (status.message.ptr != null) copy.free(copy.context, status.message);
     if (status.code != 0) return loginFailed(init, status.message.slice());
     try std.Io.File.stdout().writeStreamingAll(init.io, "login saved\n");
     return 0;

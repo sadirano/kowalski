@@ -63,6 +63,8 @@ pub const Tour = struct {
             .login_prompts = loginPrompts,
             .login = login,
             .free = free,
+            .init = init,
+            .deinit = deinit,
         };
         t.app = .{ .store = &t.store, .port = port, .clock = clock, .provider = instance };
         t.app.traits = api.parseTraits(t.traits_arena.allocator(), traits);
@@ -117,6 +119,14 @@ pub fn removeFiles(io: std.Io, path: []const u8) void {
 const traits = "{\"link\":\"https://tickets.example/{ref}\",\"paid_breaks\":[{\"from\":\"08:00\",\"to\":\"12:00\",\"minutes\":15},{\"from\":\"13:00\",\"to\":\"18:00\",\"minutes\":15}]}";
 
 const allocator = std.heap.page_allocator;
+
+/// The tour is built in: the daemon sets its context and calls neither.
+fn init(context: ?*anyopaque, _: k.Bytes, out_context: *?*anyopaque) callconv(.c) k.Status {
+    out_context.* = context;
+    return .{};
+}
+
+fn deinit(_: ?*anyopaque) callconv(.c) void {}
 
 fn give(text: []const u8, out: *k.Bytes) bool {
     const copy = allocator.dupe(u8, text) catch return false;

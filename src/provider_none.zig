@@ -5,3 +5,7 @@ pub fn kowalskiProvider(requested: u32) callconv(.c) ?*const contract.Table {
     _ = requested;
     return null;
 }
+
+pub fn kowalskiProviderInfo() callconv(.c) contract.Bytes {
+    return .of("{\"contracts\":[],\"name\":\"none\",\"build\":\"\"}");
+}

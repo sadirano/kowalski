@@ -8,6 +8,8 @@ pub fn build(b: *std.Build) void {
     // A package that depends on kowalski passes its own file as `provider`.
     const provider_path = b.option(std.Build.LazyPath, "provider", "Zig file of a private provider (see src/provider_api.zig)");
     const contract = b.addModule("kowalski_provider", .{ .root_source_file = b.path("src/provider_api.zig"), .target = target, .optimize = optimize });
+    const provider_check = b.addModule("kowalski_provider_check", .{ .root_source_file = b.path("src/provider_check.zig"), .target = target, .optimize = optimize });
+    provider_check.addImport("kowalski_provider", contract);
     const provider = b.createModule(.{
         .root_source_file = provider_path orelse b.path("src/provider_none.zig"),
         .target = target,
@@ -45,6 +47,12 @@ pub fn build(b: *std.Build) void {
     const test_run = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_run.step);
+    const contract_tests = b.addTest(.{ .root_module = makeModule(b, seams, target, optimize, "src/provider_check_test.zig") });
+    contract_tests.root_module.addImport("kowalski_provider_check", provider_check);
+    const example_module = b.createModule(.{ .root_source_file = b.path("examples/provider.zig"), .target = target, .optimize = optimize });
+    example_module.addImport("kowalski_provider", contract);
+    contract_tests.root_module.addImport("example_provider", example_module);
+    test_step.dependOn(&b.addRunArtifact(contract_tests).step);
 }
 
 const Seams = struct {
