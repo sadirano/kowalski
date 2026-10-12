@@ -92,7 +92,7 @@ pub fn dayNumbers(store: *store_mod.Store, allocator: std.mem.Allocator, day_sta
         if (last_end) |end| if (clamped_start > end) countPause(windows, &paused, schedule.lunches, end, clamped_start);
         last_end = if (last_end) |end| @max(end, raw_end) else raw_end;
         const reason = std.meta.stringToEnum(store_mod.OpenedBy, stmt.columnText(3).?) orelse return error.InvalidState;
-        if (start >= day_start_ms and (reason == .@"switch" or reason == .import) and had_earlier and previous_task != null and previous_task.? != task_id) {
+        if (start >= day_start_ms and (reason == .@"switch") and had_earlier and previous_task != null and previous_task.? != task_id) {
             tasks.items[index.?].hops += 1;
             result.hops += 1;
         }
@@ -148,7 +148,7 @@ fn fixtureInterval(db: *store_mod.Store, task: i64, role: store_mod.Role, start:
     try stmt.bindI64(3, start);
     if (end) |value| try stmt.bindI64(4, value) else try stmt.bindNull(4);
     try stmt.bindText(5, @tagName(opened));
-    if (end != null) try stmt.bindText(6, "import") else try stmt.bindNull(6);
+    if (end != null) try stmt.bindText(6, "stop") else try stmt.bindNull(6);
     _ = try stmt.step();
 }
 
@@ -162,7 +162,7 @@ test "day bounds split focus and exclude parallel" {
     const c = try store.createTask("C", 3);
     const hour: i64 = 3_600_000;
     const day: i64 = 24 * hour;
-    try fixtureInterval(&store, a, .focus, 23 * hour, day + hour, .import);
+    try fixtureInterval(&store, a, .focus, 23 * hour, day + hour, .@"switch");
     try fixtureInterval(&store, b, .parallel, 12 * hour, day + 4 * hour, .parallel);
     try fixtureInterval(&store, c, .focus, day + 2 * hour, null, .@"switch");
     var first = try dayNumbers(&store, std.testing.allocator, 0, day, day + 3 * hour, .{});

@@ -1,5 +1,6 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
+const clock = @import("clock.zig");
 
 pub fn ensure(db: *sqlite.Db) !void {
     const version = blk: {
@@ -11,9 +12,62 @@ pub fn ensure(db: *sqlite.Db) !void {
     if (version == current) return;
     if (version > current) return error.SchemaVersion;
 
+    if (version > 0) try backup(db, version);
+    try db.exec("PRAGMA foreign_keys=OFF");
+    defer db.exec("PRAGMA foreign_keys=ON") catch {};
+
     var tx = try db.transaction();
     defer tx.deinit();
     if (version == 0) try db.exec(
+        "CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL CHECK(length(title)>0), created_ms INTEGER NOT NULL);" ++
+            "CREATE TABLE task_bindings(task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, provider_instance TEXT NOT NULL, external_ref TEXT NOT NULL, UNIQUE(provider_instance,external_ref));" ++
+            "CREATE TABLE task_fields(task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(task_id,name));" ++
+            "CREATE TABLE intervals(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id), role TEXT NOT NULL CHECK(role IN ('focus','parallel')), start_ms INTEGER NOT NULL, end_ms INTEGER CHECK(end_ms IS NULL OR end_ms>=start_ms), opened_by TEXT NOT NULL CHECK(opened_by IN ('switch','parallel','resume')), closed_by TEXT CHECK(closed_by IN ('switch','pause','stop','recovered')), text TEXT, CHECK((end_ms IS NULL)=(closed_by IS NULL)));" ++
+            "CREATE UNIQUE INDEX one_open_interval_per_task ON intervals(task_id) WHERE end_ms IS NULL;" ++
+            "CREATE UNIQUE INDEX one_open_focus ON intervals(role) WHERE end_ms IS NULL AND role='focus';" ++
+            "CREATE INDEX intervals_start ON intervals(start_ms);" ++
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, interval_id INTEGER NOT NULL REFERENCES intervals(id) ON DELETE CASCADE, at_ms INTEGER NOT NULL, text TEXT NOT NULL CHECK(length(text)>0));" ++
+            "CREATE TABLE saved_set(task_id INTEGER PRIMARY KEY REFERENCES tasks(id), role TEXT NOT NULL CHECK(role IN ('focus','parallel')));" ++
+            "CREATE UNIQUE INDEX one_saved_focus ON saved_set(role) WHERE role='focus';" ++
+            "CREATE TABLE day_summaries(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), text TEXT NOT NULL);" ++
+            "CREATE TABLE postings(id INTEGER PRIMARY KEY, day TEXT NOT NULL CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), task_id INTEGER NOT NULL REFERENCES tasks(id), provider_instance TEXT NOT NULL, external_ref TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','confirmed','unknown','cancelled')), amount_text TEXT NOT NULL, amount_micro INTEGER NOT NULL CHECK(amount_micro>=0), provider_data TEXT, created_ms INTEGER NOT NULL, confirmed_ms INTEGER, covered_start_ms INTEGER, covered_end_ms INTEGER CHECK(covered_end_ms IS NULL OR covered_end_ms>covered_start_ms));" ++
+            "CREATE UNIQUE INDEX one_inflight_posting ON postings(day,provider_instance,external_ref) WHERE state IN ('sending','unknown');" ++
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);" ++
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);" ++
+            "CREATE TABLE lunches(id INTEGER PRIMARY KEY, out_ms INTEGER NOT NULL, back_ms INTEGER CHECK(back_ms IS NULL OR back_ms>=out_ms));" ++
+            "CREATE UNIQUE INDEX one_open_lunch ON lunches(back_ms IS NULL) WHERE back_ms IS NULL;" ++
+            "CREATE TABLE day_edits(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), edited_ms INTEGER NOT NULL);" ++
+            "CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);",
+    );
+    // 2: lunch breaks as recorded, and when each day's history was last edited.
+    if (version > 0 and version < 2) try db.exec(
+        "CREATE TABLE lunches(id INTEGER PRIMARY KEY, out_ms INTEGER NOT NULL, back_ms INTEGER CHECK(back_ms IS NULL OR back_ms>=out_ms));" ++
+            "CREATE UNIQUE INDEX one_open_lunch ON lunches(back_ms IS NULL) WHERE back_ms IS NULL;" ++
+            "CREATE TABLE day_edits(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), edited_ms INTEGER NOT NULL);" ++
+            "PRAGMA user_version=2;",
+    );
+    // 3: the span of focus time a posting booked with its own start and end;
+    // null for a posting of a day's total.
+    if (version > 0 and version < 3) try db.exec(
+        "ALTER TABLE postings ADD COLUMN covered_start_ms INTEGER;" ++
+            "ALTER TABLE postings ADD COLUMN covered_end_ms INTEGER CHECK(covered_end_ms IS NULL OR covered_end_ms>covered_start_ms);" ++
+            "PRAGMA user_version=3;",
+    );
+    if (version > 0 and version < 4) try db.exec(
+        "CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);" ++
+            "PRAGMA user_version=4;",
+    );
+    if (version > 0) try migrateV5(db);
+    try db.exec("PRAGMA user_version=5");
+    var check = try db.prepare("PRAGMA foreign_key_check");
+    defer check.finalize();
+    if (try check.step() != .done) return error.ForeignKeyViolation;
+    try tx.commit();
+}
+
+pub const current: i64 = 5;
+
+const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
             "CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL CHECK(length(title)>0), created_ms INTEGER NOT NULL, import_id INTEGER REFERENCES imports(id));" ++
             "CREATE TABLE task_bindings(task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, provider_instance TEXT NOT NULL, external_ref TEXT NOT NULL, UNIQUE(provider_instance,external_ref));" ++
@@ -30,30 +84,64 @@ pub fn ensure(db: *sqlite.Db) !void {
             "CREATE UNIQUE INDEX one_inflight_posting ON postings(day,provider_instance,external_ref) WHERE state IN ('sending','unknown');" ++
             "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);" ++
             "CREATE TABLE import_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);" ++
-            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-    );
-    // 2: lunch breaks as recorded, and when each day's history was last edited.
-    if (version < 2) try db.exec(
-        "CREATE TABLE lunches(id INTEGER PRIMARY KEY, out_ms INTEGER NOT NULL, back_ms INTEGER CHECK(back_ms IS NULL OR back_ms>=out_ms));" ++
-            "CREATE UNIQUE INDEX one_open_lunch ON lunches(back_ms IS NULL) WHERE back_ms IS NULL;" ++
-            "CREATE TABLE day_edits(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), edited_ms INTEGER NOT NULL);" ++
-            "PRAGMA user_version=2;",
-    );
-    // 3: the span of focus time a posting booked with its own start and end;
-    // null for a posting of a day's total.
-    if (version < 3) try db.exec(
-        "ALTER TABLE postings ADD COLUMN covered_start_ms INTEGER;" ++
-            "ALTER TABLE postings ADD COLUMN covered_end_ms INTEGER CHECK(covered_end_ms IS NULL OR covered_end_ms>covered_start_ms);" ++
-            "PRAGMA user_version=3;",
-    );
-    if (version < 4) try db.exec(
-        "CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);" ++
-            "PRAGMA user_version=4;",
-    );
-    try tx.commit();
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
+
+fn backup(db: *sqlite.Db, version: i64) !void {
+    var path: ?[]const u8 = null;
+    {
+        var list = try db.prepare("PRAGMA database_list");
+        defer list.finalize();
+        while (try list.step() == .row) {
+            if (std.mem.eql(u8, list.columnText(1).?, "main")) {
+                const name = list.columnText(2) orelse "";
+                if (name.len != 0) path = try std.heap.page_allocator.dupe(u8, name);
+                break;
+            }
+        }
+    }
+    const db_path = path orelse return;
+    defer std.heap.page_allocator.free(db_path);
+    const seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(@divFloor(clock.nowMs(), 1000)) };
+    const day = seconds.getEpochDay().calculateYearDay();
+    const month = day.calculateMonthDay();
+    const time = seconds.getDaySeconds();
+    const name = try std.fmt.allocPrint(std.heap.page_allocator, "backup-v{d}-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.db", .{
+        version, day.year, month.month.numeric(), month.day_index + 1, time.getHoursIntoDay(), time.getMinutesIntoHour(), time.getSecondsIntoMinute(),
+    });
+    defer std.heap.page_allocator.free(name);
+    const target = try std.fs.path.join(std.heap.page_allocator, &.{ std.fs.path.dirname(db_path) orelse ".", name });
+    defer std.heap.page_allocator.free(target);
+    var vacuum = try db.prepare("VACUUM INTO ?1");
+    defer vacuum.finalize();
+    try vacuum.bindText(1, target);
+    if (try vacuum.step() != .done) return error.Sqlite;
 }
 
-pub const current: i64 = 4;
+fn migrateV5(db: *sqlite.Db) !void {
+    try db.exec(
+        "CREATE TABLE tasks_new(id INTEGER PRIMARY KEY, title TEXT NOT NULL CHECK(length(title)>0), created_ms INTEGER NOT NULL);" ++
+            "INSERT INTO tasks_new(id,title,created_ms) SELECT id,title,created_ms FROM tasks;" ++
+            "DROP TABLE tasks; ALTER TABLE tasks_new RENAME TO tasks;" ++
+            "CREATE TABLE intervals_new(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id), role TEXT NOT NULL CHECK(role IN ('focus','parallel')), start_ms INTEGER NOT NULL, end_ms INTEGER CHECK(end_ms IS NULL OR end_ms>=start_ms), opened_by TEXT NOT NULL CHECK(opened_by IN ('switch','parallel','resume')), closed_by TEXT CHECK(closed_by IN ('switch','pause','stop','recovered')), text TEXT, CHECK((end_ms IS NULL)=(closed_by IS NULL)));" ++
+            "INSERT INTO intervals_new(id,task_id,role,start_ms,end_ms,opened_by,closed_by,text) SELECT id,task_id,role,start_ms,end_ms,CASE WHEN opened_by='import' THEN 'switch' ELSE opened_by END,CASE WHEN closed_by='import' THEN 'stop' ELSE closed_by END,text FROM intervals;" ++
+            "DROP TABLE intervals; ALTER TABLE intervals_new RENAME TO intervals;" ++
+            "CREATE UNIQUE INDEX one_open_interval_per_task ON intervals(task_id) WHERE end_ms IS NULL;" ++
+            "CREATE UNIQUE INDEX one_open_focus ON intervals(role) WHERE end_ms IS NULL AND role='focus';" ++
+            "CREATE INDEX intervals_start ON intervals(start_ms);" ++
+            "CREATE TABLE notes_new(id INTEGER PRIMARY KEY, interval_id INTEGER NOT NULL REFERENCES intervals(id) ON DELETE CASCADE, at_ms INTEGER NOT NULL, text TEXT NOT NULL CHECK(length(text)>0));" ++
+            "INSERT INTO notes_new(id,interval_id,at_ms,text) SELECT id,interval_id,at_ms,text FROM notes;" ++
+            "DROP TABLE notes; ALTER TABLE notes_new RENAME TO notes;" ++
+            "CREATE TABLE day_summaries_new(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), text TEXT NOT NULL);" ++
+            "INSERT INTO day_summaries_new(day,text) SELECT day,text FROM day_summaries;" ++
+            "DROP TABLE day_summaries; ALTER TABLE day_summaries_new RENAME TO day_summaries;" ++
+            "CREATE TABLE postings_new(id INTEGER PRIMARY KEY, day TEXT NOT NULL CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), task_id INTEGER NOT NULL REFERENCES tasks(id), provider_instance TEXT NOT NULL, external_ref TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('sending','confirmed','unknown','cancelled')), amount_text TEXT NOT NULL, amount_micro INTEGER NOT NULL CHECK(amount_micro>=0), provider_data TEXT, created_ms INTEGER NOT NULL, confirmed_ms INTEGER, covered_start_ms INTEGER, covered_end_ms INTEGER CHECK(covered_end_ms IS NULL OR covered_end_ms>covered_start_ms));" ++
+            "INSERT INTO postings_new(id,day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,provider_data,created_ms,confirmed_ms,covered_start_ms,covered_end_ms) SELECT id,day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,provider_data,created_ms,confirmed_ms,covered_start_ms,covered_end_ms FROM postings;" ++
+            "DROP TABLE postings; ALTER TABLE postings_new RENAME TO postings;" ++
+            "CREATE UNIQUE INDEX one_inflight_posting ON postings(day,provider_instance,external_ref) WHERE state IN ('sending','unknown');" ++
+            "DROP TABLE import_settings; DROP TABLE imports;",
+    );
+}
 
 test "schema constraints and version" {
     var db: sqlite.Db = .{};
@@ -79,42 +167,103 @@ test "schema constraints and version" {
     try std.testing.expectError(error.SchemaVersion, ensure(&db));
 }
 
-test "a version 1 database upgrades in place" {
-    var db: sqlite.Db = .{};
-    try db.open(":memory:");
-    defer db.close();
-    try db.exec("CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL); CREATE TABLE postings(id INTEGER PRIMARY KEY, amount_micro INTEGER); INSERT INTO postings VALUES(1,500000); PRAGMA user_version=1;");
-    try ensure(&db);
-    try db.exec("INSERT INTO day_edits(day,edited_ms) VALUES('2026-03-10',1)");
-    var stmt = try db.prepare("PRAGMA user_version");
-    defer stmt.finalize();
-    _ = try stmt.step();
-    try std.testing.expectEqual(current, stmt.columnI64(0));
+fn legacyFixture(db: *sqlite.Db, version: i64) !void {
+    try db.exec(legacyBase);
+    try db.exec("CREATE TABLE lunches(id INTEGER PRIMARY KEY, out_ms INTEGER NOT NULL, back_ms INTEGER CHECK(back_ms IS NULL OR back_ms>=out_ms));CREATE UNIQUE INDEX one_open_lunch ON lunches(back_ms IS NULL) WHERE back_ms IS NULL;CREATE TABLE day_edits(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), edited_ms INTEGER NOT NULL);");
+    try db.exec("ALTER TABLE postings ADD COLUMN covered_start_ms INTEGER;ALTER TABLE postings ADD COLUMN covered_end_ms INTEGER CHECK(covered_end_ms IS NULL OR covered_end_ms>covered_start_ms);");
+    if (version == 4) try db.exec("CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);");
+    try db.exec("INSERT INTO imports(id,at_ms,source,report,events) VALUES(9,0,'x','{}','[]');INSERT INTO import_settings(key,value) VALUES('x','y');INSERT INTO tasks(id,title,created_ms,import_id) VALUES(11,'A',1,9);INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by,text,import_id) VALUES(12,11,'focus',1,2,'import','import','work',9);INSERT INTO notes(id,interval_id,at_ms,text,import_id) VALUES(13,12,1,'note',9);INSERT INTO day_summaries(day,text,import_id) VALUES('2026-03-10','summary',9);INSERT INTO postings(id,day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms,import_id,covered_start_ms,covered_end_ms) VALUES(14,'2026-03-10',11,'example','ref','confirmed','1',1000000,1,2,9,1,2);");
+    if (version == 3) try db.exec("PRAGMA user_version=3") else try db.exec("PRAGMA user_version=4");
 }
 
-test "a version 2 database gains posting coverage and keeps its rows" {
-    var db: sqlite.Db = .{};
-    try db.open(":memory:");
-    defer db.close();
-    try db.exec("CREATE TABLE postings(id INTEGER PRIMARY KEY, amount_micro INTEGER); INSERT INTO postings VALUES(1,500000); PRAGMA user_version=2;");
-    try ensure(&db);
-    try db.exec("UPDATE postings SET covered_start_ms=10,covered_end_ms=20 WHERE id=1");
-    try std.testing.expectError(error.Sqlite, db.exec("UPDATE postings SET covered_end_ms=5 WHERE id=1"));
-    var stmt = try db.prepare("SELECT amount_micro FROM postings WHERE id=1");
-    defer stmt.finalize();
-    _ = try stmt.step();
-    try std.testing.expectEqual(@as(i64, 500000), stmt.columnI64(0));
-}
-
-test "a version 3 database gains provider trust and keeps work history" {
-    var db: sqlite.Db = .{};
-    try db.open(":memory:");
-    defer db.close();
-    try db.exec("CREATE TABLE postings(id INTEGER PRIMARY KEY, amount_micro INTEGER); INSERT INTO postings VALUES(1,500000); PRAGMA user_version=3;");
-    try ensure(&db);
-    var stmt = try db.prepare("SELECT amount_micro FROM postings WHERE id=1");
+fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
+    var stmt = try db.prepare(sql);
     defer stmt.finalize();
     try std.testing.expectEqual(.row, try stmt.step());
-    try std.testing.expectEqual(@as(i64, 500000), stmt.columnI64(0));
-    try db.exec("INSERT INTO provider_trust(id,sha256,how,approved_ms) VALUES(1,'abc','compared',1)");
+    return stmt.columnI64(0);
+}
+
+fn assertV5(db: *sqlite.Db) !void {
+    try std.testing.expectEqual(@as(i64, 5), try scalar(db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
+    try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
+    try std.testing.expectEqual(@as(i64, 12), try scalar(db, "SELECT id FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 13), try scalar(db, "SELECT id FROM notes"));
+    try std.testing.expectEqual(@as(i64, 7), try scalar(db, "SELECT length(text) FROM day_summaries WHERE day='2026-03-10' AND text='summary'"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(db, "SELECT id FROM postings"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM intervals WHERE opened_by='switch' AND closed_by='stop' AND text='work'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM postings WHERE covered_start_ms=1 AND covered_end_ms=2 AND amount_micro=1000000"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM sqlite_master WHERE name IN ('imports','import_settings')"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='import_id'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('intervals') WHERE name='import_id'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('notes') WHERE name='import_id'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('day_summaries') WHERE name='import_id'"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('postings') WHERE name='import_id'"));
+    try std.testing.expectEqual(@as(i64, 4), try scalar(db, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN ('one_open_interval_per_task','one_open_focus','intervals_start','one_inflight_posting')"));
+    var check = try db.prepare("PRAGMA foreign_key_check");
+    defer check.finalize();
+    try std.testing.expectEqual(.done, try check.step());
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO intervals(task_id,role,start_ms,opened_by) VALUES(11,'focus',3,'import')"));
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES('2026-03-10',11,'example','bad','confirmed','1',1,1,2,1)"));
+}
+
+test "v3 and v4 history upgrades to v5" {
+    for ([_]i64{ 3, 4 }) |version| {
+        var db: sqlite.Db = .{};
+        try db.open(":memory:");
+        defer db.close();
+        try legacyFixture(&db, version);
+        try ensure(&db);
+        try assertV5(&db);
+    }
+}
+
+test "fresh v5 has no import provenance" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    try ensure(&db);
+    try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM sqlite_master WHERE name IN ('imports','import_settings')"));
+    inline for (.{ "tasks", "intervals", "notes", "day_summaries", "postings" }) |table| {
+        try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM pragma_table_info('" ++ table ++ "') WHERE name='import_id'"));
+    }
+}
+
+test "file upgrade makes a v4 backup, current file does not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/work's db.db", .{tmp.sub_path});
+    defer a.free(path);
+    var db: sqlite.Db = .{};
+    try db.open(path);
+    try legacyFixture(&db, 4);
+    try ensure(&db);
+    try assertV5(&db);
+    try ensure(&db);
+    db.close();
+    const current_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/current.db", .{tmp.sub_path});
+    defer a.free(current_path);
+    var current_db: sqlite.Db = .{};
+    try current_db.open(current_path);
+    try ensure(&current_db);
+    try ensure(&current_db);
+    current_db.close();
+    var dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next(std.testing.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "backup-v")) continue;
+        try std.testing.expect(std.mem.startsWith(u8, entry.name, "backup-v4-"));
+        count += 1;
+        const backup_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, entry.name });
+        defer a.free(backup_path);
+        var copy: sqlite.Db = .{};
+        try copy.openReadOnly(backup_path);
+        defer copy.close();
+        try std.testing.expectEqual(@as(i64, 4), try scalar(&copy, "PRAGMA user_version"));
+        try std.testing.expectEqual(@as(i64, 12), try scalar(&copy, "SELECT id FROM intervals"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }

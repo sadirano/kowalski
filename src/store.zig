@@ -5,6 +5,7 @@ const zone = @import("zone.zig");
 
 pub const Error = error{
     Sqlite,
+    ForeignKeyViolation,
     SchemaVersion,
     OutOfMemory,
     TooLarge,
@@ -47,8 +48,8 @@ pub const Error = error{
 pub const max_time_ms: i64 = 253_402_300_800_000;
 
 pub const Role = enum { focus, parallel };
-pub const OpenedBy = enum { @"switch", parallel, @"resume", import };
-pub const ClosedBy = enum { @"switch", pause, stop, recovered, import };
+pub const OpenedBy = enum { @"switch", parallel, @"resume" };
+pub const ClosedBy = enum { @"switch", pause, stop, recovered };
 pub const PostingState = enum { sending, confirmed, unknown, cancelled };
 
 fn sqlText(value: anytype) []const u8 {
@@ -243,7 +244,7 @@ pub const Store = struct {
     /// interval's start, so starting and stopping, or hopping twice, in one millisecond writes 1 ms
     /// intervals instead of zero-length or overlapping ones.
     fn intervalTime(s: *Store, now_ms: i64) !i64 {
-        var stmt = try s.db.prepare("SELECT max(coalesce(end_ms,start_ms+1)) FROM intervals WHERE import_id IS NULL");
+        var stmt = try s.db.prepare("SELECT max(coalesce(end_ms,start_ms+1)) FROM intervals");
         defer stmt.finalize();
         if (try stmt.step() != .row or stmt.columnIsNull(0)) return now_ms;
         const floor = stmt.columnI64(0);
@@ -1298,7 +1299,7 @@ test "recovery clamps to interval start without a fresh heartbeat" {
     var s = try Store.init(&db, std.testing.allocator);
     _ = try s.createTask("A", 1);
     _ = try s.createTask("B", 2);
-    try db.exec("INSERT INTO intervals(task_id,role,start_ms,opened_by) VALUES(1,'focus',200,'import'),(2,'parallel',400,'import')");
+    try db.exec("INSERT INTO intervals(task_id,role,start_ms,opened_by) VALUES(1,'focus',200,'switch'),(2,'parallel',400,'parallel')");
     try db.exec("INSERT INTO meta(key,value) VALUES('last_heartbeat_ms','300')");
     try s.onStart(1_000);
     try std.testing.expectEqual(@as(i64, 300), try testScalar(&db, "SELECT end_ms FROM intervals WHERE task_id=1"));

@@ -43,6 +43,9 @@ you request a check. With your confirmation, it downloads the release ZIP,
 checks its signature, size and published SHA-256 when available, copies the database
 before installing the two executables, and restarts the background service.
 
+Each file database schema upgrade also leaves a `backup-v<old>-<YYYYMMDD-HHMMSS>.db`
+next to the database before changing it.
+
 To go back by hand, download the previous release ZIP and restore its two
 executables. If the new version changed the database schema, restore the
 matching `backup-before-<version>-<date>/` database copy as well. The `.old`

@@ -199,12 +199,11 @@ pub fn taskOpen(store: *Store, task_id: i64) !bool {
 pub const Posted = struct {
     amount_text: []const u8,
     amount_micro: i64,
-    imported: bool,
     confirmed_ms: i64,
 };
 
 pub fn postedOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8) ![]Posted {
-    var stmt = try store.db.prepare("SELECT amount_text,amount_micro,import_id IS NOT NULL,confirmed_ms FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state='confirmed' ORDER BY confirmed_ms,id");
+    var stmt = try store.db.prepare("SELECT amount_text,amount_micro,confirmed_ms FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state='confirmed' ORDER BY confirmed_ms,id");
     defer stmt.finalize();
     try stmt.bindText(1, day);
     try stmt.bindText(2, instance);
@@ -213,8 +212,7 @@ pub fn postedOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: 
     while (try stmt.step() == .row) try rows.append(a, .{
         .amount_text = try a.dupe(u8, stmt.columnText(0).?),
         .amount_micro = stmt.columnI64(1),
-        .imported = stmt.columnI64(2) != 0,
-        .confirmed_ms = stmt.columnI64(3),
+        .confirmed_ms = stmt.columnI64(2),
     });
     return rows.items;
 }
