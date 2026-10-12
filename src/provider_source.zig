@@ -116,11 +116,11 @@ pub fn release(db: *sqlite.Db, a: std.mem.Allocator, generation: i64, sequence: 
 }
 
 pub fn recordError(db: *sqlite.Db, generation: i64, message: []const u8, now: i64) !void {
-    var stmt = try db.prepare("UPDATE provider_source SET last_check_ms=?1,last_error=?2 WHERE id=1 AND generation=?3");
+    _ = now;
+    var stmt = try db.prepare("UPDATE provider_source SET last_error=?1 WHERE id=1 AND generation=?2");
     defer stmt.finalize();
-    try stmt.bindI64(1, now);
-    try stmt.bindText(2, message);
-    try stmt.bindI64(3, generation);
+    try stmt.bindText(1, message);
+    try stmt.bindI64(2, generation);
     _ = try stmt.step();
 }
 

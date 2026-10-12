@@ -849,13 +849,34 @@ fn sourceCommandInner(d: *Daemon, a: std.mem.Allocator, request: api.Request, ba
         d.mutex.lockUncancelable(d.io);
         defer d.mutex.unlock(d.io);
         const enrolled = try provider_source.read(d.app.store.db, a);
-        if (enrolled == null) return api.answer(a, .ok, .{ .enrollment = @as(?provider_source.Enrollment, null), .available = @as(?provider_manifest.Manifest, null) });
+        if (enrolled == null) {
+            const setup_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(d.db_path) orelse ".", "providers", "source.json" });
+            const setup_bytes = Io.Dir.cwd().readFileAlloc(d.io, setup_path, a, .limited(64 * 1024)) catch null;
+            const Setup = struct { source: []const u8, key: []const u8 };
+            const setup: ?Setup = if (setup_bytes) |bytes| blk: {
+                const parsed = std.json.parseFromSliceLeaky(Setup, a, bytes, .{ .ignore_unknown_fields = false }) catch break :blk null;
+                break :blk parsed;
+            } else null;
+            return api.answer(a, .ok, .{ .enrollment = @as(?provider_source.Enrollment, null), .available = @as(?provider_manifest.Manifest, null), .installed = @as(?provider_manifest.Manifest, null), .setup = setup });
+        }
         const current = enrolled.?;
         const latest = try provider_source.release(d.app.store.db, a, current.generation, current.highest_sequence);
         const latest_manifest: ?provider_manifest.Manifest = if (latest) |r| try provider_manifest.verify(a, r.bytes, r.signature, current.public_key) else null;
         const trust = try readTrust(d.app.store.db, a);
         const available: ?provider_manifest.Manifest = if (latest_manifest) |m| if (trust == null or !std.mem.eql(u8, trust.?.mode, "source") or !std.mem.eql(u8, trust.?.sha, m.sha256)) m else null else null;
-        return api.answer(a, .ok, .{ .enrollment = enrolled, .available = available, .ignored_drop_folder = hasDropDll(d, a) });
+        var installed: ?provider_manifest.Manifest = null;
+        if (trust) |pinned| {
+            if (std.mem.eql(u8, pinned.mode, "source")) {
+                var stmt = try d.app.store.db.prepare("SELECT manifest,signature FROM provider_release WHERE generation=?1");
+                defer stmt.finalize();
+                try stmt.bindI64(1, current.generation);
+                while (try stmt.step() == .row) {
+                    const m = try provider_manifest.verify(a, stmt.columnText(0).?, stmt.columnText(1).?, current.public_key);
+                    if (std.mem.eql(u8, m.sha256, pinned.sha)) { installed = m; break; }
+                }
+            }
+        }
+        return api.answer(a, .ok, .{ .enrollment = enrolled, .available = available, .installed = installed, .setup = @as(?[]const u8, null), .ignored_drop_folder = hasDropDll(d, a) });
     }
     if (base and request.method == .DELETE) {
         try d.source_turn.lock(d.io);

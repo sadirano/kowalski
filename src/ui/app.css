@@ -395,6 +395,8 @@
   .approve-accept{display:flex;flex-direction:column;align-items:flex-start;gap:4px}
   .approve-accept button.cancel-link{padding:0;text-decoration:underline;text-underline-offset:2px}
   .approve-accept small{font-size:11px;line-height:1.4;color:var(--muted)}
+  .provider-source-status{display:flex;flex-direction:column;gap:3px;text-align:right;font-size:12px;overflow-wrap:anywhere}
+  .provider-source-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
   .confirm-overlay{z-index:300}
   .confirm-popup{z-index:301;width:min(420px,94vw)}
   .confirm-text{font-size:13px;line-height:1.5;color:var(--txt)}

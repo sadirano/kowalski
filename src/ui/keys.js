@@ -36,7 +36,7 @@ function hideKeys() {
 // compete with the Enter/Escape handling further down.
 const POPUP_IDS = ['newtask-popup', 'settings-popup', 'horas-popup',
                    'obs-popup', 'cal-popup', 'edit-popup', 'addentry-popup',
-                   'keys-popup', 'login-popup', 'approve-popup', 'confirm-popup'];
+                   'keys-popup', 'login-popup', 'approve-popup', 'source-popup', 'confirm-popup'];
 function anyPopupOpen() { return POPUP_IDS.some(p => id(p) && id(p).classList.contains('show')); }
 function isTyping(e) {
   const el = e.target;
@@ -90,6 +90,10 @@ document.addEventListener('keydown', e => {
   }
   if (id('approve-popup').classList.contains('show') && (e.key === 'Escape' || e.key === 'Enter')) {
     if (e.key === 'Escape') hideProviderApproval();
+    return;
+  }
+  if (id('source-popup').classList.contains('show') && (e.key === 'Escape' || e.key === 'Enter')) {
+    if (e.key === 'Escape') hideSourceDialog();
     return;
   }
   if (e.key === 'Escape' && id('newtask-popup').classList.contains('show')) hideNewTask();

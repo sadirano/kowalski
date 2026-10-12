@@ -188,6 +188,14 @@
         <div class="set-ctl set-provider-ctl"><span class="set-ro" id="set-provider-status-text"></span>
           <span class="set-provider-waiting" id="set-provider-waiting"></span>
           <button type="button" class="set-btn" id="set-provider-review" onclick="showProviderApproval()" data-i18n="provider_review" style="display:none">Review</button>
+          <div class="provider-source-status" id="set-source-status"></div>
+          <div class="provider-source-actions" id="set-source-actions">
+            <button type="button" class="set-btn" id="set-source-use" onclick="showSourceDialog()" data-i18n="source_use">Use a provider source</button>
+            <button type="button" class="set-btn" id="set-source-check" onclick="checkSource()" data-i18n="source_check" style="display:none">Check now</button>
+            <button type="button" class="set-btn" id="set-source-install" onclick="installSource()" style="display:none"></button>
+            <button type="button" class="set-btn" id="set-source-stop" onclick="showStopSource()" data-i18n="source_stop" style="display:none">Stop using the source</button>
+          </div>
+          <span class="set-provider-waiting" id="set-source-error"></span>
           <span class="restart-prompt" id="provider-restart-prompt" style="display:none"><span data-i18n="approve_restart">Restart kowalski to load the new provider.</span>
             <button type="button" class="set-btn" onclick="restartKowalski()" data-i18n="restart_now">Restart now</button></span></div></div>
       <div class="set-row" id="set-account-row"><div class="set-lbl"><span data-i18n="set_account">Provider account</span></div>
@@ -322,6 +330,20 @@
     <button type="button" class="cancel-link" onclick="hideProviderApproval()" data-i18n="cancel">Cancel</button></div>
   <div class="approve-accept"><button type="button" class="cancel-link" id="approve-accept" onclick="trustProviderAsIs()" data-i18n="approve_accept">Trust this file as it is</button>
     <small data-i18n="approve_accept_hint">Without comparing it to a published hash. Only do this for a file you built or got directly from its publisher.</small></div>
+</div>
+<!-- Provider source enrollment and stop -->
+<div class="newtask-overlay approve-overlay" id="source-overlay" onclick="hideSourceDialog()"></div>
+<div class="newtask-popup approve-popup" id="source-popup" role="dialog" aria-modal="true" aria-labelledby="source-title">
+  <h3 id="source-title" data-i18n="source_title">Use a provider source</h3>
+  <div class="approve-details" id="source-setup" style="display:none"></div>
+  <label id="source-location-label"><span data-i18n="source_location">Source</span><input id="source-location" type="text" spellcheck="false" autocomplete="off" oninput="sourceInputChanged()"></label>
+  <label id="source-key-label"><span data-i18n="source_key">Public key</span><input id="source-key" type="text" spellcheck="false" autocomplete="off" oninput="sourceInputChanged()"></label>
+  <div id="source-proposal" class="approve-details" style="display:none"></div>
+  <div id="source-dialog-error" class="approve-match differs" role="alert"></div>
+  <div class="popup-row"><button type="button" class="apply-btn" id="source-primary" onclick="submitSource()"></button>
+    <button type="button" class="cancel-link" onclick="hideSourceDialog()" data-i18n="cancel">Cancel</button></div>
+  <div class="approve-accept" id="source-accept-row" style="display:none"><button type="button" class="cancel-link" id="source-accept" onclick="acceptSourceAsIs()" data-i18n="source_accept">Trust this source as it is</button>
+    <small data-i18n="source_accept_hint">Use the public key in the unverified proposal without comparing it.</small></div>
 </div>
 <!-- Keyboard shortcuts cheatsheet (the ? key) -->
 <div class="newtask-overlay" id="keys-overlay" onclick="hideKeys()"></div>

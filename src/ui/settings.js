@@ -64,6 +64,7 @@ async function showSettings() {
     id('set-autofill').checked = pref('ui_autofill_obs', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
     renderProviderControls();
+    loadSourceStatus().catch(e => { id('set-source-error').textContent = e.message; });
     id('set-zone').value = pref('reporting_zone', '');
     id('set-port').textContent = pref('http_port', location.port || '47100');
     apiJSON('GET', '/api/version').then(data => {
@@ -100,7 +101,7 @@ function renderProviderControls() {
 }
 
 function renderProviderStatus() {
-  id('set-provider-status').style.display = providerStatus.state === 'none' && !providerStatus.candidate ? 'none' : '';
+  id('set-provider-status').style.display = '';
   const providerText = id('set-provider-status-text');
   providerText.textContent = providerStatus.state === 'unavailable'
     ? t('provider_unavailable', { reason: providerStatus.reason })
@@ -109,6 +110,182 @@ function renderProviderStatus() {
   const candidate = providerStatus.candidate;
   id('set-provider-waiting').textContent = candidate ? t('provider_waiting', { file: candidate.file }) : '';
   id('set-provider-review').style.display = candidate ? '' : 'none';
+  renderSourceStatus();
+}
+
+let _sourceData = null;
+let _sourceBusy = false;
+let _sourceMode = 'enroll';
+let _sourceProposal = null;
+let _sourceHow = 'compared';
+let _sourceAcceptArmed = false;
+
+async function loadSourceStatus() {
+  _sourceData = await apiJSON('GET', '/api/provider/source');
+  renderSourceStatus();
+}
+
+function renderSourceStatus() {
+  const source = _sourceData?.enrollment;
+  id('set-source-use').style.display = source ? 'none' : '';
+  for (const name of ['check', 'stop']) id(`set-source-${name}`).style.display = source ? '' : 'none';
+  const available = _sourceData?.available;
+  id('set-source-install').style.display = source && available ? '' : 'none';
+  if (available) id('set-source-install').textContent = t('source_install', { version: available.version });
+  const lines = [];
+  if (source) {
+    lines.push(source.source, `${source.provider}/${source.channel}`);
+    lines.push(t('source_installed', { version: _sourceData.installed?.version || t('source_none') }));
+    if (source.last_check_ms) lines.push(t('source_last_check', { time: new Date(source.last_check_ms).toLocaleString(locale()) }));
+    if (source.last_error) lines.push(t('source_last_error', { error: source.last_error }));
+    if (_sourceData.ignored_drop_folder) lines.push(t('source_ignored'));
+  }
+  id('set-source-status').replaceChildren(...lines.map(line => {
+    const span = document.createElement('span');
+    span.textContent = line;
+    return span;
+  }));
+}
+
+function sourceDialogError(message = '') { id('source-dialog-error').textContent = message; }
+function sourceInputChanged() {
+  if (_sourceProposal) { _sourceProposal = null; id('source-proposal').style.display = 'none'; }
+  _sourceHow = 'compared';
+  const usingSetup = _sourceData?.setup && id('source-location').value.trim() === _sourceData.setup.source;
+  id('source-setup').style.display = usingSetup ? '' : 'none';
+  id('source-accept-row').style.display = usingSetup ? '' : 'none';
+  id('source-key-label').querySelector('span').textContent = t(usingSetup ? 'source_paste_key' : 'source_key');
+  sourceDialogError();
+  id('source-primary').textContent = t('source_review');
+}
+
+function showSourceDialog() {
+  if (_sourceBusy) return;
+  _sourceMode = 'enroll';
+  _sourceProposal = null;
+  _sourceHow = 'compared';
+  _sourceAcceptArmed = false;
+  const setup = _sourceData?.setup;
+  id('source-title').textContent = t('source_title');
+  id('source-location-label').style.display = '';
+  id('source-key-label').style.display = '';
+  id('source-location').value = setup?.source || '';
+  id('source-key').value = '';
+  id('source-key-label').querySelector('span').textContent = t(setup ? 'source_paste_key' : 'source_key');
+  id('source-setup').style.display = setup ? '' : 'none';
+  id('source-setup').textContent = setup ? t('source_unverified', { key: setup.key }) : '';
+  id('source-accept-row').style.display = setup ? '' : 'none';
+  id('source-accept').textContent = t('source_accept');
+  id('source-proposal').style.display = 'none';
+  id('source-primary').textContent = t('source_review');
+  sourceDialogError();
+  id('source-overlay').classList.add('show');
+  id('source-popup').classList.add('show');
+  setTimeout(() => id(setup ? 'source-key' : 'source-location').focus(), 50);
+}
+
+function hideSourceDialog() {
+  if (_sourceBusy) return;
+  id('source-overlay').classList.remove('show');
+  id('source-popup').classList.remove('show');
+  _sourceProposal = null;
+}
+
+function acceptSourceAsIs() {
+  if (_sourceBusy || !_sourceData?.setup || id('source-location').value.trim() !== _sourceData.setup.source) return;
+  if (!_sourceAcceptArmed) {
+    _sourceAcceptArmed = true;
+    id('source-accept').textContent = t('source_accept_confirm');
+    return;
+  }
+  _sourceHow = 'accepted';
+  id('source-key').value = _sourceData.setup.key;
+  sourceInputChanged();
+  _sourceHow = 'accepted';
+  submitSource();
+}
+
+function showStopSource() {
+  if (_sourceBusy) return;
+  _sourceMode = 'stop';
+  id('source-title').textContent = t('source_stop');
+  id('source-location-label').style.display = 'none';
+  id('source-key-label').style.display = 'none';
+  id('source-setup').style.display = '';
+  id('source-setup').textContent = t('source_stop_confirm');
+  id('source-proposal').style.display = 'none';
+  id('source-accept-row').style.display = 'none';
+  id('source-primary').textContent = t('source_stop');
+  sourceDialogError();
+  id('source-overlay').classList.add('show');
+  id('source-popup').classList.add('show');
+}
+
+async function submitSource() {
+  if (_sourceBusy) return;
+  _sourceBusy = true;
+  id('source-primary').disabled = true;
+  try {
+    if (_sourceMode === 'stop') {
+      await apiJSON('DELETE', '/api/provider/source');
+      _sourceBusy = false;
+      hideSourceDialog();
+      await loadSourceStatus();
+      await loadProvider();
+      return;
+    }
+    const source = id('source-location').value.trim();
+    const key = id('source-key').value.trim();
+    if (_sourceData?.setup && source === _sourceData.setup.source && key.toLowerCase() !== _sourceData.setup.key.toLowerCase()) throw new Error(t('source_key_mismatch'));
+    if (!/^[0-9a-fA-F]{64}$/.test(key)) throw new Error(t('source_key_invalid'));
+    const body = { source, key, how: _sourceHow, confirmed: true, yes: !!_sourceProposal };
+    if (_sourceProposal) body.proposal_token = _sourceProposal.proposal_token;
+    const result = await apiJSON('POST', '/api/provider/source', body);
+    if (!body.yes) {
+      _sourceProposal = result;
+      const p = result.proposal;
+      id('source-proposal').textContent = t('source_proposal', { provider: p.provider, channel: p.channel, version: p.version, sequence: p.sequence });
+      id('source-proposal').style.display = '';
+      id('source-primary').textContent = t('source_confirm');
+    } else {
+      _sourceBusy = false;
+      hideSourceDialog();
+      await loadSourceStatus();
+      await loadProvider();
+    }
+  } catch (e) {
+    if (e.status === 409 && _sourceProposal) {
+      _sourceProposal = null;
+      id('source-proposal').style.display = 'none';
+      id('source-primary').textContent = t('source_review');
+    }
+    sourceDialogError(e.message);
+  }
+  finally { _sourceBusy = false; id('source-primary').disabled = false; }
+}
+
+async function checkSource() {
+  if (_sourceBusy) return;
+  _sourceBusy = true;
+  id('set-source-check').disabled = true;
+  id('set-source-error').textContent = '';
+  try { await apiJSON('POST', '/api/provider/source/check', {}); }
+  catch (e) { id('set-source-error').textContent = e.message; }
+  finally { await loadSourceStatus().catch(() => {}); _sourceBusy = false; id('set-source-check').disabled = false; }
+}
+
+async function installSource() {
+  if (_sourceBusy || !_sourceData?.available) return;
+  _sourceBusy = true;
+  id('set-source-install').disabled = true;
+  id('set-source-error').textContent = '';
+  try {
+    const result = await apiJSON('POST', '/api/provider/source/install', { yes: true });
+    if (result.restart) id('provider-restart-prompt').style.display = 'flex';
+    await loadSourceStatus();
+    await loadProvider();
+  } catch (e) { id('set-source-error').textContent = e.message; }
+  finally { _sourceBusy = false; id('set-source-install').disabled = false; }
 }
 
 let _approvalCandidate = null;
