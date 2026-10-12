@@ -385,13 +385,13 @@ test "version comparison ignores malformed and prerelease tags" {
 
 test "release selects exact asset and rejects missing asset" {
     const a = std.testing.allocator;
-    const json = "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip.extra\",\"size\":1,\"browser_download_url\":\"https://example.test/wrong\"},{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/right\"}]}";
+    const json = "{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v99.0.0-windows-x86_64.zip.extra\",\"size\":1,\"browser_download_url\":\"https://example.test/wrong\"},{\"name\":\"kowalski-v99.0.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/right\"}]}";
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const result = try parseRelease(arena.allocator(), json);
     try std.testing.expectEqualStrings("https://example.test/right", result.available.download_url);
     try std.testing.expect(!result.available.signed);
-    const missing = try parseRelease(arena.allocator(), "{\"tag_name\":\"v0.2.0\",\"assets\":[]}");
+    const missing = try parseRelease(arena.allocator(), "{\"tag_name\":\"v99.0.0\",\"assets\":[]}");
     try std.testing.expect(missing == .up_to_date);
 }
 
@@ -404,10 +404,10 @@ test "signed message is byte exact and signature binds ZIP and asset name" {
     const zip = "ZIP bytes";
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(zip, &hash, .{});
-    const name = "kowalski-v0.2.0-windows-x86_64.zip";
+    const name = "kowalski-v99.0.0-windows-x86_64.zip";
     const message = try signedMessage(a, name, hash);
     defer a.free(message);
-    const expected = "kowalski-release-v1\nkowalski-v0.2.0-windows-x86_64.zip\n701ea42a760110f2b9933887d30ba10418fbaaa1642f2c9ab2a942d8759b8775\n";
+    const expected = "kowalski-release-v1\nkowalski-v99.0.0-windows-x86_64.zip\n701ea42a760110f2b9933887d30ba10418fbaaa1642f2c9ab2a942d8759b8775\n";
     try std.testing.expectEqualStrings(expected, message);
     const signature = try key.sign(message, null);
     const signature_text = try std.fmt.allocPrint(a, "{x}\n", .{&signature.toBytes()});
@@ -426,7 +426,7 @@ test "signed message is byte exact and signature binds ZIP and asset name" {
 test "release finds signature asset independently of ZIP order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const json = "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/zip\"},{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip.sig\",\"size\":129,\"browser_download_url\":\"https://example.test/sig\"}]}";
+    const json = "{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v99.0.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/zip\"},{\"name\":\"kowalski-v99.0.0-windows-x86_64.zip.sig\",\"size\":129,\"browser_download_url\":\"https://example.test/sig\"}]}";
     const result = try parseRelease(arena.allocator(), json);
     try std.testing.expect(result.available.signed);
     try std.testing.expectEqualStrings("https://example.test/sig", result.available.signature_url.?);
@@ -441,14 +441,14 @@ test "unsigned release returns before fetching ZIP" {
             const count: *usize = @ptrCast(@alignCast(context));
             count.* += 1;
             try std.testing.expectEqualStrings(releases_url, url);
-            return "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
+            return "{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v99.0.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
         }
     }.get };
     if (release_repo.len == 0) {
-        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, "unused.db", "0.2.0", null));
+        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, "unused.db", "99.0.0", null));
         try std.testing.expectEqual(@as(usize, 0), calls);
     } else {
-        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, "unused.db", "0.2.0", null));
+        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, "unused.db", "99.0.0", null));
         try std.testing.expectEqual(@as(usize, 1), calls);
     }
 }
@@ -479,7 +479,7 @@ test "install refuses a held update lock" {
 }
 
 test "digest mismatch rejects download" {
-    const release: Release = .{ .version = "0.2.0", .notes_url = "", .download_url = "", .size = 3, .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const release: Release = .{ .version = "99.0.0", .notes_url = "", .download_url = "", .size = 3, .digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
     try std.testing.expectError(error.UpdateDigestMismatch, validDownload("abc", release));
 }
 
@@ -554,14 +554,14 @@ test "zip extracts only exact executables and rejects traversal" {
     const zip_path = try join(a, &.{ root, "release.zip" });
     defer a.free(zip_path);
     const files = [_]ZipTestFile{
-        .{ .name = "kowalski-v0.2.0-windows-x86_64/kowalski.exe", .data = "console" },
-        .{ .name = "kowalski-v0.2.0-windows-x86_64/kowalskiw.exe", .data = "window" },
-        .{ .name = "kowalski-v0.2.0-windows-x86_64/README.md", .data = "ignored" },
+        .{ .name = "kowalski-v99.0.0-windows-x86_64/kowalski.exe", .data = "console" },
+        .{ .name = "kowalski-v99.0.0-windows-x86_64/kowalskiw.exe", .data = "window" },
+        .{ .name = "kowalski-v99.0.0-windows-x86_64/README.md", .data = "ignored" },
     };
     const zip = try testZip(a, &files);
     defer a.free(zip);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = zip_path, .data = zip });
-    try extractExecutables(a, io, zip_path, stage, "0.2.0");
+    try extractExecutables(a, io, zip_path, stage, "99.0.0");
     const console = try Io.Dir.cwd().readFileAlloc(io, try join(a, &.{ stage, "kowalski.exe" }), a, .limited(100));
     defer a.free(console);
     try std.testing.expectEqualStrings("console", console);
@@ -571,7 +571,7 @@ test "zip extracts only exact executables and rejects traversal" {
     const bad_zip = try testZip(a, &bad);
     defer a.free(bad_zip);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = zip_path, .data = bad_zip });
-    try std.testing.expectError(error.ZipBadFilename, extractExecutables(a, io, zip_path, stage, "0.2.0"));
+    try std.testing.expectError(error.ZipBadFilename, extractExecutables(a, io, zip_path, stage, "99.0.0"));
 }
 
 test "swap and rollback restore original executables" {
@@ -618,7 +618,7 @@ test "release check uses the HTTP seam without network" {
             try std.testing.expectEqualStrings(releases_url, url);
             try std.testing.expect(!redirects);
             try std.testing.expectEqual(@as(usize, 1024 * 1024), max_size);
-            return "{\"tag_name\":\"v0.2.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v0.2.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
+            return "{\"tag_name\":\"v99.0.0\",\"html_url\":\"https://example.test/notes\",\"assets\":[{\"name\":\"kowalski-v99.0.0-windows-x86_64.zip\",\"size\":2,\"browser_download_url\":\"https://example.test/download\"}]}";
         }
     }.get };
     if (release_repo.len == 0) {
