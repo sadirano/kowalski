@@ -79,7 +79,7 @@ pub fn httpGet(_: *anyopaque, a: std.mem.Allocator, io: Io, url: []const u8, red
     const storage = try a.alloc(u8, max_size);
     var body: Io.Writer = .fixed(storage);
     const agent = try std.fmt.allocPrint(a, "kowalski/{s}", .{current_version});
-    const result = try client.fetch(.{
+    const result = client.fetch(.{
         .location = .{ .url = url },
         .response_writer = &body,
         .redirect_behavior = if (redirects) .init(5) else .not_allowed,
