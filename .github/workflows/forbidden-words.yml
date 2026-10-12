@@ -1,0 +1,56 @@
+# Fails when the repository mentions a word from a private list: the files,
+# the file names, every commit message and every change in history. The list
+# lives in the FORBIDDEN_WORDS secret (one per line, whole words, any case),
+# never in the repository. Matches are reported as path:line only.
+name: forbidden-words
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan
+        env:
+          WORDS: ${{ secrets.FORBIDDEN_WORDS }}
+        run: |
+          if [ -z "$WORDS" ]; then
+            # Pull requests from forks get no secrets.
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "::notice::FORBIDDEN_WORDS is not available here; scan skipped."
+              exit 0
+            fi
+            echo "::error::the FORBIDDEN_WORDS secret is not set"
+            exit 1
+          fi
+          list=$(mktemp)
+          printf '%s\n' "$WORDS" | tr -d '\r' | grep -v '^[[:space:]]*$' > "$list"
+          failed=0
+          if git grep -I -n -i -w -F -f "$list" -- . | cut -d: -f1,2 | grep .; then
+            echo "::error::files mention a forbidden word (path:line above)"
+            failed=1
+          fi
+          if git ls-files | grep -n -i -w -F -f "$list" | cut -d: -f1 | grep .; then
+            echo "::error::a file name mentions a forbidden word (line numbers of git ls-files above)"
+            failed=1
+          fi
+          for c in $(git rev-list --all); do
+            if git log -1 --format=%B "$c" | grep -q -i -w -F -f "$list"; then
+              echo "::error::commit $c: the message mentions a forbidden word"
+              failed=1
+            fi
+            if git show --no-color --no-ext-diff --format= "$c" | grep '^+' | grep -v '^+++' | grep -q -i -w -F -f "$list"; then
+              echo "::error::commit $c: a change mentions a forbidden word"
+              failed=1
+            fi
+          done
+          exit $failed
