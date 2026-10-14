@@ -69,7 +69,11 @@ context with init's output before making operational calls.
 `link` is a URL template with a percent-encoded `{ref}` replacement;
 `paid_breaks` is an array of `{"from":"HH:MM","to":"HH:MM","minutes":N}`
 windows, where a pause counts as work up to `minutes`; `sessions: true`
-allows session posts with local start and end. `settings` has up to 16
+allows session posts with local start and end. `not_signed_in_code` is a
+nonzero integer: the `Status.code` any call returns when the session it
+needs is missing or rejected, never for a network or server failure. On it
+the dashboard opens sign-in, so a provider that checks its session in
+`quote` lets the user sign in before posting. `settings` has up to 16
 entries shaped as `{"name":"a_z0_9","label":"...","labels":{...},
 "hint":"...","hints":{...},"type":"choice"|"text",
 "choices":[{"value":"...","label":"...","labels":{...}}],

@@ -234,6 +234,7 @@
   <h3><svg class="ico" aria-hidden="true"><use href="#i-clock"/></svg><span id="horas-title" data-i18n="horas_title">Post hours</span></h3>
   <div id="horas-body"></div>
   <div class="popup-row" id="horas-actions" style="margin-top:4px;gap:8px">
+    <button class="apply-btn" id="horas-login-btn" onclick="horasSignIn()" style="flex:1;background:var(--acc);display:none" data-i18n="login_submit">Sign in</button>
     <button class="apply-btn" id="horas-submit-btn" onclick="submitHoras()" style="flex:1;background:var(--acc)" data-i18n="submit">Submit</button>
     <span class="cancel-link" onclick="hideHoras()" style="flex:0;padding:6px 10px" data-i18n="close">Close</span>
   </div>
