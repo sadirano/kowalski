@@ -89,6 +89,7 @@ pub const copied_settings = [_][]const u8{
     "ui_day_order",      "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",
     "ui_show_add_entry", "ui_chart_days",      "ui_summary_format", "ui_autofill_obs",
     "ui_links",          "ui_time_format",     "ui_chart_view",      "ui_single_keys",
+    "ui_task_order",
 };
 
 fn copySettings(from: *store_mod.Store, to: *store_mod.Store, now_ms: i64) !void {

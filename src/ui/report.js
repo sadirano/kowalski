@@ -3,6 +3,22 @@ let _blockData = [];
 const _openBlocks = new Set();
 
 // ── Report view ───────────────────────────────────────────────────────────────
+// The day's tasks in the chosen order. The API sends them by focus time.
+function orderTasks(rep) {
+  const tasks = rep.tasks.slice();
+  if (_taskOrder === 'ref') {
+    // Tasks without a ref go last, in the order they were created.
+    tasks.sort((a, b) => (a.task.ref == null) - (b.task.ref == null)
+      || (a.task.ref || '').localeCompare(b.task.ref || '', undefined, { numeric: true })
+      || a.task.id - b.task.id);
+  } else if (_taskOrder === 'added') {
+    const first = new Map();
+    for (const s of rep.intervals) first.set(s.task.id, Math.min(first.get(s.task.id) ?? Infinity, s.start_ms));
+    tasks.sort((a, b) => (first.get(a.task.id) ?? Infinity) - (first.get(b.task.id) ?? Infinity) || a.task.id - b.task.id);
+  }
+  return tasks;
+}
+
 function renderReport(rep) {
   const area = id('table-area');
   _taskData = []; // reset task registry for switch buttons
@@ -13,7 +29,7 @@ function renderReport(rep) {
     return;
   }
 
-  area.innerHTML = rep.tasks.map(entry => {
+  area.innerHTML = orderTasks(rep).map(entry => {
     const task = entry.task;
     const hopCls  = entry.hops > 0 ? 'some' : 'none';
     const hopText = entry.hops > 0 ? t('hops', { n: entry.hops }) : t('no_hops');

@@ -24,7 +24,7 @@ pub const setting_keys = [_][]const u8{
     // Dashboard preferences.
     "ui_day_order",    "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",      "ui_show_add_entry", "ui_chart_visible", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch",
     "ui_chart_days",   "ui_left_collapsed",  "ui_lang",           "ui_summary_format", "ui_autofill_obs",   "ui_links",
-    "ui_time_format",  "ui_chart_view",      "ui_chart_hidden",
+    "ui_time_format",  "ui_chart_view",      "ui_chart_hidden",   "ui_task_order",
     // Paid break windows, overriding the provider's: "08:00-12:00=15,13:00-18:00=15"; empty is none.
     "paid_breaks",
     // Windows where a screen lock pauses: "17:00-23:59"; empty is none.
@@ -1209,6 +1209,7 @@ fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
         .{ .key = "ui_summary_format", .values = &.{ "grouped", "chronological" } },
         .{ .key = "ui_time_format", .values = &.{ "system", "24", "12" } },
         .{ .key = "ui_chart_view", .values = &.{ "bars", "lanes" } },
+        .{ .key = "ui_task_order", .values = &.{ "time", "ref", "added" } },
     };
     for (choices) |c| if (std.mem.eql(u8, key, c.key)) {
         for (c.values) |allowed| if (std.mem.eql(u8, v, allowed)) return true;
@@ -2592,6 +2593,8 @@ test "settings validate preferences and paid breaks credit only the pause" {
     const a = f.arena.allocator();
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"newest\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"x\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"ref\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"id\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"[\\\"system\\\"]\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"system\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"paid_breaks\":\"08:00-12:00=15,13:00-18:00=15\"}").status);
