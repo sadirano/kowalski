@@ -140,7 +140,9 @@ function buildSlotRows(s, bi) {
   const closed = s.end_ms != null;
   const hint = closed ? escAttr(t('slot_hint')) : '';
   return bySlot.map((notes, k) => {
-    const at = first + k * SLOT_MS;
+    // A slot is a quarter hour of the clock; its label is where the
+    // interval's time in it begins, not where the quarter does.
+    const at = Math.max(first + k * SLOT_MS, s.start_ms);
     const time = fmtTime(at);
     const handle = closed
       ? ` onclick="selectSlot(event,${bi},${k})" draggable="true" ondragstart="dragSlots(event,${bi},${k})" ondragend="dragEndBlock()" title="${hint}"`
