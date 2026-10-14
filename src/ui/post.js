@@ -8,7 +8,8 @@ let _obsTok = 0;      // drops an autofill answer meant for an older popup
 let _horasGen = 0;    // a new dialog drops answers meant for the old one
 let _horasSessionsMode = false;
 
-async function showHorasDialog(date) {
+// `drafts` maps a task id to the observation and options typed before a reload.
+async function showHorasDialog(date, drafts = null) {
   _horasDate = date;
   const gen = ++_horasGen;
   id('horas-overlay').classList.add('show');
@@ -16,6 +17,7 @@ async function showHorasDialog(date) {
   id('horas-title').textContent = `${t('horas_title')} — ${fmtDate(date)}`;
   id('horas-body').innerHTML = `<div class="horas-empty">${t('checking')}</div>`;
   setHorasActions(false);
+  setHorasSignIn(false);
   if (!provider) {
     id('horas-body').innerHTML = `<div class="horas-empty">${t('no_provider')}</div>`;
     return;
@@ -27,7 +29,10 @@ async function showHorasDialog(date) {
     // A posting still sending or unknown stays listed, whatever the tracked time.
     const pending = o => (o.postings || []).some(p => p.state === 'unknown' || p.state === 'sending');
     _horasEntries = (data.offers || []).filter(o => o.total_focus_ms > 0 || pending(o))
-      .map(offer => ({ offer, quote: null, refused: null, observation: '', options: {} }));
+      .map(offer => {
+        const draft = drafts?.get(offer.task.id);
+        return { offer, quote: null, refused: null, observation: draft?.observation || '', options: { ...draft?.options } };
+      });
     renderHorasRows();
     await quoteHoras(gen);
   } catch (err) {
@@ -43,6 +48,30 @@ function hideHoras() {
 
 function setHorasActions(on) {
   id('horas-submit-btn').style.display = on ? '' : 'none';
+}
+
+// The provider session is gone: Sign in replaces Submit until the dialog reloads.
+function setHorasSignIn(on) {
+  id('horas-login-btn').style.display = on ? '' : 'none';
+  if (on) setHorasActions(false);
+}
+
+// True when a failed call says the provider session is gone (see
+// `not_signed_in_code` in the provider contract).
+function horasNeedsSignIn(err) {
+  const code = provider?.not_signed_in_code;
+  return Number.isInteger(code) && code > 0 && err?.data?.error === 'ProviderFailed' && err.data.code === code;
+}
+
+// Signs in over the dialog, then reloads it with what was typed. Does
+// nothing more if the dialog was closed or replaced meanwhile.
+async function horasSignIn() {
+  const gen = _horasGen;
+  const date = _horasDate;
+  const drafts = new Map(_horasEntries.map(e => [e.offer.task.id, { observation: e.observation, options: { ...e.options } }]));
+  const signedIn = await showLogin();
+  if (!signedIn || gen !== _horasGen || !id('horas-popup').classList.contains('show')) return;
+  await showHorasDialog(date, drafts);
 }
 
 function horasResolveButtons(postingId) {
@@ -107,11 +136,20 @@ async function quoteHoras(gen = _horasGen) {
   for (let i = 0; i < _horasEntries.length; i++) {
     if (!_horasEntries[i].offer.postable) continue;
     if (!await quoteRow(i, gen)) return;
+    // Signed out: the rows left say so without asking the provider again.
+    if (_horasEntries[i].signIn) {
+      for (let j = i + 1; j < _horasEntries.length; j++) {
+        if (_horasEntries[j].offer.postable && !_horasEntries[j].quote) refuseHorasRow(j, _horasEntries[i].refused);
+      }
+      horasSignIn();
+      return;
+    }
   }
   if (gen === _horasGen) id('horas-submit-btn').disabled = false;
 }
 
-// Quotes one row; false once the dialog moved on.
+// Quotes one row; false once the dialog moved on. A row that failed because
+// the provider session is gone is marked `signIn` and turns on Sign in.
 async function quoteRow(i, gen) {
   if (gen !== _horasGen) return false;
   const e = _horasEntries[i];
@@ -123,20 +161,34 @@ async function quoteRow(i, gen) {
     if (gen !== _horasGen) return false;
     e.quote = quote;
     e.refused = null;
+    e.signIn = false;
     if (chk) { chk.disabled = false; chk.checked = true; }
     id(`hr-${i}`)?.querySelectorAll('.hr-int input').forEach(x => { x.disabled = false; });
   } catch (err) {
     if (gen !== _horasGen) return false;
-    e.quote = null;
-    e.refused = err.message;
-    if (chk) { chk.checked = false; chk.disabled = true; }
-    id(`hr-${i}`)?.querySelectorAll('.hr-int input').forEach(x => { x.disabled = true; });
+    e.signIn = horasNeedsSignIn(err);
+    if (e.signIn) setHorasSignIn(true);
+    refuseHorasRow(i, err.message);
+    return true;
   }
   const amt = id(`hr-amt-${i}`);
   const st = id(`hr-st-${i}`);
   if (amt) amt.textContent = e.quote ? e.quote.amount_text : '';
   if (st) st.innerHTML = horasStatus(e) + horasPostedLine(e);
   return true;
+}
+
+function refuseHorasRow(i, message) {
+  const e = _horasEntries[i];
+  e.quote = null;
+  e.refused = message;
+  const chk = id(`hr-chk-${i}`);
+  if (chk) { chk.checked = false; chk.disabled = true; }
+  id(`hr-${i}`)?.querySelectorAll('.hr-int input').forEach(x => { x.disabled = true; });
+  const amt = id(`hr-amt-${i}`);
+  const st = id(`hr-st-${i}`);
+  if (amt) amt.textContent = '';
+  if (st) st.innerHTML = horasStatus(e) + horasPostedLine(e);
 }
 
 function selectedHoras() {
@@ -218,6 +270,7 @@ async function runHoras() {
   id('horas-submit-btn').disabled = true;
   let posted = false;
   let failure = null;
+  let signedOut = false;
   const requote = [];
   for (const s of sel) {
     const st = live() ? id(`hr-st-${s.i}`) : null;
@@ -236,26 +289,39 @@ async function runHoras() {
       id(`hr-${s.i}`)?.querySelectorAll('.hr-int input').forEach(x => { x.disabled = true; });
     } catch (err) {
       const unknown = err.data && err.data.posting && err.data.posting.state === 'unknown' ? err.data.posting : null;
+      // Signed out before Save: the rows left would fail the same way.
+      signedOut = !unknown && horasNeedsSignIn(err);
       if (unknown) entries[s.i].offer.postings.push(unknown);
+      else if (signedOut) failure = err.message;
       else {
         // The quote shown may be stale: it is fetched again before another try.
         entries[s.i].quote = null;
         failure = err.message;
         requote.push(s.i);
       }
-      if (!live()) continue;
+      if (!live()) { if (signedOut) break; continue; }
       if (st) st.innerHTML = unknown
         ? `<span class="hr-err">${t('st_unknown')}</span> ${horasResolveButtons(unknown.id)}`
         : `<span class="hr-err">${esc(err.message)}</span>`;
       const chk = id(`hr-chk-${s.i}`); if (chk) { chk.checked = false; chk.disabled = true; }
+      if (signedOut) break;
     }
   }
-  if (live()) {
-    for (const i of requote) await quoteRow(i, gen);
-    if (live()) id('horas-submit-btn').disabled = false;
+  if (live() && !signedOut) {
+    for (const i of requote) {
+      if (!await quoteRow(i, gen)) break;
+      if (entries[i].signIn) { signedOut = true; break; }
+    }
+    if (live() && !signedOut) id('horas-submit-btn').disabled = false;
   }
   showToast(failure || t('post_done'));
   if (posted) loadDay(selectedDate, { chart: true });
+  // Nothing posts again on its own: after sign-in the dialog reloads with
+  // what was posted, and Submit sends the rest.
+  if (signedOut && live()) {
+    setHorasSignIn(true);
+    await horasSignIn();
+  }
 }
 
 async function resolveHoras(postingId, posted) {

@@ -102,13 +102,14 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter'  && id('settings-popup').classList.contains('show') && e.target.tagName !== 'BUTTON') applySettings();
   // Notes opens over Post hours: Escape closes Notes alone.
   if (e.key === 'Escape' && id('obs-popup').classList.contains('show')) { closeObsPopup(); return; }
+  // Sign-in can open over Post hours too: Escape closes sign-in alone.
+  if (e.key === 'Escape' && id('login-popup').classList.contains('show')) { hideLogin(); return; }
   if (e.key === 'Escape' && id('horas-popup').classList.contains('show')) hideHoras();
   if (e.key === 'Escape' && id('edit-popup').classList.contains('show')) closeEditTime();
   if (e.key === 'Enter'  && id('edit-popup').classList.contains('show')) { e.preventDefault(); applyEditTime(); }
   if (e.key === 'Escape' && id('addentry-popup').classList.contains('show')) hideAddEntry();
   if (e.key === 'Enter'  && id('addentry-popup').classList.contains('show')) applyAddEntry();
   if (e.key === 'Escape' && id('keys-popup').classList.contains('show')) hideKeys();
-  if (e.key === 'Escape' && id('login-popup').classList.contains('show')) hideLogin();
 
   // ── Single-key shortcuts ────────────────────────────────────────────────────
   // Bare keys, so they have to stay out of the way of typing, of a modal that is

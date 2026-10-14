@@ -207,6 +207,8 @@ pub const Fake = struct {
     pub var post_output: ?[]const u8 = null;
     /// Next post fails with this code and outcome (0 = succeed).
     pub var post_code: u32 = 0;
+    /// Every quote fails with this code (0 = quote normally).
+    pub var quote_code: u32 = 0;
     pub var post_known: u8 = 1;
     pub var fail_on_call: u32 = 0;
     pub var post_calls: u32 = 0;
@@ -240,6 +242,11 @@ pub const Fake = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
+        if (quote_code != 0) {
+            var message: contract.Bytes = .{};
+            give("not signed in", &message);
+            return .{ .code = quote_code, .retry_safe = 1, .outcome_known = 1, .message = message };
+        }
         const Input = struct { day_over: bool, total_focus_ms: i64, posted: []struct { amount_micro: i64 } };
         const input = std.json.parseFromSliceLeaky(Input, a, request.slice(), .{ .ignore_unknown_fields = true }) catch return .{ .code = 1 };
         if (fake_policy_past_only and !input.day_over) {

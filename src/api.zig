@@ -293,7 +293,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return bindTask(app, a, id, req.body);
     }
     if (is(req, .GET, path, "/api/provider")) {
-        if (app.provider == null) return send(a, .ok, .{ .instance = null, .fields = [0]std.json.Value{}, .settings = [0]std.json.Value{}, .post_options = [0]std.json.Value{}, .sessions = false, .status = app.provider_status });
+        if (app.provider == null) return send(a, .ok, .{ .instance = null, .fields = [0]std.json.Value{}, .settings = [0]std.json.Value{}, .post_options = [0]std.json.Value{}, .sessions = false, .not_signed_in_code = null, .status = app.provider_status });
         return .{ .status = .ok, .body = "", .followup = .fields };
     }
     if (is(req, .GET, path, "/api/postings")) return offers(app, a, try param(a, params, "date"));
@@ -660,6 +660,8 @@ pub const Traits = struct {
     settings: []const ProviderSetting = &.{},
     /// Chosen per post in the Post dialog (or `post -o`) and sent with it.
     post_options: []const PostOption = &.{},
+    /// The `Status.code` meaning "sign in again": the dashboard opens sign-in on it.
+    not_signed_in_code: ?u32 = null,
 };
 
 pub const SettingChoice = struct { value: []const u8, label: []const u8, labels: ?std.json.Value = null };
@@ -819,6 +821,12 @@ pub fn parseTraits(a: std.mem.Allocator, json: []const u8) Traits {
     } else |_| {}
     if (std.json.parseFromSliceLeaky(struct { post_options: []const PostOption = &.{} }, a, json, .{ .ignore_unknown_fields = true })) |d| {
         traits.post_options = declaredOptions(a, d.post_options);
+    } else |_| {}
+    if (std.json.parseFromSliceLeaky(struct { not_signed_in_code: ?std.json.Value = null }, a, json, .{ .ignore_unknown_fields = true })) |d| {
+        // Code 0 is success, so it never means "not signed in".
+        if (d.not_signed_in_code) |v| if (v == .integer and v.integer > 0 and v.integer <= std.math.maxInt(u32)) {
+            traits.not_signed_in_code = @intCast(v.integer);
+        };
     } else |_| {}
     return traits;
 }
@@ -1518,7 +1526,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
         .fields => {
             if (!succeeded(outcome)) return providerFailure(a, outcome, null);
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, outcome.done.out, .{}) catch return error.ProviderOutput;
-            return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions, .status = app.provider_status });
+            return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions, .not_signed_in_code = app.traits.not_signed_in_code, .status = app.provider_status });
         },
         .lookup => |l| {
             if (!succeeded(outcome)) {
@@ -2164,6 +2172,38 @@ test "provider policy can refuse a quote" {
     try std.testing.expectEqual(std.http.Status.conflict, r.status);
     try std.testing.expect(contains(r.body, "PostingRefused"));
     try std.testing.expect(contains(r.body, "day not over"));
+}
+
+test "a quote failing with the not-signed-in code carries it, and the trait reaches the provider fields" {
+    var f: Fixture = .{};
+    try postingFixture(&f);
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}");
+    try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"not_signed_in_code\":null"));
+    f.app.traits = parseTraits(f.arena.allocator(), "{\"not_signed_in_code\":7}");
+    try std.testing.expect(contains(f.call(.GET, "/api/provider", "").body, "\"not_signed_in_code\":7"));
+    worker.Fake.quote_code = 7;
+    defer worker.Fake.quote_code = 0;
+    const before = worker.Fake.posted.load(.acquire);
+    const r = f.call(.POST, "/api/postings", "{\"task\":\"T-1\",\"date\":\"2026-03-10\",\"dry_run\":true}");
+    try std.testing.expectEqual(std.http.Status.bad_gateway, r.status);
+    try std.testing.expect(contains(r.body, "\"error\":\"ProviderFailed\",\"code\":7"));
+    try std.testing.expectEqual(before, worker.Fake.posted.load(.acquire));
+}
+
+test "a malformed not-signed-in code is dropped" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const b = arena.allocator();
+    try std.testing.expectEqual(@as(?u32, 1), parseTraits(b, "{\"not_signed_in_code\":1}").not_signed_in_code);
+    try std.testing.expectEqual(@as(?u32, null), parseTraits(b, "{}").not_signed_in_code);
+    for ([_][]const u8{ "\"1\"", "1.5", "0", "-1", "4294967296", "null", "true" }) |bad| {
+        const json = try std.mem.concat(b, u8, &.{ "{\"sessions\":true,\"not_signed_in_code\":", bad, "}" });
+        const traits = parseTraits(b, json);
+        try std.testing.expectEqual(@as(?u32, null), traits.not_signed_in_code);
+        try std.testing.expect(traits.sessions);
+    }
 }
 
 test "a changed ledger makes an earlier quote stale" {
