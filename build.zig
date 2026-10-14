@@ -2,7 +2,10 @@ const std = @import("std");
 const update_options = @import("tools/update_options.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to a baseline CPU, not the build machine's: a native release
+    // build can emit instructions other machines lack and crash there.
+    // Pass -Dcpu=native for a local-only build.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const update_repo = b.option([]const u8, "update-repo", "GitHub owner/name for signed updates; empty disables updates") orelse update_options.default_repo;
     const update_key = b.option([]const u8, "update-key", "Ed25519 release public key as 64 lowercase hex characters") orelse update_options.default_key;
