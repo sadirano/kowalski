@@ -1,6 +1,6 @@
 .{
     .name = .kowalski,
-    .version = "0.2.1",
+    .version = "0.2.2",
     .fingerprint = 0xb208c92e72aa9f45,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
