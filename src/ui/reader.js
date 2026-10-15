@@ -224,6 +224,15 @@ function markMoment(rep, t0, scroll = true) {
   if (scroll) hit.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
 
+// From a report card: the Timeline tab, opened on that task.
+function openInTimeline(taskId) {
+  _readerTask = taskId;
+  _readerPin = null;
+  setTab('timeline');
+  const page = id('table-area')?.closest('section');
+  if (page) page.scrollTop = 0;
+}
+
 function readerPick(taskId, t0 = null) {
   _readerTask = taskId;
   _readerPin = t0;
