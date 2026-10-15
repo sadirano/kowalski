@@ -23,6 +23,9 @@ async function loadSettings() {
 }
 
 let _settingsLoaded = false;
+let _captureKeys = [];
+let _assignmentPreview = null;
+let _assignmentEpoch = 0, _assignmentBusy = false;
 // Window rows being edited; switching a mode off keeps them for this visit.
 let _paidDraft = [];
 let _lockDraft = [];
@@ -66,6 +69,7 @@ async function showSettings() {
     id('set-autofill').checked = pref('ui_autofill_obs', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
     renderProviderControls();
+    await loadProjectSettings();
     loadSourceStatus().catch(e => { id('set-source-error').textContent = e.message; });
     id('set-zone').value = pref('reporting_zone', '');
     id('set-port').textContent = pref('http_port', location.port || '47100');
@@ -100,6 +104,140 @@ function renderProviderControls() {
   const hiddenTabs = chartHiddenGroups();
   id('set-chart-tabs-row').style.display = fields.length ? '' : 'none';
   id('set-chart-tabs').innerHTML = fields.map(f => `<label class="set-sw"><input type="checkbox" class="sw" data-group="${escAttr(f.name)}"${hiddenTabs.includes(f.name) ? '' : ' checked'}><span>${esc(providerLabel(f))}</span></label>`).join('');
+  const projectField = id('set-project-field');
+  projectField.innerHTML = `<option value="">${esc(t('project_off'))}</option>` + fields.map(f =>
+    `<option value="${escAttr(f.name)}">${esc(providerLabel(f))}</option>`).join('');
+  projectField.value = pref('project_provider_field', '');
+}
+
+async function loadProjectSettings() {
+  const [, keys] = await Promise.all([loadProjects(), apiJSON('GET', '/api/project-keys')]);
+  _captureKeys = keys.keys;
+  renderProjectSettings();
+}
+
+function renderProjectSettings() {
+  id('set-project-list').innerHTML = projects.map(p => `<div class="project-settings-item">
+    <input id="set-project-name-${p.id}" value="${escAttr(p.label)}" maxlength="200" aria-label="${escAttr(t('project_name'))}">
+    <button type="button" class="set-btn" onclick="renameProject(${p.id})">${esc(t('project_rename'))}</button>
+    <button type="button" class="set-btn" onclick="toggleProjectArchive(${p.id},${!p.archived})">${esc(t(p.archived ? 'project_restore' : 'project_archive'))}</button>
+    ${p.archived ? `<small>${esc(t('project_archived'))}</small>` : ''}</div>`).join('');
+  id('set-project-keys').innerHTML = _captureKeys.map((k, i) => `<div class="project-settings-item">
+    <span>${esc(k.source)} · ${esc(k.project_hint)} <small>(${esc(k.project_key)})</small></span>
+    <select aria-label="${escAttr(t('project_capture_source'))}" onchange="changeCaptureKey(${i},this.value)">${projects.map(p =>
+      `<option value="${p.id}"${p.id === k.project_id ? ' selected' : ''}>${esc(p.label)}${p.archived ? ' (' + esc(t('project_archived')) + ')' : ''}</option>`).join('')}</select></div>`).join('') || `<div class="project-message">${esc(t('project_no_keys'))}</div>`;
+  const target = id('set-assign-target');
+  const value = target.value;
+  target.innerHTML = projectOptions(value);
+  if ([...target.options].some(o => o.value === value)) target.value = value;
+  _assignmentPreview = null;
+  id('set-assign-apply').disabled = true;
+  id('set-assign-result').innerHTML = '';
+  invalidateAssignmentPreview();
+}
+
+function invalidateAssignmentPreview() {
+  ++_assignmentEpoch;
+  _assignmentPreview = null;
+  id('set-assign-apply').disabled = true;
+  id('set-assign-result').innerHTML = '';
+  id('set-assign-task').style.display = id('set-assign-scope').value === 'task' ? '' : 'none';
+  id('set-assign-intervals').style.display = id('set-assign-scope').value === 'intervals' ? '' : 'none';
+}
+
+async function addProject() {
+  const field = id('set-project-new');
+  const label = field.value.trim();
+  if (!label) { field.focus(); return; }
+  try {
+    await apiJSON('POST', '/api/projects', { label });
+    field.value = '';
+    await _projectsLoading?.catch(() => {});
+    await loadProjects();
+    renderProjectSettings();
+  } catch (e) { showError(e.message); }
+}
+
+async function renameProject(projectId) {
+  const field = id('set-project-name-' + projectId);
+  const label = field.value.trim();
+  if (!label) { field.focus(); return; }
+  try {
+    await apiJSON('PATCH', '/api/projects/' + projectId, { label });
+    await _projectsLoading?.catch(() => {});
+    await loadProjects();
+    renderProjectSettings();
+    loadDay(selectedDate, { chart: true });
+  } catch (e) { showError(e.message); }
+}
+
+async function toggleProjectArchive(projectId, archived) {
+  try {
+    await apiJSON('PATCH', '/api/projects/' + projectId, { archived });
+    await _projectsLoading?.catch(() => {});
+    await loadProjects();
+    renderProjectSettings();
+    loadDay(selectedDate, { chart: true });
+  } catch (e) { showError(e.message); }
+}
+
+async function changeCaptureKey(index, value) {
+  const k = _captureKeys[index];
+  try {
+    await apiJSON('PATCH', '/api/project-keys', { source: k.source, project_key: k.project_key, project_id: Number(value) });
+    _captureKeys = (await apiJSON('GET', '/api/project-keys')).keys;
+    renderProjectSettings();
+  } catch (e) { showError(e.message); renderProjectSettings(); }
+}
+
+async function previewProjectAssignment() {
+  if (_assignmentBusy) return;
+  const mode = id('set-assign-scope').value;
+  const scope = mode === 'suggestions' ? { unassigned_suggestions: true }
+    : mode === 'intervals' ? { interval_ids: id('set-assign-intervals').value.split(',').map(x => Number(x.trim())) }
+    : { task_id: Number(id('set-assign-task').value) };
+  if (scope.task_id != null && (!Number.isInteger(scope.task_id) || scope.task_id < 1)) {
+    id('set-assign-task').focus(); return;
+  }
+  if (scope.interval_ids && (!scope.interval_ids.length || scope.interval_ids.some(x => !Number.isSafeInteger(x) || x < 1))) {
+    id('set-assign-intervals').focus(); return;
+  }
+  const value = id('set-assign-target').value;
+  const project_id = value === 'unassigned' ? null : Number(value);
+  invalidateAssignmentPreview();
+  const epoch = _assignmentEpoch;
+  try {
+    const preview = await apiJSON('POST', '/api/projects/assign/preview', { scope, project_id });
+    if (epoch !== _assignmentEpoch) return;
+    _assignmentPreview = preview.snapshot;
+    const rows = preview.snapshot.intervals;
+    const skipped = preview.skipped;
+    const fmtRow = r => `<tr><td>${r.id}</td><td>${r.task_id}</td><td>${esc(r.role)}</td><td>${esc(projectName(r.project_id))}</td><td>${esc(projectName(project_id))}</td><td>${r.focus_ms ? esc(fmtMs(r.focus_ms)) : '—'}</td></tr>`;
+    id('set-assign-result').innerHTML = `<div class="project-message">${esc(t('project_preview_count', { n: rows.length }))}</div>`
+      + (rows.length ? `<table class="project-table"><thead><tr><th>${esc(t('project_interval'))}</th><th>${esc(t('project_task_scope'))}</th><th>${esc(t('project_role'))}</th><th>${esc(t('project_from'))}</th><th>${esc(t('project_to'))}</th><th>${esc(t('project_focus_time'))}</th></tr></thead><tbody>${rows.map(fmtRow).join('')}</tbody></table>` : '')
+      + (skipped.length ? `<div class="project-message warn">${esc(t('project_skipped', { n: skipped.length }))}</div><table class="project-table"><tbody>${skipped.map(fmtRow).join('')}</tbody></table>` : '');
+    id('set-assign-apply').disabled = rows.length === 0;
+  } catch (e) {
+    if (epoch !== _assignmentEpoch) return;
+    id('set-assign-result').innerHTML = `<div class="project-message warn">${esc(e.message)}</div>`;
+  }
+}
+
+async function applyProjectAssignment() {
+  if (_assignmentBusy || !_assignmentPreview) return;
+  const snapshot = _assignmentPreview;
+  _assignmentBusy = true;
+  invalidateAssignmentPreview();
+  const epoch = _assignmentEpoch;
+  try {
+    const result = await apiJSON('POST', '/api/projects/assign/apply', { snapshot });
+    if (epoch === _assignmentEpoch) id('set-assign-result').innerHTML = `<div class="project-message">${esc(t('project_applied', { n: result.changed }))}</div>`;
+    loadDay(selectedDate, { chart: true });
+  } catch (e) {
+    if (epoch === _assignmentEpoch) id('set-assign-result').innerHTML = `<div class="project-message warn">${esc(e.status === 409 ? t('project_stale') : e.message)}</div>`;
+  } finally {
+    _assignmentBusy = false;
+  }
 }
 
 function renderProviderStatus() {
@@ -637,6 +775,7 @@ async function applySettings() {
     ui_open_on_launch: id('set-open-launch').checked ? '1' : '0',
     ui_autofill_obs: id('set-autofill').checked ? '1' : '0',
     post_sessions: id('set-post-sessions').checked ? '1' : '0',
+    project_provider_field: id('set-project-field').value || null,
     // An emptied text goes back to the provider's default.
     ...Object.fromEntries([...document.querySelectorAll('#set-provider-rows [data-key]')]
       .map(el => [el.dataset.key, el.value.trim() || null])),

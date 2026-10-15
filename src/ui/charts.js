@@ -8,14 +8,14 @@ const CHART_PALETTE = [
 ];
 
 // A series keeps its colour across ranges and tabs: the colour comes from its
-// label, moving to the next free one when two series collide, until every
+// identity, moving to the next free one when two series collide, until every
 // colour is taken once.
-function chartColors(labels) {
+function chartColors(keys) {
   const used = new Set();
-  return labels.map(label => {
+  return keys.map(key => {
     if (used.size === CHART_PALETTE.length) used.clear();
     let h = 0;
-    for (const ch of label) h = (h * 31 + ch.codePointAt(0)) | 0;
+    for (const ch of key) h = (h * 31 + ch.codePointAt(0)) | 0;
     let k = Math.abs(h) % CHART_PALETTE.length;
     for (let n = 0; n < CHART_PALETTE.length && used.has(k); n++) k = (k + 1) % CHART_PALETTE.length;
     used.add(k);
@@ -40,14 +40,17 @@ const targetLinePlugin = {
 
 // Every series with time in the range, biggest first, each with its colour.
 function rankSeries(series) {
-  const ranked = series.map(s => ({ ...s, total: s.ms.reduce((a, b) => a + b, 0) }))
+  const ranked = series.map(s => ({ ...s,
+    key: chartGroupBy === '@project' ? s.project_id == null ? 'unassigned' : 'project:' + s.project_id : s.label,
+    label: chartGroupBy === '@project' ? projectName(s.project_id) : s.label,
+    total: s.ms.reduce((a, b) => a + b, 0) }))
     .filter(s => s.total > 0).sort((a, b) => b.total - a.total);
-  const colors = chartColors(ranked.map(s => s.label));
+  const colors = chartColors(ranked.map(s => s.key));
   ranked.forEach((s, i) => { s.color = colors[i]; });
   return ranked;
 }
 
-// Series hidden from the chart by a click in the list, by label; kept while
+// Series hidden from the chart by a click in the list, by identity; kept while
 // the range changes and cleared when the grouping does.
 const _chartHidden = new Set();
 let _chartRanked = [];
@@ -85,10 +88,11 @@ function renderBars() {
   // column is rounded.
   const datasets = _chartRanked.map(s => ({
     label: s.label,
+    key: s.key,
     data: s.ms.map(ms => ms / 3600000),
     ms: s.ms,
     color: s.color,
-    hidden: _chartHidden.has(s.label),
+    hidden: _chartHidden.has(s.key),
     backgroundColor: chartShades(s.color, dates.length, sel, true),
     borderRadius: c => topSegment(c) ? { topLeft: 3, topRight: 3 } : 0,
     borderSkipped: false,
@@ -133,7 +137,7 @@ function renderBars() {
 // a click on a cell opens that day.
 function renderLanes() {
   const dates = _chartDates;
-  const rows = _chartRanked.filter(s => !_chartHidden.has(s.label));
+  const rows = _chartRanked.filter(s => !_chartHidden.has(s.key));
   const max = Math.max(1, ...rows.flatMap(s => s.ms));
   const step = Math.max(1, Math.round(dates.length / 10));
   const cols = `minmax(120px,220px) repeat(${dates.length},minmax(3px,1fr)) auto`;
@@ -155,10 +159,10 @@ function chartShades(color, n, sel, lit) {
 }
 
 // Pointing at a list row keeps that series bright and fades the rest.
-function focusChartSeries(label) {
+function focusChartSeries(key) {
   if (!chartInst) return;
   chartInst.data.datasets.forEach(d => {
-    const lit = label == null || d.label === label;
+    const lit = key == null || d.key === key;
     d.backgroundColor = chartShades(d.color, d.data.length, chartInst.$sel, lit);
   });
   chartInst.update('none');
@@ -180,10 +184,10 @@ function renderChartList() {
   const grand = _chartRanked.reduce((n, s) => n + s.total, 0);
   const top = _chartRanked[0]?.total || 1;
   box.innerHTML = _chartRanked.map((s, i) => {
-    const off = _chartHidden.has(s.label);
+    const off = _chartHidden.has(s.key);
     return `<button type="button" class="rank-row${off ? ' off' : ''}" title="${escAttr(s.label)}"`
-      + ` onclick="toggleChartSeries(${i})" onmouseenter="focusChartSeries(_chartRanked[${i}].label)" onmouseleave="focusChartSeries(null)"`
-      + ` onfocus="focusChartSeries(_chartRanked[${i}].label)" onblur="focusChartSeries(null)" aria-pressed="${!off}">`
+      + ` onclick="toggleChartSeries(${i})" onmouseenter="focusChartSeries(_chartRanked[${i}].key)" onmouseleave="focusChartSeries(null)"`
+      + ` onfocus="focusChartSeries(_chartRanked[${i}].key)" onblur="focusChartSeries(null)" aria-pressed="${!off}">`
       + `<span>${esc(s.label)}</span><b>${esc(fmtMs(s.total))} · ${Math.round(100 * s.total / grand)}%</b>`
       + `<em><i style="width:${(100 * s.total / top).toFixed(1)}%;background:${s.color}"></i></em></button>`;
   }).join('');
@@ -192,11 +196,11 @@ function renderChartList() {
 function toggleChartSeries(i) {
   const s = _chartRanked[i];
   if (!s) return;
-  if (_chartHidden.has(s.label)) _chartHidden.delete(s.label); else _chartHidden.add(s.label);
+  if (_chartHidden.has(s.key)) _chartHidden.delete(s.key); else _chartHidden.add(s.key);
   renderChartList();
   if (chartView === 'lanes') { renderLanes(); return; }
   if (!chartInst) return;
-  chartInst.setDatasetVisibility(i, !_chartHidden.has(s.label));
+  chartInst.setDatasetVisibility(i, !_chartHidden.has(s.key));
   chartInst.update();
 }
 
@@ -214,10 +218,13 @@ function chartHiddenGroups() {
 
 function renderChartGroups() {
   const hidden = chartHiddenGroups();
-  const groups = [{ name: 'task', label: t('g_task') },
+  // A provider field labelled like a core grouping says whose it is.
+  const core = [t('g_task'), t('project')];
+  const groups = [{ name: 'task', label: t('g_task') }, { name: '@project', label: t('project') },
     ...(provider?.fields || []).filter(field => !hidden.includes(field.name))
       .slice().sort((a, b) => a.order - b.order)
-      .map(field => ({ name: field.name, label: providerLabel(field) }))];
+      .map(field => ({ name: field.name, label: providerLabel(field)
+        + (core.includes(providerLabel(field)) ? ' (' + provider.instance + ')' : '') }))];
   if (!groups.some(group => group.name === chartGroupBy)) { chartGroupBy = 'task'; _chartHidden.clear(); }
   // Task alone needs no tabs.
   id('chart-groups').style.display = groups.length > 1 ? '' : 'none';

@@ -68,10 +68,19 @@ async function deleteBlock(i) {
 
 // The block as it was when the popup opened: a reload may reorder _blockData.
 let _editBlock = null;
+let _editProjectSnapshot = null;
+let _editProjectEpoch = 0, _editProjectBusy = false;
 
 function openEditTime(i) {
+  ++_editProjectEpoch;
   const s = _blockData[i];
-  _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms };
+  _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, project_id: s.project_id };
+  _editProjectSnapshot = null;
+  id('edit-project-current').textContent = projectName(s.project_id);
+  id('edit-project-target').innerHTML = projectOptions(s.project_id ?? 'unassigned');
+  id('edit-project-target').value = s.project_id == null ? 'unassigned' : String(s.project_id);
+  id('edit-project-result').innerHTML = '';
+  id('edit-project-apply').disabled = true;
   id('edit-start').value = fmtClock(hhmm24(s.start_ms));
   id('edit-end').value = s.end_ms == null ? '' : fmtClock(hhmm24(s.end_ms));
   for (const el of [id('edit-start'), id('edit-end')]) el.classList.remove('bad');
@@ -81,9 +90,70 @@ function openEditTime(i) {
 }
 
 function closeEditTime() {
+  ++_editProjectEpoch;
   id('edit-overlay').classList.remove('show');
   id('edit-popup').classList.remove('show');
   _editBlock = null;
+  _editProjectSnapshot = null;
+}
+
+function clearEditProjectPreview() {
+  ++_editProjectEpoch;
+  _editProjectSnapshot = null;
+  id('edit-project-result').innerHTML = '';
+  id('edit-project-apply').disabled = true;
+}
+
+async function previewEditProject() {
+  if (!_editBlock || _editProjectBusy) return;
+  const s = _editBlock;
+  const value = id('edit-project-target').value;
+  const project_id = value === 'unassigned' ? null : Number(value);
+  clearEditProjectPreview();
+  const epoch = _editProjectEpoch;
+  if (project_id === s.project_id) {
+    id('edit-project-result').textContent = t('project_same');
+    return;
+  }
+  try {
+    const result = await apiJSON('POST', '/api/projects/assign/preview', { scope: { interval_ids: [s.id] }, project_id });
+    if (_editBlock !== s || epoch !== _editProjectEpoch || id('edit-project-target').value !== value) return;
+    if (result.skipped.length) {
+      id('edit-project-result').textContent = t('project_skipped', { n: result.skipped.length });
+      return;
+    }
+    if (result.snapshot.intervals.length !== 1) {
+      id('edit-project-result').textContent = t('project_same');
+      return;
+    }
+    _editProjectSnapshot = result.snapshot;
+    id('edit-project-result').textContent = t('project_edit_preview', { from: projectName(s.project_id), to: projectName(project_id) });
+    id('edit-project-apply').disabled = false;
+  } catch (e) {
+    if (_editBlock !== s || epoch !== _editProjectEpoch) return;
+    id('edit-project-result').textContent = e.message;
+  }
+}
+
+async function applyEditProject() {
+  if (!_editBlock || !_editProjectSnapshot || _editProjectBusy) return;
+  const s = _editBlock;
+  const snapshot = _editProjectSnapshot;
+  clearEditProjectPreview();
+  _editProjectBusy = true;
+  const epoch = _editProjectEpoch;
+  try {
+    await apiJSON('PATCH', '/api/intervals/' + s.id, { seen: seenOf(s), start_ms: s.start_ms,
+      end_ms: s.end_ms, project_id: snapshot.project_id, snapshot });
+    if (_editBlock === s) closeEditTime();
+    showToast(t('project_applied', { n: 1 }));
+    loadDay(selectedDate, { chart: true });
+  } catch (e) {
+    if (_editBlock !== s || epoch !== _editProjectEpoch) return;
+    id('edit-project-result').textContent = e.status === 409 ? t('project_stale') : e.message;
+  } finally {
+    _editProjectBusy = false;
+  }
 }
 
 async function applyEditTime() {

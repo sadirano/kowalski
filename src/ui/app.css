@@ -113,6 +113,17 @@
   .set-save{background:var(--hover);border:1px solid #4f8ef780;color:var(--txt)}
   .set-save:hover{background:#4f8ef726}
   .set-popup button:focus-visible,.set-adv>summary:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+  .project-settings-list{display:flex;flex-direction:column;gap:6px;margin:6px 8px}
+  .project-inline{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:8px}
+  .project-inline input,.project-inline select,.project-settings-list input,.project-settings-list select,#nt-project{background:var(--bg);border:1px solid var(--brd);color:var(--txt);border-radius:4px;padding:5px 7px;font:12.5px system-ui,sans-serif;min-width:0}
+  .project-inline input{flex:1;min-width:90px}
+  .project-settings-item{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px}
+  .project-settings-item input{flex:1}
+  .project-settings-item small{color:var(--muted)}
+  .project-table{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0}
+  .project-table th,.project-table td{border-bottom:1px solid var(--brd);padding:5px;text-align:left}
+  .project-message{font-size:12px;color:var(--muted);margin:8px}
+  .project-message.warn{color:var(--warn)}
   .win-list{display:flex;flex-direction:column;gap:2px;width:fit-content;margin:2px 8px 10px auto;padding-left:12px;border-left:2px solid var(--brd)}
   .win-list:empty{display:none}
   .win-row{display:flex;align-items:center;gap:6px;min-height:36px}
@@ -162,6 +173,12 @@
   .edit-popup input.t:focus{border-color:var(--acc)}
   .edit-popup input.t.bad,.newtask-popup input.t.bad{color:var(--warn)}
   .edit-popup input.t:disabled{color:var(--muted)}
+  .edit-popup select{background:var(--bg);border:1px solid var(--brd);color:var(--txt);border-radius:4px;padding:6px 8px;font:13px system-ui,sans-serif}
+  .edit-project-current{font-size:12px;color:var(--muted)}
+  .edit-project-current strong{color:var(--txt);font-weight:600}
+  .edit-project-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .edit-project-actions button:disabled{opacity:.45;cursor:default}
+  .edit-project-hint{font-size:11px;color:var(--muted)}
   .popup-row{display:flex;gap:8px}
   .edit-popup .apply-btn{background:var(--acc)}
   .newtask-popup .apply-btn{background:var(--grn);color:#000}
@@ -295,6 +312,11 @@
   .tab.active{background:var(--acc);color:#fff;font-weight:600}
 
   .summary-area{flex:1;width:100%;height:100%;min-height:0;background:var(--surf);border:1px solid var(--brd);border-radius:var(--rad);padding:14px;font-family:var(--mono);font-size:13px;color:var(--txt);resize:none;line-height:1.5;box-sizing:border-box;margin:0}
+  .summary-layout{display:flex;gap:12px;flex:1;min-height:0}
+  .summary-projects{width:220px;min-width:180px;max-width:35%;overflow:auto;background:var(--surf);border:1px solid var(--brd);border-radius:var(--rad);padding:12px;box-sizing:border-box}
+  .summary-projects h3{font-size:12px;color:var(--muted);margin:0 0 10px}
+  .summary-project-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:5px 0;border-top:1px solid var(--brd)}
+  .summary-project-row b{font:12px var(--mono);white-space:nowrap}
   .summary-area:focus{outline:none;border-color:var(--acc)}
   .summary-wrap{position:relative;flex:1;display:flex;flex-direction:column;min-height:0}
   .summary-regen{position:absolute;top:8px;right:8px;z-index:2;padding:3px 9px;border-radius:5px;border:1px solid var(--brd);background:var(--hover);color:var(--muted);cursor:pointer;font-size:11px;font-weight:500;transition:all .15s;opacity:.7;user-select:none}

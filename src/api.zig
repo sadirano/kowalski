@@ -1122,12 +1122,13 @@ fn frequentTasks(app: *App, a: std.mem.Allocator, params: []const u8) !Response 
     return send(a, .ok, .{ .tasks = list.items });
 }
 
-/// Focus per day over the last `days` days, one series per task or per
-/// value of a provider field.
+/// Focus per day over the last `days` days, one series per task, per
+/// project (`@project`, a name no provider field can take) or per value of a
+/// provider field.
 fn chart(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     const day_count = try intParam(a, params, "days", 14, 90) orelse return badRequest(a, "days");
     const group = try param(a, params, "group") orelse "task";
-    if (std.mem.eql(u8, group, "project")) return projectChart(app, a, day_count);
+    if (std.mem.eql(u8, group, "@project")) return projectChart(app, a, day_count);
     const z = try loadZone(app, a);
     const today = dayIndex(try dateParam(app, a, null));
     var dates: std.ArrayList([]const u8) = .empty;
@@ -3134,6 +3135,13 @@ test "day totals frequent tasks and charts count focus only" {
     try std.testing.expectEqual(@as(i64, 5_400_000), by_client.series[0].total_ms);
     try std.testing.expectEqual(@as(i64, 3_600_000), by_client.series[0].ms[5]);
     try std.testing.expectEqual(@as(i64, 1_800_000), by_client.series[0].ms[6]);
+    // A provider field named like the core grouping still charts by its values.
+    const by_field = try f.get(Chart, "/api/chart?days=7&group=project");
+    try std.testing.expectEqual(@as(usize, 1), by_field.series.len);
+    try std.testing.expectEqualStrings("-", by_field.series[0].label);
+    const by_project = try f.get(Chart, "/api/chart?days=7&group=%40project");
+    try std.testing.expectEqual(@as(usize, 1), by_project.series.len);
+    try std.testing.expectEqual(@as(i64, 5_400_000), by_project.series[0].total_ms);
     const posted = f.call(.POST, "/api/postings", "{\"task\":\"#2\",\"date\":\"2026-03-10\"}");
     try std.testing.expectEqual(std.http.Status.created, posted.status);
     try std.testing.expect(contains(posted.body, "\"amount_micro\":500000"));

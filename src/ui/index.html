@@ -107,7 +107,10 @@
   </label>
   <div id="nt-info" style="display:none;flex-direction:column;gap:4px;padding:2px 2px 0"></div>
   <label><span data-i18n="lbl_title">Title</span>
-    <input type="text" id="nt-title" autocomplete="off">
+    <input type="text" id="nt-title" autocomplete="off" onblur="syncNewTaskProjectFromId()" data-i18n-ph="project_title_or_id" placeholder="Title or #task ID">
+  </label>
+  <label><span data-i18n="project">Project</span>
+    <select id="nt-project"></select>
   </label>
   <div class="popup-row" style="margin-top:2px">
     <button class="apply-btn" id="nt-submit" onclick="applyNewTask()" style="flex:1" data-i18n="btn_start">Start</button>
@@ -207,6 +210,18 @@
       <div class="set-row" id="set-account-row"><div class="set-lbl"><span data-i18n="set_account">Provider account</span></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="showLogin()"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span data-i18n="login_submit">Sign in</span></button></div></div>
     </section>
+    <section class="set-sec">
+      <h4><span data-i18n="projects">Projects</span></h4>
+      <div id="set-project-list" class="project-settings-list"></div>
+      <div class="project-inline"><input id="set-project-new" type="text" maxlength="200" data-i18n-ph="project_name" placeholder="Project name"><button type="button" class="set-btn" onclick="addProject()" data-i18n="project_add">Add project</button></div>
+      <div class="set-row"><label class="set-lbl" for="set-project-field"><span data-i18n="project_provider_field">Provider field for new tasks</span></label><div class="set-ctl"><span class="sel"><select id="set-project-field"></select></span></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="project_capture_source">Capture source</span></div></div>
+      <div id="set-project-keys" class="project-settings-list"></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="project_assignment">Project assignment</span></div></div>
+      <div class="project-inline"><select id="set-assign-scope" onchange="invalidateAssignmentPreview()"><option value="task" data-i18n="project_task_scope">Task ID</option><option value="intervals" data-i18n="project_interval_ids">Interval IDs</option><option value="suggestions" data-i18n="project_suggestions">Unassigned suggestions</option></select><input id="set-assign-task" type="number" min="1" placeholder="Task ID" data-i18n-ph="project_task_scope" oninput="invalidateAssignmentPreview()"><input id="set-assign-intervals" type="text" placeholder="Interval IDs, comma separated" data-i18n-ph="project_interval_ids_hint" oninput="invalidateAssignmentPreview()" style="display:none"><select id="set-assign-target" onchange="invalidateAssignmentPreview()"></select><button type="button" class="set-btn" onclick="previewProjectAssignment()" data-i18n="project_preview">Preview assignment</button></div>
+      <div id="set-assign-result"></div>
+      <div class="project-inline"><button type="button" class="set-btn" id="set-assign-apply" onclick="applyProjectAssignment()" data-i18n="project_apply" disabled>Apply assignment</button></div>
+    </section>
     <details class="set-sec set-adv">
       <summary><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="sec_advanced">Advanced</span><svg class="ico chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
       <div class="set-row"><label class="set-lbl" for="set-zone"><span data-i18n="set_zone">Reporting time zone</span><small data-i18n="set_zone_hint">A Windows time zone name; days start and end at its midnight.</small></label>
@@ -285,6 +300,11 @@
   <h3 data-i18n="edit_title">Edit session times</h3>
   <label><span data-i18n="lbl_start_time">Start time</span><input type="text" class="t" id="edit-start" inputmode="numeric" autocomplete="off" spellcheck="false" onchange="tidyClock(this)"></label>
   <label><span data-i18n="lbl_end_time">End time</span><input type="text" class="t" id="edit-end" inputmode="numeric" autocomplete="off" spellcheck="false" onchange="tidyClock(this)"></label>
+  <div class="edit-project-current"><span data-i18n="project">Project</span>: <strong id="edit-project-current"></strong></div>
+  <label><span data-i18n="project_to">To</span><select id="edit-project-target" onchange="clearEditProjectPreview()"></select></label>
+  <div class="edit-project-actions"><button type="button" class="set-btn" onclick="previewEditProject()" data-i18n="project_preview">Preview assignment</button><button type="button" class="set-btn" id="edit-project-apply" onclick="applyEditProject()" data-i18n="project_apply" disabled>Apply assignment</button></div>
+  <small class="edit-project-hint" data-i18n="project_edit_hint">Project changes apply separately from time edits.</small>
+  <div id="edit-project-result" class="project-message" role="status"></div>
   <div class="popup-row">
     <button class="apply-btn" onclick="applyEditTime()" style="flex:1" data-i18n="save">Save</button>
     <span class="cancel-link" onclick="closeEditTime()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>

@@ -5,9 +5,12 @@ function switchToTaskByIdx(idx) {
   if (d) switchToTask(d.task);
 }
 
-async function switchToTask(task) {
+// Without a picked project the server uses the task's default project.
+async function switchToTask(task, projectId) {
   try {
-    await apiJSON('POST', '/api/switch', { task: '#' + task.id });
+    const body = { task: '#' + task.id };
+    if (projectId !== undefined) body.project_id = projectId;
+    await apiJSON('POST', '/api/switch', body);
     showToast(t('switched', { name: task.ref || task.title }));
     await loadCurrent();
     loadSchedule();

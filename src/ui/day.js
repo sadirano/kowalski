@@ -26,6 +26,7 @@ async function loadDay(date, { chart = false } = {}) {
     const [days, day] = await Promise.all([
       fetchWeek(),
       apiJSON('GET', '/api/day?date=' + date),
+      loadProjects().catch(() => []),
     ]);
     if (gen !== _dayGen || selectedDate !== date || activeTab !== tab) return;
     weekData = days;

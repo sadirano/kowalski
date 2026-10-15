@@ -1,17 +1,21 @@
 'use strict';
 function loadSummary(day, date) {
-  if (day.summary) renderSavedSummary(day.summary, date);
+  if (day.summary) renderSavedSummary(day.summary, date, day);
   else renderSummary(day);
   id('chart-box').style.display = 'none';
 }
 
-function buildSummaryWrap(content, isSaved) {
+function buildSummaryWrap(content, isSaved, day) {
   const statusText = isSaved ? t('summary_saved_label') : '';
-  return `<div class="summary-wrap">`
+  const totals = (day.project_totals || []).filter(row => row.focus_ms > 0);
+  const projectsHtml = `<aside class="summary-projects"><h3>${esc(t('project_focus'))}</h3>`
+    + totals.map(row => `<div class="summary-project-row"><span>${esc(row.project_id == null ? t('project_unassigned') : projectName(row.project_id))}</span><b>${esc(fmtMs(row.focus_ms))}</b></div>`).join('')
+    + `</aside>`;
+  return `<div class="summary-layout"><div class="summary-wrap">`
     + `<button class="summary-regen" onclick="regenerateSummary()" title="${t('summary_regen')}" aria-label="${t('summary_regen')}">${icon('refresh')}</button>`
     + `<textarea class="summary-area" id="summary-text" oninput="onSummaryInput()">${content}</textarea>`
     + `<span class="summary-status${isSaved ? '' : ' hidden'}" id="summary-status">${statusText}</span>`
-    + `</div>`;
+    + `</div>${projectsHtml}</div>`;
 }
 
 let _summaryAutoSaveTimer = null;
@@ -44,9 +48,9 @@ function flushSummary() {
   return saveSummary(date, text);
 }
 
-function renderSavedSummary(text, date = selectedDate) {
+function renderSavedSummary(text, date = selectedDate, day = D) {
   prepareSummaryDate(date);
-  id('table-area').innerHTML = buildSummaryWrap(esc(summaryShown(date, text)), true);
+  id('table-area').innerHTML = buildSummaryWrap(esc(summaryShown(date, text)), true, day);
 }
 
 function writeSummary(date, text) {
@@ -157,5 +161,5 @@ function renderSummary(day) {
     });
   }
 
-  area.innerHTML = buildSummaryWrap(esc(summaryShown(_summaryDate, text.trim())), false);
+  area.innerHTML = buildSummaryWrap(esc(summaryShown(_summaryDate, text.trim())), false, day);
 }

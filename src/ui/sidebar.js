@@ -1,5 +1,37 @@
 'use strict';
 // ── Sidebar ───────────────────────────────────────────────────────────────────
+let projects = [];
+let _projectsLoading = null;
+
+function projectName(projectId) {
+  if (projectId == null) return t('project_unassigned');
+  const p = projects.find(p => p.id === projectId);
+  return p ? p.label + (p.archived ? ' (' + t('project_archived') + ')' : '') : '#' + projectId;
+}
+
+// New work defaults to the project of the current focus.
+function focusProjectId() {
+  return S?.focus?.project_id ?? null;
+}
+
+async function loadProjects() {
+  if (_projectsLoading) return _projectsLoading;
+  _projectsLoading = apiJSON('GET', '/api/projects?archived=1').then(data => {
+    projects = data.projects;
+    return projects;
+  }).finally(() => { _projectsLoading = null; });
+  return _projectsLoading;
+}
+
+function projectOptions(value) {
+  const choices = [`<option value="unassigned">${esc(t('project_unassigned'))}</option>`];
+  for (const p of projects) {
+    if (p.archived && String(p.id) !== String(value)) continue;
+    choices.push(`<option value="${p.id}">${esc(p.label)}${p.archived ? ' (' + esc(t('project_archived')) + ')' : ''}</option>`);
+  }
+  return choices.join('');
+}
+
 function renderSidebar() {
   const nav = id('week-nav');
   const lbl = id('sidebar-head-label');
