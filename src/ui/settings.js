@@ -78,6 +78,7 @@ async function showSettings() {
     id('set-port').textContent = pref('http_port', location.port || '47100');
     apiJSON('GET', '/api/version').then(data => {
       id('set-version').textContent = data.version;
+      id('set-update-channel').value = pref('update_channel', String(data.version).includes('-preview.') ? 'preview' : 'stable');
       id('update-row').style.display = data.update_repo || _lastUpdateOutcome ? '' : 'none';
       if (!data.update_repo && !_lastUpdateOutcome) id('update-result').style.display = 'none';
       else if (_lastUpdateOutcome) {
@@ -780,6 +781,7 @@ async function applySettings() {
     ui_autofill_obs: id('set-autofill').checked ? '1' : '0',
     post_sessions: id('set-post-sessions').checked ? '1' : '0',
     project_provider_field: id('set-project-field').value || null,
+    update_channel: id('set-update-channel').value,
     // An emptied text goes back to the provider's default.
     ...Object.fromEntries([...document.querySelectorAll('#set-provider-rows [data-key]')]
       .map(el => [el.dataset.key, el.value.trim() || null])),

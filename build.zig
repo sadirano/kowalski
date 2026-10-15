@@ -9,6 +9,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const update_repo = b.option([]const u8, "update-repo", "GitHub owner/name for signed updates; empty disables updates") orelse update_options.default_repo;
     const update_key = b.option([]const u8, "update-key", "Ed25519 release public key as 64 lowercase hex characters") orelse update_options.default_key;
+    const preview = b.option(u32, "preview", "Positive preview release number");
+    if (preview != null and preview.? == 0) @panic("-Dpreview must be a positive integer");
+    const version = if (preview) |n| b.fmt("{s}-preview.{d}", .{ @import("build.zig.zon").version, n }) else @import("build.zig.zon").version;
     if (!update_options.validRepo(update_repo)) @panic("invalid -Dupdate-repo: expected owner/name using only ASCII letters, digits, dot, underscore or hyphen, or empty");
     if (!update_options.validKey(update_key)) @panic("invalid -Dupdate-key: expected exactly 64 lowercase hex characters");
     const sqlite = b.dependency("sqlite", .{});
@@ -17,7 +20,7 @@ pub fn build(b: *std.Build) void {
     provider_check.addImport("kowalski_provider", contract);
     const manifest_module = b.createModule(.{ .root_source_file = b.path("src/provider_manifest.zig"), .target = target, .optimize = optimize });
     const no_replace_module = b.createModule(.{ .root_source_file = b.path("src/no_replace.zig"), .target = target, .optimize = optimize });
-    const seams: Seams = .{ .sqlite = sqlite, .contract = contract, .manifest = manifest_module, .no_replace = no_replace_module, .update_repo = update_repo, .update_key = update_key };
+    const seams: Seams = .{ .sqlite = sqlite, .contract = contract, .manifest = manifest_module, .no_replace = no_replace_module, .update_repo = update_repo, .update_key = update_key, .version = version };
 
     const exe = b.addExecutable(.{
         .name = "kowalski",
@@ -127,6 +130,7 @@ const Seams = struct {
     no_replace: *std.Build.Module,
     update_repo: []const u8,
     update_key: []const u8,
+    version: []const u8,
 };
 
 fn makeModule(
@@ -147,7 +151,7 @@ fn makeModule(
     module.addImport("no_replace", seams.no_replace);
     // The release version has one home: build.zig.zon.
     const options = b.addOptions();
-    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    options.addOption([]const u8, "version", seams.version);
     options.addOption([]const u8, "update_repo", seams.update_repo);
     options.addOption([]const u8, "update_key", seams.update_key);
     module.addOptions("build_options", options);
