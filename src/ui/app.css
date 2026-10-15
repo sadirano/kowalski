@@ -229,6 +229,21 @@
 
   #table-area{flex:1;min-height:0}
   #table-area.summary-view{display:flex;flex-direction:column}
+  #table-area.grid-report:not(.summary-view){display:block}
+  .card-cols{display:flex;gap:10px;align-items:flex-start}
+  .card-col{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
+  .card-col .task-card{margin-bottom:0}
+  .report-bar{display:flex;justify-content:flex-end;margin-bottom:6px}
+  .link-btn{background:none;border:none;color:var(--muted);font-size:12px;cursor:pointer;padding:2px 4px}
+  .link-btn:hover{color:var(--txt)}
+  .task-hdr.fold{cursor:pointer}
+  .task-line{display:flex;align-items:baseline;gap:8px;min-width:0}
+  .task-line .task-meta{margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .task-fold{font-size:11px;color:var(--muted);width:10px;flex-shrink:0}
+  .task-eps{font-size:11px;color:var(--muted);flex-shrink:0}
+  .task-card.folded .task-hdr{border-bottom:none}
+  .ep-rest{color:var(--muted);cursor:pointer;padding-left:70px;font-size:12px}
+  .ep-rest:hover{color:var(--txt)}
 
   /* Top panel */
 
@@ -319,6 +334,24 @@
 
   /* Session block within a task card */
   .block{border-bottom:1px solid var(--brd)}
+  .episode{border-bottom:1px solid var(--brd)}
+  .ep-hdr{display:flex;align-items:center;gap:12px;padding:9px 15px;cursor:pointer;user-select:none}
+  .ep-hdr:hover{background:var(--hover)}
+  .ep-time{font-family:var(--mono);font-size:12px;color:var(--muted);flex-shrink:0;min-width:148px}
+  .ep-dur{font-family:var(--mono);font-size:12px;font-weight:600;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ep-notes{padding:0 15px 9px 15px;display:flex;flex-direction:column;gap:3px}
+  .ep-note{display:flex;gap:10px;font-size:12.5px;line-height:18px}
+  .ep-at{font-family:var(--mono);font-size:11px;color:var(--muted);flex-shrink:0;width:60px;padding-top:1px}
+  .ep-who{font-size:10px;text-transform:uppercase;letter-spacing:.04em;flex-shrink:0;width:42px;padding-top:2px;color:var(--muted)}
+  .ep-who.agent{color:var(--acc)}
+  .ep-text{flex:1;min-width:0;word-break:break-word}
+  .ep-details{display:none;border-top:1px dashed var(--brd);margin-left:15px}
+  .ep-details.open{display:block}
+  .block.compact{border-bottom:none}
+  .block.compact .block-hdr{padding:3px 15px;gap:8px}
+  .block.compact .block-time,.block.compact .block-dur{font-size:11px;color:var(--muted);font-weight:400}
+  .block.compact .block-note-preview{visibility:hidden}
+  .block.compact .open-badge{font-size:9px;padding:0 5px}
   .block:last-child{border-bottom:none}
   .block-list{display:flex;flex-direction:column}
   .block-hdr{display:flex;align-items:center;gap:10px;padding:7px 15px;cursor:pointer;user-select:none}

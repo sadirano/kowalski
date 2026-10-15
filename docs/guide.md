@@ -287,6 +287,9 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 **Display**
 
 - Language, 12- or 24-hour time, days in the sidebar, day order, weekends.
+- Report layout: Classic (one card per task, listing its intervals) or Grid
+  (cards in columns; each task's work in blocks with their notes; click a
+  task to fold it).
 - Task order within a day: most time first, by task ID, or in the order
   they were first worked on that day.
 - Which optional buttons the command bar shows (add entry, shortcuts).
