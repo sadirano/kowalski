@@ -52,6 +52,11 @@ function renderReport(rep) {
     return;
   }
 
+  if (activeTab === 'timeline') {
+    area.classList.remove('grid-report');
+    renderReader(rep, area);
+    return;
+  }
   const ordered = orderTasks(rep);
   // Grid: cards in columns, work blocks, folding. Classic: the report as it
   // was, one full-width card per task listing its intervals.
@@ -186,7 +191,7 @@ function renderReport(rep) {
 const GRID_COLUMN = 480;
 let _gridCols = 0;
 window.addEventListener('resize', () => {
-  if (_reportLayout !== 'grid' || !D) return;
+  if (_reportLayout !== 'grid' || activeTab !== 'report' || !D) return;
   const area = id('table-area');
   const count = Math.max(1, Math.floor((area.clientWidth + 10) / (GRID_COLUMN + 10)));
   if (count !== _gridCols) renderReport(D);

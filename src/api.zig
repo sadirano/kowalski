@@ -1266,7 +1266,7 @@ fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
         .{ .key = "ui_time_format", .values = &.{ "system", "24", "12" } },
         .{ .key = "ui_chart_view", .values = &.{ "bars", "lanes" } },
         .{ .key = "ui_task_order", .values = &.{ "time", "ref", "added" } },
-        .{ .key = "ui_report_layout", .values = &.{ "classic", "grid" } },
+        .{ .key = "ui_report_layout", .values = &.{ "classic", "grid", "reader" } },
     };
     for (choices) |c| if (std.mem.eql(u8, key, c.key)) {
         for (c.values) |allowed| if (std.mem.eql(u8, v, allowed)) return true;
@@ -2685,6 +2685,7 @@ test "settings validate preferences and paid breaks credit only the pause" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"ref\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"id\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"grid\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"reader\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"cards\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"[\\\"system\\\"]\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"system\"}").status);

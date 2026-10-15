@@ -1216,6 +1216,7 @@ const ui_files = [_]UiFile{
     .{ .path = "/ui/history.js", .body = @embedFile("ui/history.js"), .kind = js },
     .{ .path = "/ui/sidebar.js", .body = @embedFile("ui/sidebar.js"), .kind = js },
     .{ .path = "/ui/report.js", .body = @embedFile("ui/report.js"), .kind = js },
+    .{ .path = "/ui/reader.js", .body = @embedFile("ui/reader.js"), .kind = js },
     .{ .path = "/ui/charts.js", .body = @embedFile("ui/charts.js"), .kind = js },
     .{ .path = "/ui/tour.js", .body = @embedFile("ui/tour.js"), .kind = js },
     .{ .path = "/ui/boot.js", .body = @embedFile("ui/boot.js"), .kind = js },
@@ -1371,5 +1372,5 @@ test "every local file the dashboard references is served" {
         }
     }
     try std.testing.expect(count > 0);
-    try std.testing.expectEqual(@as(usize, 21), ui_count); // stylesheet and 20 scripts
+    try std.testing.expectEqual(@as(usize, 22), ui_count); // stylesheet and 21 scripts
 }
