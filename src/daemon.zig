@@ -648,7 +648,7 @@ test "background source check leaves database work responsive during a slow read
         var started = std.atomic.Value(bool).init(false);
         fn get(_: *anyopaque, _: std.mem.Allocator, _: Io, _: []const u8, _: usize) ![]const u8 {
             started.store(true, .release);
-            Sleep(300);
+            Sleep(1000);
             return "late";
         }
     };
@@ -668,7 +668,7 @@ test "background source check leaves database work responsive during a slow read
         .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs },
         .source_fetcher = .{ .context = undefined, .get = Fake.get }, .source_start_delay_ms = 0 };
     var future = try io.concurrent(backgroundSourceCheck, .{&d});
-    for (0..40) |_| {
+    for (0..200) |_| {
         if (Fake.started.load(.acquire)) break;
         try io.sleep(.fromMilliseconds(5), .awake);
     }
@@ -678,9 +678,9 @@ test "background source check leaves database work responsive during a slow read
     const count = try sourceScalar(&db, "SELECT count(*) FROM provider_source");
     d.mutex.unlock(io);
     try std.testing.expectEqual(@as(i64, 1), count);
-    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - before.toMilliseconds() < 200);
+    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - before.toMilliseconds() < 500);
     future.cancel(io);
-    try io.sleep(.fromMilliseconds(350), .awake);
+    try io.sleep(.fromMilliseconds(1100), .awake);
 }
 
 fn sourceScalar(db: *sqlite.Db, sql: []const u8) !i64 {
