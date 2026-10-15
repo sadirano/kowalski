@@ -2365,6 +2365,24 @@ test "capture keys keep distinct long hints and reject blank first hints" {
     try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
 }
 
+test "a new capture key joins the user's project of the same name" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"kowalski\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"old\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/projects/2", "{\"archived\":true}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"Kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:h/kowalski'"));
+    // An archived project is not joined: the key gets a project of its own.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"git:h/old\",\"project_hint\":\"old\"}").status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:h/old'"));
+    // Neither is a project another key already claims.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"c\",\"event\":\"c0\",\"kind\":\"start\",\"project_key\":\"git:fork/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 4), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:fork/kowalski'"));
+    try std.testing.expectEqual(@as(i64, 4), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+}
+
 test "explicit Unassigned blocks first provider fallback and invalid labels are ignored" {
     var f: Fixture = .{};
     try f.init();

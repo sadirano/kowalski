@@ -318,6 +318,15 @@ pub const Store = struct {
         return if (try stmt.step() == .row) stmt.columnI64(0) else null;
     }
 
+    /// A project the user made with this label: unarchived and claimed by no
+    /// capture key, so a new key lands there instead of beside it.
+    fn unclaimedProject(s: *Store, label: []const u8) !?i64 {
+        var stmt = try s.db.prepare("SELECT id FROM projects p WHERE label=?1 COLLATE NOCASE AND archived=0 AND NOT EXISTS (SELECT 1 FROM capture_project_keys k WHERE k.project_id=p.id)");
+        defer stmt.finalize();
+        try stmt.bindText(1, label);
+        return if (try stmt.step() == .row) stmt.columnI64(0) else null;
+    }
+
     fn uniqueCaptureLabel(s: *Store, source: []const u8, key: []const u8, hint: []const u8) ![]const u8 {
         const base = std.mem.trim(u8, hint, " \t\r\n");
         if (!validProjectLabel(base)) return error.InvalidProjectLabel;
@@ -357,9 +366,11 @@ pub const Store = struct {
             if (try s.mappedProject(source, k)) |id| return id;
             const raw = hint orelse return error.InvalidProjectLabel;
             if (raw.len > 200) return error.InvalidProjectLabel;
-            const label = try s.uniqueCaptureLabel(source, k, raw);
-            defer s.allocator.free(label);
-            const id = try s.insertProject(label);
+            const id = if (try s.unclaimedProject(std.mem.trim(u8, raw, " \t\r\n"))) |own| own else blk: {
+                const label = try s.uniqueCaptureLabel(source, k, raw);
+                defer s.allocator.free(label);
+                break :blk try s.insertProject(label);
+            };
             var stmt = try s.db.prepare("INSERT INTO capture_project_keys(source,project_key,project_id,project_hint) VALUES(?1,?2,?3,?4)");
             defer stmt.finalize();
             try stmt.bindText(1, source);
