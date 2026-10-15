@@ -410,7 +410,7 @@ const isShown = popupId => id(popupId)?.classList.contains('show');
 const prevWorkday = () => {
   const d = new Date(todayStr() + 'T12:00:00');
   do d.setDate(d.getDate() - 1); while (d.getDay() === 0 || d.getDay() === 6);
-  return d.toLocaleDateString('sv');
+  return calendarDateStr(d);
 };
 const redDay = () => document.querySelector('#week-nav .dclock.unsynced')?.closest('.dbtn')
   || [...document.querySelectorAll('#week-nav .dbtn')].reverse().find(b => b.querySelector('.dtotal')?.textContent !== '—');

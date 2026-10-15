@@ -169,7 +169,8 @@ fn demoData(init: std.process.Init, destination: []const u8, args: []const []con
         try store.setSetting("reporting_zone", id, clock.nowMs());
         break :blk id;
     };
-    const zone = try zone_mod.Zone.load(zone_id);
+    defer a.free(zone_id);
+    const zone = try store.loadZone();
     const now = if (at) |text| localMs(&zone, text) orelse return usageError() else clock.nowMs();
     const instance = try store.getSetting("provider_instance") orelse tour_mod.instance;
     demo.seed(&db, a, .{ .lang = lang, .instance = instance, .now_ms = now, .zone = &zone }) catch |err| switch (err) {

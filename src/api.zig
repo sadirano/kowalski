@@ -19,7 +19,7 @@ pub const default_port: u16 = 47100;
 
 /// Settings the API may change; anything else is refused.
 pub const setting_keys = [_][]const u8{
-    "reporting_zone",  "daily_work_minutes", "lunch_minutes",     "http_port",
+    "reporting_zone",  "day_start", "daily_work_minutes", "lunch_minutes",     "http_port",
     "post_sessions",
     "project_provider_field",
     // Dashboard preferences.
@@ -621,10 +621,8 @@ pub fn parseDate(a: std.mem.Allocator, text: []const u8) !Date {
 }
 
 fn loadZone(app: *App, a: std.mem.Allocator) !zone.Zone {
-    const id = try app.store.reportingZone() orelse return zone.Zone.load("UTC");
-    defer app.store.allocator.free(id);
     _ = a;
-    return zone.Zone.load(id);
+    return app.store.loadZone();
 }
 
 fn dateParam(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Date {
@@ -730,6 +728,7 @@ fn state(app: *App, a: std.mem.Allocator) !Response {
     return send(a, .ok, .{
         .now_ms = now,
         .zone = try zoneName(app, a),
+        .day_start_min = z.day_start_min,
         .date = today.text,
         .provider = app.provider,
         .link = app.traits.link,
@@ -782,6 +781,7 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
     return send(a, .ok, .{
         .date = date.text,
         .zone = try zoneName(app, a),
+        .day_start_min = z.day_start_min,
         .start_ms = bounds.start_ms,
         .end_ms = bounds.end_ms,
         .numbers = numbersOf(n),
@@ -3139,6 +3139,37 @@ test "day totals frequent tasks and charts count focus only" {
     try std.testing.expect(contains(posted.body, "\"amount_micro\":500000"));
 }
 
+test "day start moves early work to prior day and posting covers it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const midnight = (try (try zone.Zone.load("UTC")).dayBounds(2026, 3, 15)).start_ms;
+    test_now = midnight + 12 * 3_600_000;
+    const task = try f.store.createTask("Night work", test_now);
+    f.app.provider = "fake";
+    f.app.traits = parseTraits(f.arena.allocator(), "{\"sessions\":true}");
+    try f.store.bind(task, "fake", "R-1", test_now);
+    _ = try f.store.addInterval(task, .focus, midnight + 3_600_000, midnight + 5_400_000, test_now);
+    const DayTotal = struct { numbers: Numbers };
+    const before = try f.get(DayTotal, "/api/day?date=2026-03-15");
+    try std.testing.expectEqual(@as(i64, 1_800_000), before.numbers.total_ms);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"day_start\":\"04:00\"}").status);
+    const prior = try f.get(DayTotal, "/api/day?date=2026-03-14");
+    const current = try f.get(DayTotal, "/api/day?date=2026-03-15");
+    try std.testing.expectEqual(@as(i64, 1_800_000), prior.numbers.total_ms);
+    try std.testing.expectEqual(@as(i64, 0), current.numbers.total_ms);
+    const totals = f.call(.GET, "/api/daytotals?from=2026-03-14&to=2026-03-15", "");
+    try std.testing.expectEqual(std.http.Status.ok, totals.status);
+    try std.testing.expect(contains(totals.body, "\"2026-03-14\":1800000"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"post_sessions\":\"1\"}").status);
+    const posted = f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-14\"}");
+    try std.testing.expectEqual(std.http.Status.created, posted.status);
+    const rows = try query.postingsOn(&f.store, f.arena.allocator(), "2026-03-14", task);
+    try std.testing.expect(rows.len > 0);
+    try std.testing.expectEqual(midnight + 3_600_000, rows[0].covered_start_ms.?);
+    try std.testing.expectEqual(midnight + 5_400_000, rows[rows.len - 1].covered_end_ms.?);
+}
+
 test "day status follows binding posting and reduced history" {
     var f: Fixture = .{};
     try f.init();
@@ -3204,6 +3235,12 @@ test "settings validate preferences and paid breaks credit only the pause" {
     try f.init();
     defer f.deinit();
     const a = f.arena.allocator();
+    for ([_][]const u8{ "4:00", "04:0", "12:01", "13:00", "04:60", "xx:yy" }) |bad| {
+        const body = try std.fmt.allocPrint(a, "{{\"day_start\":\"{s}\"}}", .{bad});
+        try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", body).status);
+    }
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"day_start\":\"12:00\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"day_start\":\"00:00\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"newest\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"x\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"ref\"}").status);

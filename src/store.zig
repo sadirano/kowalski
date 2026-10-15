@@ -72,12 +72,21 @@ pub const AssignmentSnapshot = struct {
     intervals: []const AssignmentRow,
     totals: []const AssignmentTotal,
     reporting_zone: []const u8,
+    day_start_min: u16 = 0,
 };
 pub const AssignmentPreview = struct { snapshot: AssignmentSnapshot, skipped: []const AssignmentRow };
 pub const AssignmentResult = struct { changed: usize, focus_ms: i64 };
 
-pub fn assignmentTotals(a: std.mem.Allocator, rows: []const AssignmentRow, zone_name: []const u8) ![]AssignmentTotal {
-    const z = try zone.Zone.load(zone_name);
+pub fn parseDayStart(value: []const u8) !u16 {
+    if (value.len != 5 or value[2] != ':') return error.InvalidSetting;
+    for ([_]usize{ 0, 1, 3, 4 }) |i| if (!std.ascii.isDigit(value[i])) return error.InvalidSetting;
+    const hour = try std.fmt.parseInt(u16, value[0..2], 10);
+    const minute = try std.fmt.parseInt(u16, value[3..5], 10);
+    if (hour > 12 or minute > 59 or (hour == 12 and minute != 0)) return error.InvalidSetting;
+    return hour * 60 + minute;
+}
+
+pub fn assignmentTotals(a: std.mem.Allocator, rows: []const AssignmentRow, z: zone.Zone) ![]AssignmentTotal {
     var totals: std.ArrayList(AssignmentTotal) = .empty;
     for (rows) |row| {
         if (!std.mem.eql(u8, row.role, "focus")) continue;
@@ -256,6 +265,8 @@ pub const Store = struct {
         const zone_setting = try s.getSetting("reporting_zone");
         defer if (zone_setting) |name| s.allocator.free(name);
         if (!std.mem.eql(u8, snapshot.reporting_zone, zone_setting orelse "UTC")) return error.Stale;
+        const current_zone = try s.loadZone();
+        if (snapshot.day_start_min != current_zone.day_start_min) return error.Stale;
         var focus_ms: i64 = 0;
         for (snapshot.intervals, 0..) |row, i| {
             if (row.end_ms == null or row.project_id == target) return error.Stale;
@@ -272,7 +283,7 @@ pub const Store = struct {
             if (actual_focus != row.focus_ms) return error.Stale;
             focus_ms += actual_focus;
         }
-        const totals = try assignmentTotals(s.allocator, snapshot.intervals, snapshot.reporting_zone);
+        const totals = try assignmentTotals(s.allocator, snapshot.intervals, current_zone);
         defer {
             for (totals) |total| s.allocator.free(total.date);
             s.allocator.free(totals);
@@ -532,7 +543,7 @@ pub const Store = struct {
         defer s.allocator.free(windows);
         const id = try s.reportingZone() orelse return false;
         defer s.allocator.free(id);
-        const z = try zone.Zone.load(id);
+        const z = try s.loadZone();
         const local = z.localOf(now_ms) catch return error.InvalidTime;
         if (!(lockWindowsContain(windows, @as(u16, local.hour) * 60 + local.minute) orelse false)) return false;
         if (!try s.hasOpen()) return false;
@@ -1580,9 +1591,7 @@ pub const Store = struct {
 
     /// Stamps every reporting day that [start, end] touches as edited now.
     fn markEdited(s: *Store, start: i64, end: i64, now_ms: i64) !void {
-        const id = try s.reportingZone();
-        defer if (id) |v| s.allocator.free(v);
-        const z = try zone.Zone.load(id orelse "UTC");
+        const z = try s.loadZone();
         var at = start;
         const last = @max(start, end);
         var days: u32 = 0;
@@ -1910,6 +1919,8 @@ pub const Store = struct {
         if (std.mem.eql(u8, key, "reporting_zone")) {
             if (val.len == 0) return error.InvalidSetting;
             _ = try zone.Zone.load(val);
+        } else if (std.mem.eql(u8, key, "day_start")) {
+            _ = parseDayStart(val) catch return error.InvalidSetting;
         } else if (std.mem.eql(u8, key, "daily_work_minutes")) {
             const n = std.fmt.parseInt(u16, val, 10) catch return error.InvalidSetting;
             if (n < 1 or n > 1440) return error.InvalidSetting;
@@ -1958,6 +1969,16 @@ pub const Store = struct {
 
     pub fn reportingZone(s: *Store) Error!?[]u8 {
         return s.getSetting("reporting_zone");
+    }
+
+    pub fn loadZone(s: *Store) !zone.Zone {
+        const id = try s.reportingZone();
+        defer if (id) |v| s.allocator.free(v);
+        var z = try zone.Zone.load(id orelse "UTC");
+        const setting = try s.getSetting("day_start");
+        defer if (setting) |v| s.allocator.free(v);
+        if (setting) |v| z.day_start_min = try parseDayStart(v);
+        return z;
     }
 
     fn minuteSetting(s: *Store, key: []const u8, default: u16) !u16 {

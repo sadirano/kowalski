@@ -70,7 +70,8 @@ function fmtDate(str) {
 function shortDate(str) { return new Date(str+'T12:00:00').toLocaleDateString(locale(),{month:'short',day:'numeric'}); }
 function dayName(str)   { return new Date(str+'T12:00:00').toLocaleDateString(locale(),{weekday:'short'}); }
 function isWeekend(str) { const d = new Date(str+'T12:00:00').getDay(); return d === 0 || d === 6; }
-function todayStr()     { return (S && S.date) || new Date().toLocaleDateString('sv'); }
+function calendarDateStr(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function todayStr()     { return S?.date ?? calendarDateStr(new Date()); }
 function esc(s)  { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 // escAttr also escapes the quote, for text dropped into an HTML attribute
 // (client names and notes reach title="…" in the search results).

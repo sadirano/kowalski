@@ -48,7 +48,7 @@ pub const Tour = struct {
             break :zone id;
         };
         defer gpa.free(zone_id);
-        const zone = try zone_mod.Zone.load(zone_id);
+        const zone = try t.store.loadZone();
         try demo.seed(&t.db, gpa, .{ .lang = lang, .instance = instance, .now_ms = now, .zone = &zone });
         try t.store.onStart(now);
         t.table = .{
@@ -85,7 +85,7 @@ pub const Tour = struct {
 /// provider-specific chart groups, lock pausing, and the collapsed sidebar
 /// and hidden chart, which would hide what the flows point at.
 pub const copied_settings = [_][]const u8{
-    "reporting_zone",    "daily_work_minutes", "lunch_minutes",     "paid_breaks",
+    "reporting_zone",    "day_start", "daily_work_minutes", "lunch_minutes",     "paid_breaks",
     "ui_day_order",      "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",
     "ui_show_add_entry", "ui_chart_days",      "ui_summary_format", "ui_autofill_obs",
     "ui_links",          "ui_time_format",     "ui_chart_view",      "ui_single_keys",
