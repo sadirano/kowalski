@@ -11,11 +11,12 @@ const SHORTCUTS = [
   { k: '/',           i: 'keys_search' },
   { k: '←  →',  i: 'keys_day' },
   { k: 'T',           i: 'today' },
-  { k: '1  2',        i: 'keys_tabs' },
+  { k: '1  2  3',     i: 'keys_tabs' },
   { k: 'G',           i: 'keys_calendar' },
   { k: 'C',           i: 'keys_chart' },
   { k: 'A',           i: 'keys_addentry' },
   { k: '[',           i: 'keys_sidebar' },
+  { k: 'J  K',        i: 'keys_sitting' },
   { k: '?',           i: 'keys_help' },
 ];
 
@@ -124,10 +125,14 @@ document.addEventListener('keydown', e => {
     case 'ArrowRight':  e.preventDefault(); stepDay(1);     return;
     case 't': case 'T': e.preventDefault(); goToDate(todayStr()); return;
     case '1':           e.preventDefault(); setTab('report');    return;
-    case '2':           e.preventDefault(); setTab('summary');   return;
+    case '2':           e.preventDefault(); setTab('timeline');  return;
+    case '3':           e.preventDefault(); setTab('summary');   return;
     case 'g': case 'G': e.preventDefault(); showCalendar(); return;
     case '[':           e.preventDefault(); toggleLeftPanel(); return;
     case '?':           e.preventDefault(); showKeys();     return;
+  }
+  if ((e.key === 'j' || e.key === 'k') && activeTab === 'timeline') {
+    e.preventDefault(); readerStep(e.key === 'j' ? 1 : -1); return;
   }
   if (e.key === 'c' || e.key === 'C') {
     if (activeTab === 'report') { e.preventDefault(); toggleChartVisible(); }

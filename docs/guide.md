@@ -74,7 +74,11 @@ One bar across the top holds everything you use all day, from left to right:
 
 - **Date and arrows:** the day being shown. The arrows step one day; `←` and
   `→` do the same, and `T` jumps to today.
-- **Report / Summary:** the two views of a day (`1` and `2`).
+- **Report / Timeline / Summary:** the three views of a day (`1`, `2`, `3`).
+  Timeline shows one task at a time, read top to bottom: its sittings, each
+  prompt with what came of it, and the breaks between them; click a minute
+  on the day ribbon to see what you and anything else were doing then. It
+  only reads; edit in Report.
 - **Search:** finds a task by ref, title, provider field or note text
   (`Ctrl+K` or `/`).
 - **Current task:** the round button starts, pauses and resumes tracking
@@ -287,6 +291,9 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 **Display**
 
 - Language, 12- or 24-hour time, days in the sidebar, day order, weekends.
+- Report layout: Classic (one card per task, listing its intervals) or Grid
+  (cards in columns; each task's work in blocks with their notes; click a
+  task to fold it).
 - Task order within a day: most time first, by task ID, or in the order
   they were first worked on that day.
 - Which optional buttons the command bar shows (add entry, shortcuts).
@@ -321,11 +328,12 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 | `Ctrl+K`, `/` | search |
 | `←` `→` | previous / next day |
 | `T` | today |
-| `1` `2` | report / summary |
+| `1` `2` `3` | report / timeline / summary |
 | `G` | calendar |
 | `C` | show or hide the chart |
 | `A` | add a past entry |
 | `[` | sidebar |
+| `J` `K` | next or previous sitting, in Timeline |
 | `?` | the shortcut list |
 
 Keys are the same in every language and follow the character your layout

@@ -35,10 +35,14 @@ async function loadDay(date, { chart = false } = {}) {
     id('table-area').classList.toggle('summary-view', tab === 'summary');
     renderSchedule();
     renderSidebar();
+    id('cards').parentElement.style.display = tab === 'timeline' ? 'none' : ''; // the timeline reads one task, not the day's numbers
     renderCards(D);
     if (tab === 'report') {
       renderReport(D);
       if (chart) loadChart();
+    } else if (tab === 'timeline') {
+      id('chart-box').style.display = 'none'; // the timeline has its own day ribbon
+      renderReport(D);
     } else {
       loadSummary(D, date);
     }

@@ -52,6 +52,7 @@
   </div>
   <div class="tabs" id="main-tabs">
     <div class="tab active" data-tab="report" onclick="setTab('report',this)" data-i18n="tab_report">Report</div>
+    <div class="tab" data-tab="timeline" onclick="setTab('timeline',this)" data-i18n="tab_timeline">Timeline</div>
     <div class="tab" data-tab="summary" onclick="setTab('summary',this)" data-i18n="tab_summary">Summary</div>
   </div>
   <div class="search-box">
@@ -161,6 +162,11 @@
         <div class="set-ctl"><span class="sel"><select id="set-day-order">
           <option value="oldest" data-i18n="day_order_oldest">Oldest first</option>
           <option value="newest" data-i18n="day_order_newest">Newest first</option>
+        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-report-layout"><span data-i18n="set_report_layout">Report layout</span></label>
+        <div class="set-ctl"><span class="sel"><select id="set-report-layout">
+          <option value="classic" data-i18n="report_layout_classic">Classic</option>
+          <option value="grid" data-i18n="report_layout_grid">Grid</option>
         </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
       <div class="set-row"><label class="set-lbl" for="set-task-order"><span data-i18n="set_task_order">Task order</span></label>
         <div class="set-ctl"><span class="sel"><select id="set-task-order">
@@ -459,6 +465,7 @@
 <script src="/ui/history.js"></script>
 <script src="/ui/sidebar.js"></script>
 <script src="/ui/report.js"></script>
+<script src="/ui/reader.js"></script>
 <script src="/ui/charts.js"></script>
 <script src="/ui/tour.js"></script>
 <script src="/ui/boot.js"></script>

@@ -10,6 +10,7 @@ function applyPrefs() {
   _singleKeys = pref('ui_single_keys', '1') === '1';
   _summaryFormat = pref('ui_summary_format', 'grouped');
   _taskOrder = pref('ui_task_order', 'time');
+  _reportLayout = ['grid'].includes(pref('ui_report_layout', 'classic')) ? pref('ui_report_layout', 'classic') : 'classic';
   _chartVisible = pref('ui_chart_visible', '1') === '1';
   chartDays = parseInt(pref('ui_chart_days', '14'), 10);
   if (!Number.isFinite(chartDays) || chartDays < 1) chartDays = 14;
@@ -61,6 +62,7 @@ async function showSettings() {
     id('set-show-weekends').checked = pref('ui_hide_weekends', '0') !== '1';
     id('set-summary-format').value = pref('ui_summary_format', 'grouped');
     id('set-task-order').value = pref('ui_task_order', 'time');
+    id('set-report-layout').value = _reportLayout;
     id('set-links').checked = pref('ui_links', '0') === '1';
     id('set-show-add-entry').checked = pref('ui_show_add_entry', '0') === '1';
     id('set-show-keys').checked = pref('ui_show_keys', '1') === '1';
@@ -769,6 +771,7 @@ async function applySettings() {
     ui_hide_weekends: id('set-show-weekends').checked ? '0' : '1',
     ui_summary_format: id('set-summary-format').value,
     ui_task_order: id('set-task-order').value,
+    ui_report_layout: id('set-report-layout').value,
     ui_links: id('set-links').checked ? '1' : '0',
     ui_show_add_entry: id('set-show-add-entry').checked ? '1' : '0',
     ui_show_keys: id('set-show-keys').checked ? '1' : '0',

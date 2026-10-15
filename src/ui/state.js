@@ -30,6 +30,7 @@ let _showKeys        = true;  // gate: the shortcuts button in the header
 let _singleKeys      = true;  // gate: the one-key shortcuts (N, T, arrows...)
 let _summaryFormat   = 'grouped'; // summary layout format: 'chronological' | 'grouped'
 let _taskOrder       = 'time';    // day task order: 'time' | 'ref' | 'added'
+let _reportLayout    = 'classic'; // report layout: 'classic' | 'grid' (the timeline tab is its own view)
 let _sidebarFirstRender = true; // first sidebar paint scrolls today (newest) into view
 let _calYear       = 0;     // calendar modal: displayed year
 let _calMonth      = 0;     // calendar modal: displayed month (0-based)
