@@ -69,6 +69,7 @@ fn fromUtcMs(ms: i64) !SystemTime {
 
 pub const Zone = struct {
     info: DynamicTimeZoneInformation,
+    day_start_min: u16 = 0,
 
     pub fn load(id: []const u8) !Zone {
         var index: u32 = 0;
@@ -92,23 +93,37 @@ pub const Zone = struct {
         }
     }
 
-    fn localMidnightMs(z: *const Zone, date: SystemTime) !i64 {
-        var utc: SystemTime = undefined;
-        if (TzSpecificLocalTimeToSystemTimeEx(&z.info, &date, &utc) == 0) return error.InvalidDate;
-        return utcMs(utc);
+    fn localStartMs(z: *const Zone, date: SystemTime) !i64 {
+        var shifted = date;
+        shifted.hour = @divTrunc(z.day_start_min, 60);
+        shifted.minute = @mod(z.day_start_min, 60);
+        const nominal = try utcMs(shifted);
+        for (0..1440) |minutes| {
+            const wanted = try fromUtcMs(nominal + @as(i64, @intCast(minutes)) * 60_000);
+            var utc: SystemTime = undefined;
+            if (TzSpecificLocalTimeToSystemTimeEx(&z.info, &wanted, &utc) == 0) return error.InvalidDate;
+            const result = try utcMs(utc);
+            // Windows may normalize a missing clock time into the gap. Use the
+            // first actual local minute after it, while retaining its choice
+            // of occurrence for a repeated clock time.
+            if (z.day_start_min == 0) return result;
+            const actual = try z.localOf(result);
+            if (actual.year == wanted.year and actual.month == wanted.month and actual.day == wanted.day and actual.hour == wanted.hour and actual.minute == wanted.minute) return result;
+        }
+        return error.InvalidDate;
     }
 
     pub const Bounds = struct { start_ms: i64, end_ms: i64 };
 
     pub fn dayBounds(z: *const Zone, year: u16, month: u16, day: u16) !Bounds {
-        // Bounds use UTC of local midnight; a missing midnight maps to the first valid local time after it.
-        // Windows dateOf can flip 1 ms early at a midnight DST transition; that is a data artifact.
+        // A missing local start maps to the first valid local time after it.
+        // Windows dateOf can flip 1 ms early at a DST transition; that is a data artifact.
         const local: SystemTime = .{ .year = year, .month = month, .day = day };
         const nominal = try utcMs(local);
         const next = try fromUtcMs(nominal + 86_400_000);
         return .{
-            .start_ms = try z.localMidnightMs(local),
-            .end_ms = try z.localMidnightMs(.{ .year = next.year, .month = next.month, .day = next.day }),
+            .start_ms = try z.localStartMs(local),
+            .end_ms = try z.localStartMs(.{ .year = next.year, .month = next.month, .day = next.day }),
         };
     }
 
@@ -118,6 +133,15 @@ pub const Zone = struct {
         const utc = try fromUtcMs(ms);
         var local: SystemTime = undefined;
         if (SystemTimeToTzSpecificLocalTimeEx(&z.info, &utc, &local) == 0) return error.InvalidDate;
+        // Compared as instants against the same start dayBounds uses, so a clock
+        // time that repeats when DST ends lands on one day only.
+        if (z.day_start_min != 0) {
+            const calendar: SystemTime = .{ .year = local.year, .month = local.month, .day = local.day };
+            if (ms < try z.localStartMs(calendar)) {
+                const prior = try fromUtcMs((try utcMs(calendar)) - 86_400_000);
+                return .{ .year = prior.year, .month = prior.month, .day = prior.day };
+            }
+        }
         return .{ .year = local.year, .month = local.month, .day = local.day };
     }
 
@@ -188,4 +212,49 @@ test "a missing midnight starts the day at the gap and a repeated midnight at it
     try std.testing.expectEqual(@as(i64, 1_793_505_600_000), repeat.start_ms);
     try std.testing.expectEqual(before_repeat.end_ms, repeat.start_ms);
     try std.testing.expectEqual(@as(i64, 25 * 3_600_000), repeat.end_ms - repeat.start_ms);
+}
+
+test "shifted day bounds and date follow local wall time" {
+    var utc = try Zone.load("UTC");
+    utc.day_start_min = 240;
+    const prior = try utc.dayBounds(2026, 3, 14);
+    const day = try utc.dayBounds(2026, 3, 15);
+    try std.testing.expectEqual(@as(i64, 86_400_000), day.end_ms - day.start_ms);
+    try std.testing.expectEqual(prior.end_ms, day.start_ms);
+    try std.testing.expectEqual(@as(u16, 4), (try utc.localOf(day.start_ms)).hour);
+    try std.testing.expectEqualDeep(Zone.Date{ .year = 2026, .month = 3, .day = 14 }, try utc.dateOf(day.start_ms - 1));
+    try std.testing.expectEqualDeep(Zone.Date{ .year = 2026, .month = 3, .day = 15 }, try utc.dateOf(day.start_ms));
+    try std.testing.expectEqualDeep(Zone.Date{ .year = 2026, .month = 3, .day = 14 }, try utc.dateOf(prior.start_ms + 21 * 3_600_000));
+}
+
+test "shifted bounds cross daylight transitions" {
+    var pacific = try Zone.load("Pacific Standard Time");
+    pacific.day_start_min = 240;
+    const spring = try pacific.dayBounds(2026, 3, 7);
+    const spring_day = try pacific.dayBounds(2026, 3, 8);
+    try std.testing.expectEqual(@as(i64, 23 * 3_600_000), spring.end_ms - spring.start_ms);
+    try std.testing.expectEqual(spring.end_ms, spring_day.start_ms);
+    try std.testing.expectEqualDeep(Zone.Date{ .year = 2026, .month = 3, .day = 7 }, try pacific.dateOf(spring.end_ms - 1));
+    const fall = try pacific.dayBounds(2026, 10, 31);
+    try std.testing.expectEqual(@as(i64, 25 * 3_600_000), fall.end_ms - fall.start_ms);
+    try std.testing.expectEqualDeep(Zone.Date{ .year = 2026, .month = 10, .day = 31 }, try pacific.dateOf(fall.end_ms - 1));
+    var cuba = try Zone.load("Cuba Standard Time");
+    cuba.day_start_min = 30;
+    const gap = try cuba.dayBounds(2026, 3, 8);
+    const first = try cuba.localOf(gap.start_ms);
+    try std.testing.expectEqual(@as(u16, 1), first.hour);
+    try std.testing.expectEqual(@as(u16, 0), first.minute);
+}
+
+test "with a late day start, every moment of a DST night lies inside its own day" {
+    var z = try Zone.load("Pacific Standard Time");
+    z.day_start_min = 90;
+    // 2026-11-01: clocks fall back from 02:00 to 01:00, so 01:00-02:00 happens twice.
+    const night = (try Zone.load("UTC")).dayBounds(2026, 11, 1);
+    var ms = (try night).start_ms + 6 * 3_600_000;
+    while (ms < (try night).start_ms + 12 * 3_600_000) : (ms += 15 * 60_000) {
+        const d = try z.dateOf(ms);
+        const b = try z.dayBounds(d.year, d.month, d.day);
+        try std.testing.expect(b.start_ms <= ms and ms < b.end_ms);
+    }
 }

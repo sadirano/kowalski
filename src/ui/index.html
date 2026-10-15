@@ -224,8 +224,10 @@
     </section>
     <details class="set-sec set-adv">
       <summary><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="sec_advanced">Advanced</span><svg class="ico chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
-      <div class="set-row"><label class="set-lbl" for="set-zone"><span data-i18n="set_zone">Reporting time zone</span><small data-i18n="set_zone_hint">A Windows time zone name; days start and end at its midnight.</small></label>
+      <div class="set-row"><label class="set-lbl" for="set-zone"><span data-i18n="set_zone">Reporting time zone</span><small data-i18n="set_zone_hint">A Windows time zone name for reporting days.</small></label>
         <div class="set-ctl"><input type="text" id="set-zone" class="wide" spellcheck="false" autocomplete="off"></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-day-start"><span data-i18n="set_day_start">Day starts at</span><small data-i18n="set_day_start_hint">00:00 to 12:00; work before this time belongs to the previous day.</small></label>
+        <div class="set-ctl"><input type="time" id="set-day-start" min="00:00" max="12:00" step="60"></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="set_port">HTTP port</span><small data-i18n="set_port_hint">Change it with kowalski set http_port, then restart kowalski and install the app again.</small></div>
         <div class="set-ctl"><span class="set-ro" id="set-port"></span></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="restart_btn">Restart kowalski</span><small data-i18n="restart_hint">Stops and starts the background service, for example to load a newly approved provider.</small></div>

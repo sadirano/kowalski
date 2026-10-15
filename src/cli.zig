@@ -142,6 +142,7 @@ const Saved = struct { task: Task, role: []const u8 };
 const State = struct {
     now_ms: i64,
     zone: []const u8,
+    day_start_min: u16 = 0,
     date: []const u8,
     focus: ?Interval = null,
     parallel: []Interval = &.{},
@@ -1129,7 +1130,9 @@ fn fetchState(ctx: *Context) !State {
 
 fn currentZone(ctx: *Context) !zone.Zone {
     const s = try fetchState(ctx);
-    return zone.Zone.load(s.zone);
+    var z = try zone.Zone.load(s.zone);
+    z.day_start_min = s.day_start_min;
+    return z;
 }
 
 fn status(ctx: *Context) !Exit {
@@ -1152,7 +1155,8 @@ fn renderOpen(ctx: *Context, z: *const zone.Zone, label: []const u8, i: Interval
 
 fn renderState(ctx: *Context, s: State) !void {
     const w = ctx.out;
-    const z = try zone.Zone.load(s.zone);
+    var z = try zone.Zone.load(s.zone);
+    z.day_start_min = s.day_start_min;
     if (s.focus) |f| try renderOpen(ctx, &z, "focus", f, s.now_ms) else try w.writeAll("focus     (none)\n");
     for (s.parallel) |p| try renderOpen(ctx, &z, "parallel", p, s.now_ms);
     if (s.focus == null and s.parallel.len == 0 and s.saved.len > 0) {
@@ -1188,13 +1192,15 @@ fn renderDay(ctx: *Context, body: []const u8) !void {
     const Day = struct {
         date: []const u8,
         zone: []const u8,
+        day_start_min: u16 = 0,
         numbers: Numbers,
         tasks: []struct { task: Task, focus_ms: i64, hops: u32 },
         intervals: []Interval,
         summary: ?[]const u8 = null,
     };
     const d = try parse(Day, ctx, body);
-    const z = try zone.Zone.load(d.zone);
+    var z = try zone.Zone.load(d.zone);
+    z.day_start_min = d.day_start_min;
     const w = ctx.out;
     try w.print("{s}  ", .{d.date});
     try duration(w, d.numbers.total_ms);

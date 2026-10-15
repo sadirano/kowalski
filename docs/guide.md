@@ -301,8 +301,11 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 
 **Advanced**
 
-- The reporting time zone (a Windows zone name; days start and end at its
-  midnight) and the HTTP port, which is changed with `kowalski set
+- The reporting time zone (a Windows zone name) and **Day starts at**
+  (`00:00` to `12:00`, default `00:00`): work before that time belongs to the
+  previous day, everywhere, past days included. Hours already posted keep
+  the day they were posted on.
+- The HTTP port, which is changed with `kowalski set
   http_port <n>`.
 - **Restart kowalski** stops and starts the background service.
 

@@ -127,7 +127,7 @@ function stepDay(dir) {
   do {
     d.setDate(d.getDate() + dir);
   } while (_hideWeekends && (d.getDay() === 0 || d.getDay() === 6));
-  goToDate(d.toLocaleDateString('sv'));
+  goToDate(calendarDateStr(d));
 }
 
 // Jump to an arbitrary day (from the calendar). Unlike selectDate it doesn't need

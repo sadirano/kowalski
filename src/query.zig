@@ -135,8 +135,9 @@ pub fn projectAssignmentPreview(store: *Store, a: std.mem.Allocator, scope: stor
         if (end_ms == null) try skipped.append(a, row) else try rows.append(a, row);
     }
     if (scope == .interval_ids and selected_count != scope.interval_ids.len) return error.UnknownInterval;
-    const totals = try store_mod.assignmentTotals(a, rows.items, zone_name);
-    return .{ .snapshot = .{ .project_id = target, .intervals = rows.items, .totals = totals, .reporting_zone = zone_name }, .skipped = skipped.items };
+    const z = try store.loadZone();
+    const totals = try store_mod.assignmentTotals(a, rows.items, z);
+    return .{ .snapshot = .{ .project_id = target, .intervals = rows.items, .totals = totals, .reporting_zone = zone_name, .day_start_min = z.day_start_min }, .skipped = skipped.items };
 }
 
 pub const ProjectTotal = struct { project_id: ?i64, label: []const u8, focus_ms: i64 };

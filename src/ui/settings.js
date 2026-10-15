@@ -72,6 +72,7 @@ async function showSettings() {
     await loadProjectSettings();
     loadSourceStatus().catch(e => { id('set-source-error').textContent = e.message; });
     id('set-zone').value = pref('reporting_zone', '');
+    id('set-day-start').value = pref('day_start', '00:00');
     id('set-port').textContent = pref('http_port', location.port || '47100');
     apiJSON('GET', '/api/version').then(data => {
       id('set-version').textContent = data.version;
@@ -783,6 +784,7 @@ async function applySettings() {
   };
   const zoneName = id('set-zone').value.trim();
   if (zoneName && zoneName !== pref('reporting_zone', '')) changes.reporting_zone = zoneName;
+  changes.day_start = id('set-day-start').value;
 
   try {
     const data = await apiJSON('PATCH', '/api/settings', changes);
