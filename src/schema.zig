@@ -79,14 +79,29 @@ pub fn ensure(db: *sqlite.Db) !void {
         "ALTER TABLE intervals ADD COLUMN captured INTEGER NOT NULL DEFAULT 0 CHECK(captured IN (0,1));" ++
             "ALTER TABLE notes ADD COLUMN source TEXT CHECK(source IN ('prompt','outcome'));",
     );
-    try db.exec("PRAGMA user_version=8");
+    if (version < 9) try db.exec(
+        "CREATE TABLE projects(id INTEGER PRIMARY KEY, label TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(trim(label))>0 AND label=trim(label) AND length(CAST(label AS BLOB))<=200), archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)));" ++
+            "ALTER TABLE tasks ADD COLUMN project_id INTEGER REFERENCES projects(id);" ++
+            "ALTER TABLE tasks ADD COLUMN project_choice_explicit INTEGER NOT NULL DEFAULT 0 CHECK(project_choice_explicit IN (0,1));" ++
+            "ALTER TABLE tasks ADD COLUMN project_fallback_eligible INTEGER NOT NULL DEFAULT 0 CHECK(project_fallback_eligible IN (0,1));" ++
+            "CREATE INDEX tasks_project ON tasks(project_id);" ++
+            "ALTER TABLE intervals ADD COLUMN project_id INTEGER REFERENCES projects(id);" ++
+            "ALTER TABLE intervals ADD COLUMN posting_span_id INTEGER;" ++
+            "CREATE INDEX intervals_project_start ON intervals(project_id,start_ms);" ++
+            "ALTER TABLE saved_set ADD COLUMN project_id INTEGER REFERENCES projects(id);" ++
+            "CREATE TABLE capture_project_keys(source TEXT NOT NULL, project_key TEXT NOT NULL, project_id INTEGER NOT NULL REFERENCES projects(id), project_hint TEXT NOT NULL, PRIMARY KEY(source,project_key));" ++
+            "CREATE INDEX capture_project_keys_project ON capture_project_keys(project_id);" ++
+            "ALTER TABLE capture_runs ADD COLUMN project_id INTEGER REFERENCES projects(id);" ++
+            "ALTER TABLE capture_runs ADD COLUMN project_key TEXT;",
+    );
+    try db.exec("PRAGMA user_version=9");
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
     if (try check.step() != .done) return error.ForeignKeyViolation;
     try tx.commit();
 }
 
-pub const current: i64 = 8;
+pub const current: i64 = 9;
 
 const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
@@ -170,6 +185,11 @@ test "schema constraints and version" {
     defer db.close();
     try ensure(&db);
     try ensure(&db);
+    try std.testing.expectEqual(@as(i64, 9), try scalar(&db, "PRAGMA user_version"));
+    try db.exec("INSERT INTO projects(label) VALUES('fresh')");
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('FRESH')"));
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('')"));
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES(' trim ')"));
     try db.exec("INSERT INTO tasks(id,title,created_ms) VALUES(1,'A',0),(2,'B',0)");
     try db.exec("INSERT INTO intervals(task_id,role,start_ms,opened_by) VALUES(1,'focus',10,'switch')");
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO intervals(task_id,role,start_ms,opened_by) VALUES(1,'parallel',11,'parallel')"));
@@ -184,7 +204,7 @@ test "schema constraints and version" {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO lunches(out_ms) VALUES(2)"));
     try db.exec("UPDATE lunches SET back_ms=3");
     try db.exec("INSERT INTO lunches(out_ms) VALUES(4)");
-    try db.exec("PRAGMA user_version=9");
+    try db.exec("PRAGMA user_version=10");
     try std.testing.expectError(error.SchemaVersion, ensure(&db));
 }
 
@@ -204,8 +224,8 @@ fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
     return stmt.columnI64(0);
 }
 
-fn assertV5(db: *sqlite.Db) !void {
-    try std.testing.expectEqual(@as(i64, 8), try scalar(db, "PRAGMA user_version"));
+fn assertV9(db: *sqlite.Db) !void {
+    try std.testing.expectEqual(@as(i64, 9), try scalar(db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
     try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
     try std.testing.expectEqual(@as(i64, 12), try scalar(db, "SELECT id FROM intervals"));
@@ -214,6 +234,8 @@ fn assertV5(db: *sqlite.Db) !void {
     try std.testing.expectEqual(@as(i64, 14), try scalar(db, "SELECT id FROM postings"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM intervals WHERE opened_by='switch' AND closed_by='stop' AND text='work'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM postings WHERE covered_start_ms=1 AND covered_end_ms=2 AND amount_micro=1000000"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM tasks WHERE project_id IS NULL AND project_choice_explicit=0 AND project_fallback_eligible=0"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM intervals WHERE project_id IS NULL AND posting_span_id IS NULL"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM sqlite_master WHERE name IN ('imports','import_settings')"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='import_id'"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(db, "SELECT count(*) FROM pragma_table_info('intervals') WHERE name='import_id'"));
@@ -228,18 +250,18 @@ fn assertV5(db: *sqlite.Db) !void {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES('2026-03-10',11,'example','bad','confirmed','1',1,1,2,1)"));
 }
 
-test "v3 and v4 history upgrades to v5" {
+test "v3 and v4 history upgrades to v9" {
     for ([_]i64{ 3, 4 }) |version| {
         var db: sqlite.Db = .{};
         try db.open(":memory:");
         defer db.close();
         try legacyFixture(&db, version);
         try ensure(&db);
-        try assertV5(&db);
+        try assertV9(&db);
     }
 }
 
-test "fresh v5 has no import provenance" {
+test "fresh v9 has no import provenance" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
@@ -260,7 +282,7 @@ test "file upgrade makes a v4 backup, current file does not" {
     try db.open(path);
     try legacyFixture(&db, 4);
     try ensure(&db);
-    try assertV5(&db);
+    try assertV9(&db);
     try ensure(&db);
     db.close();
     const current_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/current.db", .{tmp.sub_path});
@@ -289,7 +311,7 @@ test "file upgrade makes a v4 backup, current file does not" {
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
-test "populated v5 upgrades to v6 without changing history or trust" {
+test "populated v5 upgrades to v9 without changing history or trust" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const a = std.testing.allocator;
@@ -305,7 +327,7 @@ test "populated v5 upgrades to v6 without changing history or trust" {
     const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try db.exec("INSERT INTO provider_trust(id,sha256,how,approved_ms,last_good,loading) VALUES(1,'" ++ sha ++ "','compared',7,'" ++ sha ++ "','" ++ sha ++ "')");
     try ensure(&db);
-    try assertV5(&db);
+    try assertV9(&db);
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM provider_trust WHERE mode='manual' AND loading='" ++ sha ++ "' AND last_good='" ++ sha ++ "'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM provider_quarantine WHERE sha256='" ++ sha ++ "'"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT value FROM provider_generation WHERE id=1"));
@@ -318,5 +340,68 @@ test "populated v5 upgrades to v6 without changing history or trust" {
     while (try it.next(std.testing.io)) |entry| {
         if (std.mem.startsWith(u8, entry.name, "backup-v5-")) backups += 1;
     }
+    try std.testing.expectEqual(@as(usize, 1), backups);
+}
+
+test "populated v8 upgrades to v9 in place with one v8 backup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/populated-v8.db", .{tmp.sub_path});
+    defer a.free(path);
+    var db: sqlite.Db = .{};
+    try db.open(path);
+    try ensure(&db);
+    try db.exec(
+        "PRAGMA foreign_keys=OFF;" ++
+        "DROP INDEX tasks_project;DROP INDEX intervals_project_start;DROP INDEX capture_project_keys_project;" ++
+        "ALTER TABLE capture_runs DROP COLUMN project_key;ALTER TABLE capture_runs DROP COLUMN project_id;" ++
+        "ALTER TABLE saved_set DROP COLUMN project_id;" ++
+        "ALTER TABLE intervals DROP COLUMN posting_span_id;ALTER TABLE intervals DROP COLUMN project_id;" ++
+        "ALTER TABLE tasks DROP COLUMN project_fallback_eligible;ALTER TABLE tasks DROP COLUMN project_choice_explicit;ALTER TABLE tasks DROP COLUMN project_id;" ++
+        "DROP TABLE capture_project_keys;DROP TABLE projects;PRAGMA user_version=8;PRAGMA foreign_keys=ON;",
+    );
+    try db.exec(
+        "INSERT INTO tasks(id,title,created_ms) VALUES(17,'synthetic',100);" ++
+        "INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by,text,captured) VALUES(18,17,'focus',100,200,'switch','stop','work',1);" ++
+        "INSERT INTO notes(id,interval_id,at_ms,text,source) VALUES(19,18,150,'note','prompt');" ++
+        "INSERT INTO day_summaries(day,text) VALUES('2026-03-10','summary');" ++
+        "INSERT INTO postings(id,day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,provider_data,created_ms,confirmed_ms,covered_start_ms,covered_end_ms) VALUES(20,'2026-03-10',17,'synthetic','r','confirmed','0.5',500000,'{}',100,200,100,200);" ++
+        "INSERT INTO capture_runs(source,run,task_id,attended,working,started_ms) VALUES('agent','run',17,1,0,100);" ++
+        "INSERT INTO saved_set(task_id,role) VALUES(17,'focus');",
+    );
+    try ensure(&db);
+    try ensure(&db);
+    try std.testing.expectEqual(@as(i64, 9), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND start_ms=100 AND end_ms=200 AND text='work' AND captured=1 AND project_id IS NULL AND posting_span_id IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND project_id IS NULL AND project_choice_explicit=0 AND project_fallback_eligible=0"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=19 AND interval_id=18 AND at_ms=150 AND text='note' AND source='prompt'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM day_summaries WHERE day='2026-03-10' AND text='summary'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM postings WHERE id=20 AND task_id=17 AND amount_text='0.5' AND amount_micro=500000 AND provider_data='{}' AND covered_start_ms=100 AND covered_end_ms=200"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM capture_runs WHERE source='agent' AND run='run' AND project_id IS NULL AND project_key IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM saved_set WHERE task_id=17 AND project_id IS NULL"));
+    var check = try db.prepare("PRAGMA foreign_key_check");
+    defer check.finalize();
+    try std.testing.expectEqual(.done, try check.step());
+    try db.exec("INSERT INTO projects(id,label) VALUES(1,'alpha')");
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('ALPHA')"));
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES(' blank ')"));
+    try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label,archived) VALUES('wrong',2)"));
+    try std.testing.expectError(error.Sqlite, db.exec("UPDATE tasks SET project_id=999 WHERE id=17"));
+    db.close();
+    var dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    var backups: usize = 0;
+    while (try it.next(std.testing.io)) |entry| if (std.mem.startsWith(u8, entry.name, "backup-v8-")) {
+        backups += 1;
+        const backup_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, entry.name });
+        defer a.free(backup_path);
+        var copy: sqlite.Db = .{};
+        try copy.openReadOnly(backup_path);
+        defer copy.close();
+        try std.testing.expectEqual(@as(i64, 8), try scalar(&copy, "PRAGMA user_version"));
+        try std.testing.expectEqual(@as(i64, 1), try scalar(&copy, "SELECT count(*) FROM postings WHERE id=20 AND covered_start_ms=100 AND covered_end_ms=200"));
+    };
     try std.testing.expectEqual(@as(usize, 1), backups);
 }

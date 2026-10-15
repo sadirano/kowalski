@@ -26,6 +26,7 @@ pub const Error = error{
     PostingBlocked,
     InvalidSetting,
     InvalidTime,
+    InvalidDate,
     UnknownInterval,
     UnknownNote,
     /// The interval changed since the caller read it.
@@ -42,12 +43,65 @@ pub const Error = error{
     TaskHasPostings,
     /// A task with an open interval is stopped before it is deleted.
     TaskOpen,
+    UnknownProject,
+    DuplicateProject,
+    InvalidProjectLabel,
+    InvalidProjectKey,
+    AmbiguousTask,
 };
 
 /// Times outside [0, max_time_ms) (years 1970..9999) are refused.
 pub const max_time_ms: i64 = 253_402_300_800_000;
 
 pub const Role = enum { focus, parallel };
+pub const ProjectChoice = union(enum) { omitted, selected: ?i64 };
+pub const AssignmentScope = union(enum) { task_id: i64, interval_ids: []const i64, unassigned_suggestions };
+pub const AssignmentRow = struct {
+    id: i64,
+    task_id: i64,
+    project_id: ?i64,
+    role: []const u8,
+    start_ms: i64,
+    end_ms: ?i64,
+    focus_ms: i64,
+    reason: []const u8 = "selected",
+};
+pub const AssignmentTotal = struct { project_id: ?i64, date: []const u8, focus_ms: i64 };
+pub const AssignmentSnapshot = struct {
+    project_id: ?i64,
+    intervals: []const AssignmentRow,
+    totals: []const AssignmentTotal,
+    reporting_zone: []const u8,
+};
+pub const AssignmentPreview = struct { snapshot: AssignmentSnapshot, skipped: []const AssignmentRow };
+pub const AssignmentResult = struct { changed: usize, focus_ms: i64 };
+
+pub fn assignmentTotals(a: std.mem.Allocator, rows: []const AssignmentRow, zone_name: []const u8) ![]AssignmentTotal {
+    const z = try zone.Zone.load(zone_name);
+    var totals: std.ArrayList(AssignmentTotal) = .empty;
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.role, "focus")) continue;
+        const end = row.end_ms orelse continue;
+        var at = row.start_ms;
+        while (at < end) {
+            const d = try z.dateOf(at);
+            const bounds = try z.dayBounds(d.year, d.month, d.day);
+            const next = @min(end, bounds.end_ms);
+            const day = try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+            var found = false;
+            for (totals.items) |*total| {
+                if (total.project_id == row.project_id and std.mem.eql(u8, total.date, day)) {
+                    total.focus_ms += next - at;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try totals.append(a, .{ .project_id = row.project_id, .date = day, .focus_ms = next - at }) else a.free(day);
+            at = next;
+        }
+    }
+    return totals.toOwnedSlice(a);
+}
 
 /// One event from an outside time source; see `Store.capture`.
 pub const CaptureKind = enum { start, subject, prompt, busy, stop, end };
@@ -66,7 +120,13 @@ pub const Capture = struct {
     /// A note for the run's open interval: the prompt's text on `prompt`,
     /// what came of the turn on `stop`. Written once per event id.
     note: ?[]const u8 = null,
+    subject: ?[]const u8 = null,
+    default_subject: ?[]const u8 = null,
+    project_key: ?[]const u8 = null,
+    project_hint: ?[]const u8 = null,
+    first_prompt: ?[]const u8 = null,
 };
+pub const CaptureResult = struct { applied: bool, project_id: ?i64, task_id: ?i64 };
 /// A working run that sends nothing for this long is taken as gone.
 pub const capture_lease_ms: i64 = 20 * 60_000;
 /// A run's task stays open this long after its turn ends, so the next
@@ -83,6 +143,297 @@ fn sqlText(value: anytype) []const u8 {
 pub const Store = struct {
     db: *sqlite.Db,
     allocator: std.mem.Allocator,
+
+    fn validProjectLabel(label: []const u8) bool {
+        return label.len > 0 and label.len <= 200 and
+            std.mem.eql(u8, label, std.mem.trim(u8, label, " \t\r\n")) and
+            std.unicode.utf8ValidateSlice(label);
+    }
+
+    fn projectExists(s: *Store, id: i64) !bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM projects WHERE id=?1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, id);
+        return try stmt.step() == .row;
+    }
+
+    fn projectByLabel(s: *Store, label: []const u8) !?i64 {
+        var stmt = try s.db.prepare("SELECT id FROM projects WHERE label=?1 COLLATE NOCASE");
+        defer stmt.finalize();
+        try stmt.bindText(1, label);
+        return if (try stmt.step() == .row) stmt.columnI64(0) else null;
+    }
+
+    fn insertProject(s: *Store, label: []const u8) !i64 {
+        if (!validProjectLabel(label)) return error.InvalidProjectLabel;
+        if (try s.projectByLabel(label) != null) return error.DuplicateProject;
+        var stmt = try s.db.prepare("INSERT INTO projects(label) VALUES(?1) RETURNING id");
+        defer stmt.finalize();
+        try stmt.bindText(1, label);
+        if (try stmt.step() != .row) return error.Sqlite;
+        const id = stmt.columnI64(0);
+        if (try stmt.step() != .done) return error.Sqlite;
+        return id;
+    }
+
+    pub fn createProject(s: *Store, label: []const u8, now_ms: i64) Error!i64 {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        const id = try s.insertProject(label);
+        try tx.commit();
+        return id;
+    }
+
+    pub fn renameProject(s: *Store, id: i64, label: []const u8, now_ms: i64) Error!void {
+        if (!validProjectLabel(label)) return error.InvalidProjectLabel;
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (!try s.projectExists(id)) return error.UnknownProject;
+        if (try s.projectByLabel(label)) |other| if (other != id) return error.DuplicateProject;
+        var stmt = try s.db.prepare("UPDATE projects SET label=?1 WHERE id=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, label);
+        try stmt.bindI64(2, id);
+        _ = try stmt.step();
+        try tx.commit();
+    }
+
+    pub fn archiveProject(s: *Store, id: i64, archived: bool, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (!try s.projectExists(id)) return error.UnknownProject;
+        var stmt = try s.db.prepare("UPDATE projects SET archived=?1 WHERE id=?2");
+        defer stmt.finalize();
+        try stmt.bindI64(1, @intFromBool(archived));
+        try stmt.bindI64(2, id);
+        _ = try stmt.step();
+        try tx.commit();
+    }
+
+    pub fn setTaskProject(s: *Store, task: i64, project: ?i64, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (project) |id| if (!try s.projectExists(id)) return error.UnknownProject;
+        var stmt = try s.db.prepare("UPDATE tasks SET project_id=?1,project_choice_explicit=1,project_fallback_eligible=0 WHERE id=?2");
+        defer stmt.finalize();
+        if (project) |id| try stmt.bindI64(1, id) else try stmt.bindNull(1);
+        try stmt.bindI64(2, task);
+        _ = try stmt.step();
+        if (s.db.changes() == 0) return error.UnknownTask;
+        try tx.commit();
+    }
+
+    pub fn updateTask(s: *Store, task: i64, title: ?[]const u8, choice: ProjectChoice, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (title) |value| {
+            if (value.len == 0) return error.EmptyText;
+            var rename = try s.db.prepare("UPDATE tasks SET title=?1 WHERE id=?2");
+            defer rename.finalize();
+            try rename.bindText(1, value);
+            try rename.bindI64(2, task);
+            _ = try rename.step();
+            if (s.db.changes() == 0) return error.UnknownTask;
+        }
+        if (choice == .selected) {
+            if (choice.selected) |id| if (!try s.projectExists(id)) return error.UnknownProject;
+            var assign = try s.db.prepare("UPDATE tasks SET project_id=?1,project_choice_explicit=1,project_fallback_eligible=0 WHERE id=?2");
+            defer assign.finalize();
+            if (choice.selected) |id| try assign.bindI64(1, id) else try assign.bindNull(1);
+            try assign.bindI64(2, task);
+            _ = try assign.step();
+            if (s.db.changes() == 0) return error.UnknownTask;
+        }
+        try tx.commit();
+    }
+
+    pub fn applyProjectAssign(s: *Store, snapshot: AssignmentSnapshot, target: ?i64, now_ms: i64) Error!AssignmentResult {
+        if (now_ms < 0 or now_ms >= max_time_ms) return error.InvalidTime;
+        var tx = try s.db.transaction();
+        defer tx.deinit();
+        if (target != snapshot.project_id) return error.Stale;
+        if (target) |id| if (!try s.projectExists(id)) return error.UnknownProject;
+        const zone_setting = try s.getSetting("reporting_zone");
+        defer if (zone_setting) |name| s.allocator.free(name);
+        if (!std.mem.eql(u8, snapshot.reporting_zone, zone_setting orelse "UTC")) return error.Stale;
+        var focus_ms: i64 = 0;
+        for (snapshot.intervals, 0..) |row, i| {
+            if (row.end_ms == null or row.project_id == target) return error.Stale;
+            for (snapshot.intervals[0..i]) |prior| if (prior.id == row.id) return error.Stale;
+            var stmt = try s.db.prepare("SELECT task_id,project_id,role,start_ms,end_ms FROM intervals WHERE id=?1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, row.id);
+            if (try stmt.step() != .row) return error.Stale;
+            const old_project: ?i64 = if (stmt.columnIsNull(1)) null else stmt.columnI64(1);
+            if (stmt.columnIsNull(4) or stmt.columnI64(0) != row.task_id or old_project != row.project_id or
+                !std.mem.eql(u8, stmt.columnText(2).?, row.role) or stmt.columnI64(3) != row.start_ms or
+                stmt.columnI64(4) != row.end_ms.?) return error.Stale;
+            const actual_focus: i64 = if (std.mem.eql(u8, row.role, "focus")) row.end_ms.? - row.start_ms else 0;
+            if (actual_focus != row.focus_ms) return error.Stale;
+            focus_ms += actual_focus;
+        }
+        const totals = try assignmentTotals(s.allocator, snapshot.intervals, snapshot.reporting_zone);
+        defer {
+            for (totals) |total| s.allocator.free(total.date);
+            s.allocator.free(totals);
+        }
+        if (totals.len != snapshot.totals.len) return error.Stale;
+        for (totals) |total| {
+            var found = false;
+            for (snapshot.totals) |reviewed| if (total.project_id == reviewed.project_id and std.mem.eql(u8, total.date, reviewed.date) and total.focus_ms == reviewed.focus_ms) { found = true; break; };
+            if (!found) return error.Stale;
+        }
+        for (snapshot.intervals) |row| {
+            var stmt = try s.db.prepare("UPDATE intervals SET project_id=?1 WHERE id=?2");
+            defer stmt.finalize();
+            if (target) |id| try stmt.bindI64(1, id) else try stmt.bindNull(1);
+            try stmt.bindI64(2, row.id);
+            _ = try stmt.step();
+            try s.markEdited(row.start_ms, row.end_ms.?, now_ms);
+        }
+        try tx.commit();
+        return .{ .changed = snapshot.intervals.len, .focus_ms = focus_ms };
+    }
+
+    pub fn setCaptureProjectKey(s: *Store, source: []const u8, key: []const u8, hint: []const u8, project: i64, now_ms: i64) Error!void {
+        if (key.len == 0 or key.len > 2048 or hint.len > 200) return error.InvalidProjectLabel;
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (!try s.projectExists(project)) return error.UnknownProject;
+        var stmt = try s.db.prepare("INSERT INTO capture_project_keys(source,project_key,project_id,project_hint) VALUES(?1,?2,?3,?4) ON CONFLICT(source,project_key) DO UPDATE SET project_id=excluded.project_id,project_hint=excluded.project_hint");
+        defer stmt.finalize();
+        try stmt.bindText(1, source);
+        try stmt.bindText(2, key);
+        try stmt.bindI64(3, project);
+        try stmt.bindText(4, hint);
+        _ = try stmt.step();
+        try tx.commit();
+    }
+
+    fn mappedProject(s: *Store, source: []const u8, key: []const u8) !?i64 {
+        var stmt = try s.db.prepare("SELECT project_id FROM capture_project_keys WHERE source=?1 AND project_key=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, source);
+        try stmt.bindText(2, key);
+        return if (try stmt.step() == .row) stmt.columnI64(0) else null;
+    }
+
+    fn uniqueCaptureLabel(s: *Store, source: []const u8, key: []const u8, hint: []const u8) ![]const u8 {
+        const base = std.mem.trim(u8, hint, " \t\r\n");
+        if (!validProjectLabel(base)) return error.InvalidProjectLabel;
+        if (try s.projectByLabel(base) == null) return try s.allocator.dupe(u8, base);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(source);
+        hasher.update(&.{0});
+        hasher.update(key);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        const alphabet = "0123456789abcdef";
+        var hex: [64]u8 = undefined;
+        for (digest, 0..) |byte, i| {
+            hex[i * 2] = alphabet[byte >> 4];
+            hex[i * 2 + 1] = alphabet[byte & 15];
+        }
+        var prefix: usize = 8;
+        var number: usize = 0;
+        while (true) {
+            var suffix_buf: [96]u8 = undefined;
+            const suffix = if (number == 0)
+                try std.fmt.bufPrint(&suffix_buf, "-{s}", .{hex[0..prefix]})
+            else
+                try std.fmt.bufPrint(&suffix_buf, "-{s}-{d}", .{ hex, number });
+            var base_len = @min(base.len, 200 - suffix.len);
+            while (base_len > 0 and !std.unicode.utf8ValidateSlice(base[0..base_len])) : (base_len -= 1) {}
+            const label = try std.mem.concat(s.allocator, u8, &.{ base[0..base_len], suffix });
+            if (try s.projectByLabel(label) == null) return label;
+            s.allocator.free(label);
+            if (prefix < 64) prefix = @min(64, prefix + 4) else number += 1;
+        }
+    }
+
+    fn resolveCaptureProject(s: *Store, source: []const u8, key: ?[]const u8, hint: ?[]const u8, task: ?i64) !?i64 {
+        if (key) |k| {
+            if (k.len == 0 or k.len > 2048) return error.InvalidProjectKey;
+            if (try s.mappedProject(source, k)) |id| return id;
+            const raw = hint orelse return error.InvalidProjectLabel;
+            if (raw.len > 200) return error.InvalidProjectLabel;
+            const label = try s.uniqueCaptureLabel(source, k, raw);
+            defer s.allocator.free(label);
+            const id = try s.insertProject(label);
+            var stmt = try s.db.prepare("INSERT INTO capture_project_keys(source,project_key,project_id,project_hint) VALUES(?1,?2,?3,?4)");
+            defer stmt.finalize();
+            try stmt.bindText(1, source);
+            try stmt.bindText(2, k);
+            try stmt.bindI64(3, id);
+            try stmt.bindText(4, std.mem.trim(u8, raw, " \t\r\n"));
+            _ = try stmt.step();
+            return id;
+        }
+        return if (task) |t| try s.taskProject(t) else null;
+    }
+
+    fn resolveCaptureTask(s: *Store, text: []const u8, scope: ?i64, now_ms: i64) !i64 {
+        const title = std.mem.trim(u8, text, " \t");
+        if (title.len == 0) return error.EmptyText;
+        if (title[0] == '#') {
+            const id = std.fmt.parseInt(i64, title[1..], 10) catch return error.UnknownTask;
+            var by_id = try s.db.prepare("SELECT 1 FROM tasks WHERE id=?1");
+            defer by_id.finalize();
+            try by_id.bindI64(1, id);
+            if (try by_id.step() != .row) return error.UnknownTask;
+            return id;
+        }
+        const steps = [_][]const u8{
+            "SELECT task_id FROM task_bindings WHERE external_ref=?1 ORDER BY task_id LIMIT 2",
+            "SELECT id FROM tasks WHERE title=?1 COLLATE NOCASE AND project_id IS ?2 ORDER BY id LIMIT 2",
+        };
+        for (steps, 0..) |sql, i| {
+            var stmt = try s.db.prepare(sql);
+            defer stmt.finalize();
+            try stmt.bindText(1, title);
+            if (i == 1) {
+                if (scope) |id| try stmt.bindI64(2, id) else try stmt.bindNull(2);
+            }
+            if (try stmt.step() == .row) {
+                const id = stmt.columnI64(0);
+                if (try stmt.step() == .row) return error.AmbiguousTask;
+                return id;
+            }
+        }
+        return s.insertTask(title, .{ .selected = scope }, now_ms);
+    }
+
+    fn sessionTitle(s: *Store, seed: ?[]const u8) ![]const u8 {
+        const raw = seed orelse "";
+        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidCharacter;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(s.allocator);
+        var i: usize = 0;
+        var points: usize = 0;
+        var pending_space = false;
+        while (i < raw.len and points < 60) {
+            const width = std.unicode.utf8ByteSequenceLength(raw[i]) catch return error.InvalidCharacter;
+            const part = raw[i .. i + width];
+            if (width == 1 and std.ascii.isWhitespace(part[0])) {
+                if (out.items.len > 0) pending_space = true;
+            } else {
+                if (pending_space) {
+                    try out.append(s.allocator, ' ');
+                    pending_space = false;
+                    points += 1;
+                    if (points == 60) break;
+                }
+                try out.appendSlice(s.allocator, part);
+                points += 1;
+            }
+            i += width;
+        }
+        if (out.items.len == 0) {
+            out.deinit(s.allocator);
+            return s.allocator.dupe(u8, "Session");
+        }
+        return out.toOwnedSlice(s.allocator);
+    }
 
     pub fn init(db: *sqlite.Db, allocator: std.mem.Allocator) Error!Store {
         try schema.ensure(db);
@@ -179,18 +530,50 @@ pub const Store = struct {
     }
 
     pub fn createTask(s: *Store, title: []const u8, now_ms: i64) Error!i64 {
+        return s.createTaskWithProject(title, .omitted, now_ms);
+    }
+
+    pub fn createTaskWithProject(s: *Store, title: []const u8, choice: ProjectChoice, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
         if (title.len == 0) return error.EmptyText;
-        var stmt = try s.db.prepare("INSERT INTO tasks(title,created_ms) VALUES(?1,?2) RETURNING id");
+        const id = try s.insertTask(title, choice, now_ms);
+        try tx.commit();
+        return id;
+    }
+
+    fn insertTask(s: *Store, title: []const u8, choice: ProjectChoice, now_ms: i64) !i64 {
+        const project: ?i64 = switch (choice) { .omitted => null, .selected => |id| id };
+        if (project) |id| if (!try s.projectExists(id)) return error.UnknownProject;
+        var stmt = try s.db.prepare("INSERT INTO tasks(title,created_ms,project_id,project_choice_explicit,project_fallback_eligible) VALUES(?1,?2,?3,?4,?5) RETURNING id");
         defer stmt.finalize();
         try stmt.bindText(1, title);
         try stmt.bindI64(2, now_ms);
+        if (project) |id| try stmt.bindI64(3, id) else try stmt.bindNull(3);
+        try stmt.bindI64(4, if (choice == .omitted) 0 else 1);
+        try stmt.bindI64(5, if (choice == .omitted) 1 else 0);
         if (try stmt.step() != .row) return error.Sqlite;
         const id = stmt.columnI64(0);
         if (try stmt.step() != .done) return error.Sqlite;
-        try tx.commit();
         return id;
+    }
+
+    fn taskProject(s: *Store, task: i64) !?i64 {
+        var stmt = try s.db.prepare("SELECT project_id FROM tasks WHERE id=?1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        if (try stmt.step() == .done) return error.UnknownTask;
+        return if (stmt.columnIsNull(0)) null else stmt.columnI64(0);
+    }
+
+    fn chosenProject(s: *Store, task: i64, choice: ProjectChoice) !?i64 {
+        return switch (choice) {
+            .omitted => try s.taskProject(task),
+            .selected => |id| blk: {
+                if (id) |v| if (!try s.projectExists(v)) return error.UnknownProject;
+                break :blk id;
+            },
+        };
     }
 
     pub fn setTitle(s: *Store, task: i64, title: []const u8, now_ms: i64) Error!void {
@@ -227,7 +610,34 @@ pub const Store = struct {
         try stmt.bindText(3, ref);
         _ = try stmt.step();
         for (values) |v| try s.putField(task, v.name, v.value);
+        try s.applyProviderProjectFallback(task, values);
         try tx.commit();
+    }
+
+    fn applyProviderProjectFallback(s: *Store, task: i64, values: []const FieldValue) !void {
+        var eligible = try s.db.prepare("SELECT project_fallback_eligible FROM tasks WHERE id=?1");
+        defer eligible.finalize();
+        try eligible.bindI64(1, task);
+        if (try eligible.step() != .row or eligible.columnI64(0) == 0) return;
+        var consume = try s.db.prepare("UPDATE tasks SET project_fallback_eligible=0 WHERE id=?1");
+        defer consume.finalize();
+        try consume.bindI64(1, task);
+        _ = try consume.step();
+        var setting = try s.db.prepare("SELECT value FROM settings WHERE key='project_provider_field'");
+        defer setting.finalize();
+        if (try setting.step() != .row) return;
+        const name = setting.columnText(0).?;
+        if (name.len == 0) return;
+        for (values) |v| if (std.mem.eql(u8, v.name, name)) {
+            if (!validProjectLabel(v.value)) return;
+            const project = (try s.projectByLabel(v.value)) orelse try s.insertProject(v.value);
+            var update = try s.db.prepare("UPDATE tasks SET project_id=?1 WHERE id=?2");
+            defer update.finalize();
+            try update.bindI64(1, project);
+            try update.bindI64(2, task);
+            _ = try update.step();
+            return;
+        };
     }
 
     pub fn taskByBinding(s: *Store, instance: []const u8, ref: []const u8) Error!?i64 {
@@ -279,7 +689,7 @@ pub const Store = struct {
         return floor;
     }
 
-    fn openInterval(s: *Store, task: i64, role: Role, reason: OpenedBy, text: ?[]const u8, now_ms: i64) !i64 {
+    fn openInterval(s: *Store, task: i64, role: Role, reason: OpenedBy, text: ?[]const u8, project: ?i64, now_ms: i64) !i64 {
         {
             // Any new activity ends a lunch break.
             var lunch_end = try s.db.prepare("UPDATE lunches SET back_ms=max(out_ms,?1) WHERE back_ms IS NULL");
@@ -287,13 +697,14 @@ pub const Store = struct {
             try lunch_end.bindI64(1, now_ms);
             _ = try lunch_end.step();
         }
-        var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,opened_by,text) VALUES(?1,?2,?3,?4,?5) RETURNING id");
+        var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,opened_by,text,project_id) VALUES(?1,?2,?3,?4,?5,?6) RETURNING id");
         defer stmt.finalize();
         try stmt.bindI64(1, task);
         try stmt.bindText(2, sqlText(role));
         try stmt.bindI64(3, now_ms);
         try stmt.bindText(4, sqlText(reason));
         try stmt.bindOptionalText(5, text);
+        if (project) |id| try stmt.bindI64(6, id) else try stmt.bindNull(6);
         if (try stmt.step() != .row) return error.Sqlite;
         const id = stmt.columnI64(0);
         if (try stmt.step() != .done) return error.Sqlite;
@@ -309,19 +720,38 @@ pub const Store = struct {
     }
 
     pub fn switchTo(s: *Store, task: i64, text: ?[]const u8, now_ms: i64) Error!i64 {
+        return s.switchToProject(task, text, .omitted, now_ms);
+    }
+
+    pub fn switchToProject(s: *Store, task: i64, text: ?[]const u8, choice: ProjectChoice, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        const project = try s.chosenProject(task, choice);
+        var split_span: ?i64 = null;
+        var split_id: ?i64 = null;
         {
-            var focus = try s.db.prepare("SELECT id,task_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+            var focus = try s.db.prepare("SELECT id,task_id,project_id,posting_span_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
             defer focus.finalize();
             if (try focus.step() == .row and focus.columnI64(1) == task) {
                 const id = focus.columnI64(0);
-                try tx.commit();
-                return id;
+                const current_project: ?i64 = if (focus.columnIsNull(2)) null else focus.columnI64(2);
+                if (choice == .omitted or current_project == project) {
+                    try tx.commit();
+                    return id;
+                }
+                split_span = if (focus.columnIsNull(3)) id else focus.columnI64(3);
+                split_id = id;
             }
         }
         const at = try s.intervalTime(now_ms);
         try s.closeFocus(.@"switch", at);
+        if (split_span) |span| {
+            var mark = try s.db.prepare("UPDATE intervals SET posting_span_id=?1 WHERE id=?2");
+            defer mark.finalize();
+            try mark.bindI64(1, span);
+            try mark.bindI64(2, split_id.?);
+            _ = try mark.step();
+        }
         {
             var stmt = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,?1),closed_by='switch' WHERE end_ms IS NULL AND role='parallel' AND task_id=?2");
             defer stmt.finalize();
@@ -329,7 +759,14 @@ pub const Store = struct {
             try stmt.bindI64(2, task);
             _ = try stmt.step();
         }
-        const id = try s.openInterval(task, .focus, .@"switch", text, at);
+        const id = try s.openInterval(task, .focus, .@"switch", text, project, at);
+        if (split_span) |span| {
+            var mark = try s.db.prepare("UPDATE intervals SET posting_span_id=?1 WHERE id=?2");
+            defer mark.finalize();
+            try mark.bindI64(1, span);
+            try mark.bindI64(2, id);
+            _ = try mark.step();
+        }
         try s.db.exec("DELETE FROM saved_set");
         try s.heartbeat(at);
         try tx.commit();
@@ -337,8 +774,13 @@ pub const Store = struct {
     }
 
     pub fn openParallel(s: *Store, task: i64, text: ?[]const u8, now_ms: i64) Error!i64 {
+        return s.openParallelProject(task, text, .omitted, now_ms);
+    }
+
+    pub fn openParallelProject(s: *Store, task: i64, text: ?[]const u8, choice: ProjectChoice, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        const project = try s.chosenProject(task, choice);
         {
             var stmt = try s.db.prepare("SELECT 1 FROM intervals WHERE task_id=?1 AND end_ms IS NULL");
             defer stmt.finalize();
@@ -346,7 +788,7 @@ pub const Store = struct {
             if (try stmt.step() == .row) return error.AlreadyOpen;
         }
         const at = try s.intervalTime(now_ms);
-        const id = try s.openInterval(task, .parallel, .parallel, text, at);
+        const id = try s.openInterval(task, .parallel, .parallel, text, project, at);
         try s.db.exec("DELETE FROM saved_set");
         try s.heartbeat(at);
         try tx.commit();
@@ -371,6 +813,10 @@ pub const Store = struct {
     /// attended run the user last prompted holds the focus, other working
     /// runs run in parallel. Returns false for an event id already applied.
     pub fn capture(s: *Store, c: Capture, now_ms: i64) Error!bool {
+        return (try s.captureDetailed(c, now_ms)).applied;
+    }
+
+    pub fn captureDetailed(s: *Store, c: Capture, now_ms: i64) Error!CaptureResult {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
         const at = try s.intervalTime(now_ms);
@@ -384,8 +830,9 @@ pub const Store = struct {
             try stmt.bindI64(5, at);
             _ = try stmt.step();
             if (s.db.changes() == 0) {
+                const old = s.captureRun(c.source, c.run) catch null;
                 try tx.commit();
-                return false;
+                return .{ .applied = false, .project_id = if (old) |r| r.project else null, .task_id = if (old) |r| r.task else null };
             }
         }
         try s.expireRuns(at);
@@ -399,27 +846,63 @@ pub const Store = struct {
             try stmt.bindI64(5, at);
             _ = try stmt.step();
         }
-        if (c.kind == .subject and c.task == null) return error.UnknownTask;
         var run = try s.captureRun(c.source, c.run);
-        // A subject sent with any event names the run's task before the event applies.
-        if (c.task) |task| if (run.task != task) {
-            try s.moveRun(c, run, task, at, c.kind != .prompt);
-            run = try s.captureRun(c.source, c.run);
-        };
+        const saved_key = try s.savedCaptureKey(c.source, c.run);
+        defer if (saved_key) |key| s.allocator.free(key);
+        const key = c.project_key orelse saved_key;
+        const lookup_project = try s.resolveCaptureProject(c.source, key, c.project_hint, run.task);
+        if (c.project_key != null) try s.setRunProjectKey(c, c.project_key);
+        var target_task = run.task;
+        if (c.kind == .subject) {
+            target_task = c.task orelse if (c.subject) |subject| try s.resolveCaptureTask(subject, lookup_project, at) else return error.UnknownTask;
+        } else if (c.task != null or c.subject != null) {
+            // A subject sent with any event names the run's task before the event applies;
+            // a prompt or busy then engages it in its own role.
+            const task = c.task orelse try s.resolveCaptureTask(c.subject.?, lookup_project, at);
+            if (run.task != task) {
+                const moved_project = try s.resolveCaptureProject(c.source, key, c.project_hint, task);
+                try s.moveRun(c, run, task, moved_project, at, c.kind != .prompt and c.kind != .busy);
+                run = try s.captureRun(c.source, c.run);
+            }
+        } else if (run.task == null) {
+            if (c.default_subject) |subject| {
+                const task = try s.resolveCaptureTask(subject, lookup_project, at);
+                try s.setRun(c, task, run.working, run.role, run.lease_until);
+                run.task = task;
+            } else if (c.kind == .prompt and c.default_task == null) {
+                const title = try s.sessionTitle(c.first_prompt);
+                defer s.allocator.free(title);
+                const task = try s.insertTask(title, .{ .selected = lookup_project }, at);
+                try s.setRun(c, task, run.working, run.role, run.lease_until);
+                run.task = task;
+            }
+        }
+        if (c.kind != .subject) target_task = run.task;
+        const project = try s.resolveCaptureProject(c.source, key, c.project_hint, target_task);
+        try s.setRunProject(c, project);
         switch (c.kind) {
-            .start, .subject => {},
+            .start => {},
+            .subject => {
+                const task = target_task.?;
+                if (run.task != task) {
+                    try s.moveRun(c, run, task, project, at, true);
+                } else if (run.working) {
+                    // In its grace the run moves project when work resumes, not now.
+                    try s.setRole(c, try s.engage(c, task, run.role orelse .parallel, project, at));
+                }
+            },
             .prompt => {
                 const role: Role = if (c.attended) .focus else .parallel;
                 try s.setRun(c, run.task, true, role, at + capture_lease_ms);
-                try s.setRole(c, try s.engage(c, run.task, role, at));
+                try s.setRole(c, try s.engage(c, run.task, role, project, at));
             },
             .busy => {
                 if (run.working or run.idle != null) {
                     try s.setRun(c, run.task, true, run.role, at + capture_lease_ms);
-                    try s.setRole(c, try s.engage(c, run.task, run.role orelse .parallel, at));
+                    try s.setRole(c, try s.engage(c, run.task, run.role orelse .parallel, project, at));
                 } else {
                     try s.setRun(c, run.task, true, .parallel, at + capture_lease_ms);
-                    _ = try s.engage(c, run.task, .parallel, at);
+                    _ = try s.engage(c, run.task, .parallel, project, at);
                 }
             },
             .stop => if (run.working) {
@@ -442,8 +925,9 @@ pub const Store = struct {
         }
         if (c.note) |text| if (c.kind != .start and c.kind != .end) try s.captureNote(c, at, text);
         try s.heartbeat(at);
+        const final = try s.captureRun(c.source, c.run);
         try tx.commit();
-        return true;
+        return .{ .applied = true, .project_id = final.project, .task_id = final.task };
     }
 
     fn captureNote(s: *Store, c: Capture, at: i64, text: []const u8) !void {
@@ -468,12 +952,12 @@ pub const Store = struct {
 
     /// The run works on `task` from now on; a working run moves its time there.
     /// `engage_now` is false for a prompt, which engages in its own role next.
-    fn moveRun(s: *Store, c: Capture, run: CaptureRun, task: i64, at: i64, engage_now: bool) !void {
+    fn moveRun(s: *Store, c: Capture, run: CaptureRun, task: i64, project: ?i64, at: i64, engage_now: bool) !void {
         try s.setRun(c, task, run.working, run.role, run.lease_until);
         try s.setIdle(c, run.idle);
         if (run.working or run.idle != null) {
             try s.releaseTask(c, run.task, at, .@"switch");
-            if (engage_now) try s.setRole(c, try s.engage(c, task, run.role orelse .parallel, at));
+            if (engage_now) try s.setRole(c, try s.engage(c, task, run.role orelse .parallel, project, at));
         }
     }
 
@@ -489,7 +973,7 @@ pub const Store = struct {
     }
 
     /// `idle`: when the run's turn ended, while its task is kept open.
-    const CaptureRun = struct { task: ?i64, working: bool, role: ?Role, lease_until: ?i64, idle: ?i64 };
+    const CaptureRun = struct { task: ?i64, working: bool, role: ?Role, lease_until: ?i64, idle: ?i64, project: ?i64 };
 
     /// Whether this event was applied already, so a retry changes nothing,
     /// not even by creating the task it names.
@@ -511,7 +995,7 @@ pub const Store = struct {
     }
 
     fn captureRun(s: *Store, source: []const u8, run: []const u8) !CaptureRun {
-        var stmt = try s.db.prepare("SELECT task_id,working,role,lease_until_ms,idle_since_ms FROM capture_runs WHERE source=?1 AND run=?2");
+        var stmt = try s.db.prepare("SELECT task_id,working,role,lease_until_ms,idle_since_ms,project_id FROM capture_runs WHERE source=?1 AND run=?2");
         defer stmt.finalize();
         try stmt.bindText(1, source);
         try stmt.bindText(2, run);
@@ -522,7 +1006,35 @@ pub const Store = struct {
             .role = if (stmt.columnText(2)) |r| std.meta.stringToEnum(Role, r) else null,
             .lease_until = if (stmt.columnIsNull(3)) null else stmt.columnI64(3),
             .idle = if (stmt.columnIsNull(4)) null else stmt.columnI64(4),
+            .project = if (stmt.columnIsNull(5)) null else stmt.columnI64(5),
         };
+    }
+
+    fn savedCaptureKey(s: *Store, source: []const u8, run: []const u8) !?[]const u8 {
+        var stmt = try s.db.prepare("SELECT project_key FROM capture_runs WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, source);
+        try stmt.bindText(2, run);
+        if (try stmt.step() != .row) return null;
+        return if (stmt.columnText(0)) |key| try s.allocator.dupe(u8, key) else null;
+    }
+
+    fn setRunProjectKey(s: *Store, c: Capture, key: ?[]const u8) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET project_key=?3 WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, c.source);
+        try stmt.bindText(2, c.run);
+        try stmt.bindOptionalText(3, key);
+        _ = try stmt.step();
+    }
+
+    fn setRunProject(s: *Store, c: Capture, project: ?i64) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET project_id=?3 WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, c.source);
+        try stmt.bindText(2, c.run);
+        if (project) |id| try stmt.bindI64(3, id) else try stmt.bindNull(3);
+        _ = try stmt.step();
     }
 
     fn setRun(s: *Store, c: Capture, task: ?i64, working: bool, role: ?Role, lease_until: ?i64) !void {
@@ -574,14 +1086,22 @@ pub const Store = struct {
 
     /// Opens the task in this role. Taking the focus moves the task that
     /// had it to parallel when another run still works on it.
-    fn engage(s: *Store, c: Capture, task: ?i64, role: Role, at: i64) !Role {
+    fn engage(s: *Store, c: Capture, task: ?i64, role: Role, project: ?i64, at: i64) !Role {
         const t = task orelse return role;
         var open_role: ?Role = null;
+        var open_id: ?i64 = null;
+        var open_project: ?i64 = null;
+        var open_captured = false;
         {
-            var stmt = try s.db.prepare("SELECT role FROM intervals WHERE task_id=?1 AND end_ms IS NULL");
+            var stmt = try s.db.prepare("SELECT id,role,project_id,captured FROM intervals WHERE task_id=?1 AND end_ms IS NULL");
             defer stmt.finalize();
             try stmt.bindI64(1, t);
-            if (try stmt.step() == .row) open_role = std.meta.stringToEnum(Role, stmt.columnText(0).?);
+            if (try stmt.step() == .row) {
+                open_id = stmt.columnI64(0);
+                open_role = std.meta.stringToEnum(Role, stmt.columnText(1).?);
+                open_project = if (stmt.columnIsNull(2)) null else stmt.columnI64(2);
+                open_captured = stmt.columnI64(3) != 0;
+            }
         }
         // Tracking by hand outranks capture: a prompt does not take a focus
         // the user chose; its run works in parallel until then.
@@ -592,15 +1112,25 @@ pub const Store = struct {
             break :blk try stmt.step() == .row;
         };
         if (role == .parallel or manual_focus or try s.focusHeld(c, t)) {
-            if (open_role == null) try s.continueOrOpen(t, .parallel, at);
+            if (open_role == null) try s.continueOrOpen(t, .parallel, project, at)
+            else if (open_role == .parallel and open_captured and open_project != project)
+                try s.splitCapturedProject(open_id.?, t, .parallel, project, at);
             return .parallel;
         }
-        if (open_role == .focus) return .focus;
+        if (open_role == .focus) {
+            if (open_captured and open_project != project)
+                try s.splitCapturedProject(open_id.?, t, .focus, project, at);
+            return .focus;
+        }
         var previous: ?i64 = null;
+        var previous_project: ?i64 = null;
         {
-            var stmt = try s.db.prepare("SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+            var stmt = try s.db.prepare("SELECT task_id,project_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
             defer stmt.finalize();
-            if (try stmt.step() == .row) previous = stmt.columnI64(0);
+            if (try stmt.step() == .row) {
+                previous = stmt.columnI64(0);
+                previous_project = if (stmt.columnIsNull(1)) null else stmt.columnI64(1);
+            }
         }
         // A captured focus whose runs all sit in their grace ends where the
         // last turn ended: the grace is not attention once another task takes over.
@@ -619,10 +1149,10 @@ pub const Store = struct {
             try stmt.bindI64(2, own);
             _ = try stmt.step();
         }
-        try s.continueOrOpen(t, .focus, at);
+        try s.continueOrOpen(t, .focus, if (open_role != null and !open_captured) open_project else project, at);
         try s.db.exec("DELETE FROM saved_set");
         if (previous) |p| if (try s.otherRunWorks(c, p)) {
-            if (try s.otherRunWorking(c, p)) try s.continueOrOpen(p, .parallel, at);
+            if (try s.otherRunWorking(c, p)) try s.continueOrOpen(p, .parallel, previous_project, at);
             var stmt = try s.db.prepare("UPDATE capture_runs SET role='parallel' WHERE (working=1 OR idle_since_ms IS NOT NULL) AND task_id=?1");
             defer stmt.finalize();
             try stmt.bindI64(1, p);
@@ -631,24 +1161,48 @@ pub const Store = struct {
         return .focus;
     }
 
+    fn splitCapturedProject(s: *Store, old_id: i64, task: i64, role: Role, project: ?i64, at: i64) !void {
+        var old = try s.db.prepare("SELECT posting_span_id FROM intervals WHERE id=?1");
+        defer old.finalize();
+        try old.bindI64(1, old_id);
+        if (try old.step() != .row) return error.UnknownInterval;
+        const span = if (old.columnIsNull(0)) old_id else old.columnI64(0);
+        var close = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,?1),closed_by='switch',posting_span_id=?2 WHERE id=?3");
+        defer close.finalize();
+        try close.bindI64(1, at);
+        try close.bindI64(2, span);
+        try close.bindI64(3, old_id);
+        _ = try close.step();
+        try s.openCaptured(task, role, project, at);
+        var mark = try s.db.prepare("UPDATE intervals SET posting_span_id=?1 WHERE task_id=?2 AND end_ms IS NULL");
+        defer mark.finalize();
+        try mark.bindI64(1, span);
+        try mark.bindI64(2, task);
+        _ = try mark.step();
+    }
+
     /// Carries on the task's last interval in this role when it ended
     /// within the grace (a turn's end, a daemon restart, a short focus
     /// handoff), so a conversation stays one row. Opens a new one when the
     /// task ran since, a lunch began in the gap, or, for the focus, another
     /// focus took the gap.
-    fn continueOrOpen(s: *Store, task: i64, role: Role, at: i64) !void {
+    fn continueOrOpen(s: *Store, task: i64, role: Role, project: ?i64, at: i64) !void {
         var id: i64 = 0;
         var end: i64 = 0;
+        var old_project: ?i64 = null;
+        var span: ?i64 = null;
         {
-            var stmt = try s.db.prepare("SELECT id,end_ms FROM intervals WHERE task_id=?1 AND role=?2 AND captured=1 AND end_ms IS NOT NULL AND end_ms<=?3 AND end_ms>=?4 ORDER BY end_ms DESC LIMIT 1");
+            var stmt = try s.db.prepare("SELECT id,end_ms,project_id,posting_span_id FROM intervals WHERE task_id=?1 AND role=?2 AND captured=1 AND end_ms IS NOT NULL AND end_ms<=?3 AND end_ms>=?4 ORDER BY end_ms DESC LIMIT 1");
             defer stmt.finalize();
             try stmt.bindI64(1, task);
             try stmt.bindText(2, @tagName(role));
             try stmt.bindI64(3, at);
             try stmt.bindI64(4, at - capture_idle_ms);
-            if (try stmt.step() != .row) return s.openCaptured(task, role, at);
+            if (try stmt.step() != .row) return s.openCaptured(task, role, project, at);
+            old_project = if (stmt.columnIsNull(2)) null else stmt.columnI64(2);
             id = stmt.columnI64(0);
             end = stmt.columnI64(1);
+            span = if (stmt.columnIsNull(3)) id else stmt.columnI64(3);
         }
         var stmt = try s.db.prepare("SELECT 1 FROM intervals WHERE id<>?1 AND ((task_id=?2 AND coalesce(end_ms,?4)>?3) OR (?5='focus' AND role='focus' AND start_ms<?4 AND coalesce(end_ms,?4)>?3)) UNION ALL SELECT 1 FROM lunches WHERE out_ms>=?3 AND out_ms<=?4");
         defer stmt.finalize();
@@ -657,15 +1211,30 @@ pub const Store = struct {
         try stmt.bindI64(3, end);
         try stmt.bindI64(4, at);
         try stmt.bindText(5, @tagName(role));
-        if (try stmt.step() == .row) return s.openCaptured(task, role, at);
+        if (try stmt.step() == .row) return s.openCaptured(task, role, project, at);
+        if (old_project != project) {
+            var extend = try s.db.prepare("UPDATE intervals SET end_ms=?1,posting_span_id=?2 WHERE id=?3");
+            defer extend.finalize();
+            try extend.bindI64(1, at);
+            try extend.bindI64(2, span.?);
+            try extend.bindI64(3, id);
+            _ = try extend.step();
+            try s.openCaptured(task, role, project, at);
+            var mark = try s.db.prepare("UPDATE intervals SET posting_span_id=?1 WHERE task_id=?2 AND end_ms IS NULL");
+            defer mark.finalize();
+            try mark.bindI64(1, span.?);
+            try mark.bindI64(2, task);
+            _ = try mark.step();
+            return;
+        }
         var reopen = try s.db.prepare("UPDATE intervals SET end_ms=NULL,closed_by=NULL WHERE id=?1");
         defer reopen.finalize();
         try reopen.bindI64(1, id);
         _ = try reopen.step();
     }
 
-    fn openCaptured(s: *Store, task: i64, role: Role, at: i64) !void {
-        const id = try s.openInterval(task, role, if (role == .focus) .@"switch" else .parallel, null, at);
+    fn openCaptured(s: *Store, task: i64, role: Role, project: ?i64, at: i64) !void {
+        const id = try s.openInterval(task, role, if (role == .focus) .@"switch" else .parallel, null, project, at);
         var stmt = try s.db.prepare("UPDATE intervals SET captured=1 WHERE id=?1");
         defer stmt.finalize();
         try stmt.bindI64(1, id);
@@ -757,7 +1326,7 @@ pub const Store = struct {
     fn pauseOpen(s: *Store, now_ms: i64) !i64 {
         const at = try s.intervalTime(now_ms);
         try s.db.exec("DELETE FROM saved_set");
-        try s.db.exec("INSERT INTO saved_set(task_id,role) SELECT task_id,role FROM intervals WHERE end_ms IS NULL");
+        try s.db.exec("INSERT INTO saved_set(task_id,role,project_id) SELECT task_id,role,project_id FROM intervals WHERE end_ms IS NULL");
         var stmt = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,?1),closed_by='pause' WHERE end_ms IS NULL");
         defer stmt.finalize();
         try stmt.bindI64(1, at);
@@ -770,12 +1339,12 @@ pub const Store = struct {
         defer tx.deinit();
         if (try s.hasOpen()) return error.SomethingOpen;
         const at = try s.intervalTime(now_ms);
-        var saved = try s.db.prepare("SELECT task_id,role FROM saved_set ORDER BY task_id");
+        var saved = try s.db.prepare("SELECT task_id,role,project_id FROM saved_set ORDER BY task_id");
         defer saved.finalize();
         var opened = false;
         while (try saved.step() == .row) {
             const role = std.meta.stringToEnum(Role, saved.columnText(1).?) orelse return error.InvalidState;
-            _ = try s.openInterval(saved.columnI64(0), role, .@"resume", null, at);
+            _ = try s.openInterval(saved.columnI64(0), role, .@"resume", null, if (saved.columnIsNull(2)) null else saved.columnI64(2), at);
             opened = true;
         }
         if (opened) {
@@ -942,10 +1511,10 @@ pub const Store = struct {
 
     pub const Span = struct { start_ms: i64, end_ms: ?i64 };
 
-    const Row = struct { task: i64, role: Role, start_ms: i64, end_ms: ?i64, text: ?[]u8, closed_by: ?[]u8 };
+    const Row = struct { task: i64, role: Role, start_ms: i64, end_ms: ?i64, text: ?[]u8, closed_by: ?[]u8, project: ?i64, posting_span: ?i64, captured: bool };
 
     fn intervalRow(s: *Store, id: i64) !Row {
-        var stmt = try s.db.prepare("SELECT task_id,role,start_ms,end_ms,text,closed_by FROM intervals WHERE id=?1");
+        var stmt = try s.db.prepare("SELECT task_id,role,start_ms,end_ms,text,closed_by,project_id,posting_span_id,captured FROM intervals WHERE id=?1");
         defer stmt.finalize();
         try stmt.bindI64(1, id);
         if (try stmt.step() == .done) return error.UnknownInterval;
@@ -958,6 +1527,9 @@ pub const Store = struct {
             .end_ms = if (stmt.columnIsNull(3)) null else stmt.columnI64(3),
             .text = text,
             .closed_by = if (stmt.columnText(5)) |c| try s.allocator.dupe(u8, c) else null,
+            .project = if (stmt.columnIsNull(6)) null else stmt.columnI64(6),
+            .posting_span = if (stmt.columnIsNull(7)) null else stmt.columnI64(7),
+            .captured = stmt.columnI64(8) != 0,
         };
     }
 
@@ -1058,7 +1630,7 @@ pub const Store = struct {
         defer s.freeRow(b);
         try checkSeen(a, first_seen);
         try checkSeen(b, second_seen);
-        if (first == second or a.task != b.task or a.role != b.role) return error.NotMergeable;
+        if (first == second or a.task != b.task or a.role != b.role or a.project != b.project) return error.NotMergeable;
         const a_end = a.end_ms orelse return error.NotMergeable;
         if (a_end > b.start_ms) return error.NotMergeable;
         try s.checkFree(&.{ first, second }, a.task, a.role, a_end, b.start_ms);
@@ -1096,17 +1668,23 @@ pub const Store = struct {
 
     /// Records a finished past interval.
     pub fn addInterval(s: *Store, task: i64, role: Role, start: i64, end: i64, now_ms: i64) Error!i64 {
+        return s.addIntervalProject(task, role, start, end, .omitted, now_ms);
+    }
+
+    pub fn addIntervalProject(s: *Store, task: i64, role: Role, start: i64, end: i64, choice: ProjectChoice, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        const project = try s.chosenProject(task, choice);
         try validSpan(start, end, now_ms);
         try s.checkFree(&.{}, task, role, start, end);
-        var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,end_ms,opened_by,closed_by) VALUES(?1,?2,?3,?4,?5,'stop') RETURNING id");
+        var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,end_ms,opened_by,closed_by,project_id) VALUES(?1,?2,?3,?4,?5,'stop',?6) RETURNING id");
         defer stmt.finalize();
         try stmt.bindI64(1, task);
         try stmt.bindText(2, sqlText(role));
         try stmt.bindI64(3, start);
         try stmt.bindI64(4, end);
         try stmt.bindText(5, if (role == .focus) "switch" else "parallel");
+        if (project) |p| try stmt.bindI64(6, p) else try stmt.bindNull(6);
         if ((stmt.step() catch |err| {
             if (s.db.isConstraint()) return error.UnknownTask;
             return err;
@@ -1148,9 +1726,9 @@ pub const Store = struct {
             break :blk id;
         } else blk: {
             try s.reshape(id, row.task, from, "switch");
-            break :blk try s.insertPiece(to_task, row.role, from, to, if (to == end) last_closed_by else "switch");
+            break :blk try s.insertPiece(to_task, row.role, from, to, if (to == end) last_closed_by else "switch", row.project, row.posting_span, row.captured);
         };
-        const tail: ?i64 = if (to < end) try s.insertPiece(row.task, row.role, to, end, last_closed_by) else null;
+        const tail: ?i64 = if (to < end) try s.insertPiece(row.task, row.role, to, end, last_closed_by, row.project, row.posting_span, row.captured) else null;
         // Notes follow their time: before `from` stays, past `to` goes to the tail.
         if (moved != id) try s.moveNotes(id, moved, from, null);
         if (tail) |t| try s.moveNotes(moved, t, to, null);
@@ -1169,8 +1747,8 @@ pub const Store = struct {
         _ = try stmt.step();
     }
 
-    fn insertPiece(s: *Store, task: i64, role: Role, start: i64, end: i64, closed_by: []const u8) !i64 {
-        var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,end_ms,opened_by,closed_by) VALUES(?1,?2,?3,?4,?5,?6) RETURNING id");
+    fn insertPiece(s: *Store, task: i64, role: Role, start: i64, end: i64, closed_by: []const u8, project: ?i64, posting_span: ?i64, captured: bool) !i64 {
+        var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,end_ms,opened_by,closed_by,project_id,posting_span_id,captured) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) RETURNING id");
         defer stmt.finalize();
         try stmt.bindI64(1, task);
         try stmt.bindText(2, sqlText(role));
@@ -1178,6 +1756,9 @@ pub const Store = struct {
         try stmt.bindI64(4, end);
         try stmt.bindText(5, if (role == .focus) "switch" else "parallel");
         try stmt.bindText(6, closed_by);
+        if (project) |p| try stmt.bindI64(7, p) else try stmt.bindNull(7);
+        if (posting_span) |span| try stmt.bindI64(8, span) else try stmt.bindNull(8);
+        try stmt.bindI64(9, @intFromBool(captured));
         if (try stmt.step() != .row) return error.Sqlite;
         const new_id = stmt.columnI64(0);
         if (try stmt.step() != .done) return error.Sqlite;
@@ -1329,6 +1910,8 @@ pub const Store = struct {
             if (n < 1024) return error.InvalidSetting;
         } else if (std.mem.eql(u8, key, "lock_pause")) {
             if (lockWindowsContain(val, 0) == null) return error.InvalidSetting;
+        } else if (std.mem.eql(u8, key, "project_provider_field")) {
+            if (val.len > 200) return error.InvalidSetting;
         } else if (std.mem.eql(u8, key, "capture_hold_sources")) {
             if (val.len > 1000) return error.InvalidSetting;
             var it = std.mem.splitScalar(u8, val, ',');
@@ -1469,7 +2052,7 @@ test "store refuses a future schema version" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
-    try db.exec("PRAGMA user_version=9");
+    try db.exec("PRAGMA user_version=10");
     try std.testing.expectError(error.SchemaVersion, Store.init(&db, std.testing.allocator));
 }
 
@@ -1592,7 +2175,7 @@ test "failed switch and resume roll back all writes" {
     const b = try s.createTask("B", 2);
     _ = try s.switchTo(a, null, 100);
     try db.exec("INSERT INTO saved_set(task_id,role) VALUES(2,'parallel')");
-    try std.testing.expectError(error.Sqlite, s.switchTo(999, null, 120));
+    try std.testing.expectError(error.UnknownTask, s.switchTo(999, null, 120));
     try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND task_id=1"));
     try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals"));
     try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM saved_set"));
@@ -1685,7 +2268,7 @@ test "guard recovery survives failed switch FK" {
     var s = try Store.init(&db, std.testing.allocator);
     const a = try s.createTask("A", 0);
     _ = try s.switchTo(a, null, 0);
-    try std.testing.expectError(error.Sqlite, s.switchTo(999, null, 180_001));
+    try std.testing.expectError(error.UnknownTask, s.switchTo(999, null, 180_001));
     try expectRecoveredFocus(&db);
 }
 

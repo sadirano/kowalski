@@ -13,6 +13,22 @@ The data model and behavior of kowalski. Contributor rules are in
   what they mean.
 - A task without a provider is a complete local task.
 
+## Projects
+
+A project is an optional user-chosen grouping, independent of providers.
+It has a stable ID, a unique editable label and an archived flag. A task
+may have a default project. Each interval stores its own attributed project;
+old intervals and tasks remain Unassigned after upgrade. New intervals use
+an explicit choice, then capture context, then task default. Changing a
+task default never moves history. Historical reassignment requires a preview
+and explicit apply. Renaming changes labels, not attribution. Archiving hides
+a project from new pickers; history and existing capture mappings still work.
+Capture keys identify source projects; names are hints, never merge keys.
+Title lookup is scoped to the current project and rejects ambiguity; refs
+and `#id` remain global. Provider fields remain separate. An opt-in provider
+field can supply a new task default. Project does not affect provider
+binding, posting identity, amounts or coverage.
+
 ## Time model
 
 - A task is worked in **intervals**. Each interval has a fixed role:
@@ -25,6 +41,10 @@ The data model and behavior of kowalski. Contributor rules are in
 - **Switch** closes the current focus and opens a focus interval on the
   target. If the target was running in parallel, its parallel interval
   closes and a focus interval opens. Other parallel intervals carry on.
+A captured change of project on an event that continues or opens time closes
+the current interval and opens another at that event boundary. Terminal
+events only close or release. Focus, parallel and posting time keep their
+existing rules.
 - **Pause** saves the set of open tasks and their roles, then closes their
   intervals, in one transaction. Pausing with nothing open keeps the saved
   set. **Resume** needs nothing open and turns the saved set back into new
@@ -115,7 +135,7 @@ The data model and behavior of kowalski. Contributor rules are in
 - Importing from another tool is a separate tool's job, not the core's.
   Up to v0.1.0 kowalski exported its database code as a Zig module for
   such a tool; it no longer does. An importer built against v0.1.0 writes
-  schema v3. Kowalski upgrades that database to v5 on open. Imported
+  schema v3. Kowalski upgrades that database to the current schema on open. Imported
   rows become ordinary history;
   import provenance is no longer kept.
 

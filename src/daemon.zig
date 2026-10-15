@@ -259,6 +259,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
             std.heap.page_allocator.destroy(table);
         }
     };
+    defer d.app.clearDeclaredFields();
     try startProvider(&d);
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
     var listener = address.listen(io, .{}) catch |err| {
@@ -365,6 +366,7 @@ fn approveTrust(db: *sqlite.Db, sha: []const u8, how: []const u8) !void {
 }
 
 fn startProvider(d: *Daemon) !void {
+    d.app.clearDeclaredFields();
     const a = d.traits_allocator;
     try rememberQuarantine(d.app.store.db);
     if (try provider_source.read(d.app.store.db, a)) |enrolled| {
@@ -482,6 +484,9 @@ fn loadHash(d: *Daemon, sha: []const u8) !void {
     d.app.provider_status.reason = "";
     try d.app.store.setSetting("provider_instance", copy.instance.slice(), clock.nowMs());
     d.app.traits = api.parseTraits(a, copy.traits.slice());
+    const fields_outcome = try worker.runInline(copy, a, .fields);
+    if (fields_outcome == .done and fields_outcome.done.code == 0)
+        try d.app.loadDeclaredFields(fields_outcome.done.out);
     try markGood(d.app.store.db, sha);
     log("provider: {s}", .{copy.instance.slice()});
 }

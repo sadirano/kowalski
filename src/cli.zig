@@ -4,6 +4,7 @@ const std = @import("std");
 const Io = std.Io;
 const sqlite = @import("sqlite.zig");
 const api = @import("api.zig");
+const store_mod = @import("store.zig");
 const zone = @import("zone.zig");
 const windows = std.os.windows;
 
@@ -22,17 +23,25 @@ pub const usage =
     \\  open                         start the daemon if needed and open the dashboard
     \\  autostart [on|off]           start the daemon at logon, or show the setting
     \\  status                       focus, parallel work and today's numbers
-    \\  switch <task> [-m <text>]    focus on a task (created when nothing matches)
-    \\  parallel <task> [-m <text>]  open a task next to the focus
+    \\  switch|track [--project <#id|unassigned>] <task> [-m <text>]
+    \\  parallel [--project <#id|unassigned>] <task> [-m <text>]
     \\  stop <task>                  close a task's open interval
     \\  pause | resume               save and close everything open, or bring it back
     \\  note [-t <task>] <text>      note on the focus, or on the named task
     \\  capture <kind> --source <s> --run <r> [--event <id>] [--subject <task>]
-    \\          [--default <task>] [--unattended]
+    \\          [--default <task>] [--project-key <key>] [--project-hint <hint>]
+    \\          [--first-prompt <text>] [--unattended]
     \\                               record an outside run (start|subject|prompt|busy|stop|end)
     \\  tasks [<filter>]             tasks by recent use
     \\  new <title>                  create a task without opening it
     \\  rename <#id> <title>         change a task's title
+    \\  project list [--all]         list projects
+    \\  project add <label>          add a project
+    \\  project rename <#id> <label> rename a project
+    \\  project archive <#id> [--undo]  archive or unarchive
+    \\  project assign <#id|unassigned> --task <#id> [--apply <hash>]
+    \\  project assign <#id|unassigned> --interval <#id>... [--apply <hash>]
+    \\  project assign <#id|unassigned> --suggest [--apply <hash>]
     \\  delete <#id>                 delete a task and its time (not while running or posted)
     \\  day [<YYYY-MM-DD>]           totals, hops, timeline and summary
     \\  summary [<YYYY-MM-DD>] [<text>]  show or set a day's summary ("" clears)
@@ -210,6 +219,26 @@ fn options(ctx: *Context, args: []const []const u8, comptime flags: []const []co
     return .{ .words = words.items, .values = values };
 }
 
+fn hashId(text: []const u8) !i64 {
+    if (text.len < 2 or text[0] != '#') return error.Usage;
+    const id = std.fmt.parseInt(i64, text[1..], 10) catch return error.Usage;
+    if (id <= 0) return error.Usage;
+    return id;
+}
+
+fn projectId(text: []const u8) !?i64 {
+    if (std.mem.eql(u8, text, "unassigned")) return null;
+    return try hashId(text);
+}
+
+const Project = struct { id: i64, label: []const u8, archived: bool };
+
+fn projectLabel(projects: []const Project, id: ?i64) []const u8 {
+    const wanted = id orelse return "Unassigned";
+    for (projects) |project| if (project.id == wanted) return project.label;
+    return "(missing project)";
+}
+
 fn jsonBody(ctx: *Context, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(ctx.a, value, .{});
 }
@@ -385,21 +414,141 @@ fn dispatch(ctx: *Context, command: []const u8, args: []const []const u8) !Exit 
     };
 }
 
+fn projectCommand(ctx: *Context, args: []const []const u8) !Exit {
+    if (args.len == 0) return error.Usage;
+    const eql = std.mem.eql;
+    if (eql(u8, args[0], "list")) {
+        if (args.len > 2 or (args.len == 2 and !eql(u8, args[1], "--all"))) return error.Usage;
+        const reply = try call(ctx, "GET", if (args.len == 2) "/api/projects?archived=1" else "/api/projects", null);
+        if (!try settle(ctx, reply)) return .ok;
+        const list = try parse(struct { projects: []Project }, ctx, reply.body);
+        for (list.projects) |project| try ctx.out.print("#{d} {s}{s}\n", .{ project.id, project.label, if (project.archived) " (archived)" else "" });
+        return .ok;
+    }
+    if (eql(u8, args[0], "add")) {
+        if (args.len < 2) return error.Usage;
+        const reply = try call(ctx, "POST", "/api/projects", try jsonBody(ctx, .{ .label = try joined(ctx, args[1..]) }));
+        if (!try settle(ctx, reply)) return .ok;
+        const result = try parse(struct { project: Project }, ctx, reply.body);
+        try ctx.out.print("#{d} {s}\n", .{ result.project.id, result.project.label });
+        return .ok;
+    }
+    if (eql(u8, args[0], "rename")) {
+        if (args.len < 3) return error.Usage;
+        const id = try hashId(args[1]);
+        const reply = try call(ctx, "PATCH", try std.fmt.allocPrint(ctx.a, "/api/projects/{d}", .{id}), try jsonBody(ctx, .{ .label = try joined(ctx, args[2..]) }));
+        if (!try settle(ctx, reply)) return .ok;
+        const result = try parse(struct { project: Project }, ctx, reply.body);
+        try ctx.out.print("#{d} {s}\n", .{ result.project.id, result.project.label });
+        return .ok;
+    }
+    if (eql(u8, args[0], "archive")) {
+        if (args.len < 2 or args.len > 3 or (args.len == 3 and !eql(u8, args[2], "--undo"))) return error.Usage;
+        const id = try hashId(args[1]);
+        const archived = args.len == 2;
+        const reply = try call(ctx, "PATCH", try std.fmt.allocPrint(ctx.a, "/api/projects/{d}", .{id}), try jsonBody(ctx, .{ .archived = archived }));
+        if (!try settle(ctx, reply)) return .ok;
+        try ctx.out.print("#{d} {s}\n", .{ id, if (archived) "archived" else "active" });
+        return .ok;
+    }
+    if (eql(u8, args[0], "assign")) {
+        if (args.len < 3) return error.Usage;
+        const target = try projectId(args[1]);
+        var task: ?i64 = null;
+        var intervals: std.ArrayList(i64) = .empty;
+        var suggest = false;
+        var apply_hash: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (eql(u8, args[i], "--task")) {
+                i += 1;
+                if (i >= args.len) return error.Usage;
+                task = try hashId(args[i]);
+            } else if (eql(u8, args[i], "--interval")) {
+                i += 1;
+                if (i >= args.len or !std.mem.startsWith(u8, args[i], "#")) return error.Usage;
+                while (i < args.len and std.mem.startsWith(u8, args[i], "#")) : (i += 1) try intervals.append(ctx.a, try hashId(args[i]));
+                i -= 1;
+            } else if (eql(u8, args[i], "--suggest")) suggest = true
+            else if (eql(u8, args[i], "--apply")) {
+                i += 1;
+                if (i >= args.len) return error.Usage;
+                apply_hash = args[i];
+            }
+            else return error.Usage;
+        }
+        const modes: u8 = @intFromBool(task != null) + @as(u8, @intFromBool(intervals.items.len > 0)) + @as(u8, @intFromBool(suggest));
+        if (modes != 1) return error.Usage;
+        const scope = .{ .task_id = task, .interval_ids = if (intervals.items.len > 0) @as(?[]const i64, intervals.items) else null, .unassigned_suggestions = suggest };
+        const preview_reply = try call(ctx, "POST", "/api/projects/assign/preview", try jsonBody(ctx, .{ .scope = scope, .project_id = target }));
+        if (preview_reply.status < 200 or preview_reply.status >= 300) {
+            _ = try settle(ctx, preview_reply);
+            return .failed;
+        }
+        const preview = try parse(store_mod.AssignmentPreview, ctx, preview_reply.body);
+        const snapshot_json = try std.json.Stringify.valueAlloc(ctx.a, preview.snapshot, .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(snapshot_json, &digest, .{});
+        const alphabet = "0123456789abcdef";
+        var seen_hash: [16]u8 = undefined;
+        for (digest[0..8], 0..) |byte, n| {
+            seen_hash[n * 2] = alphabet[byte >> 4];
+            seen_hash[n * 2 + 1] = alphabet[byte & 15];
+        }
+        if (!ctx.json) {
+            const project_reply = try call(ctx, "GET", "/api/projects?archived=1", null);
+            if (project_reply.status < 200 or project_reply.status >= 300) {
+                _ = try settle(ctx, project_reply);
+                return .failed;
+            }
+            const all = try parse(struct { projects: []Project }, ctx, project_reply.body);
+            for (preview.snapshot.intervals) |row| try ctx.out.print("#{d} {s} -> {s} ({d} ms focus)\n", .{ row.id, projectLabel(all.projects, row.project_id), projectLabel(all.projects, target), row.focus_ms });
+            for (preview.snapshot.totals) |total| try ctx.out.print("{s} {s}: {d} ms focus\n", .{ total.date, projectLabel(all.projects, total.project_id), total.focus_ms });
+            for (preview.skipped) |row| try ctx.out.print("#{d} skipped (open)\n", .{row.id});
+        } else if (apply_hash == null) {
+            try ctx.out.writeAll(preview_reply.body);
+            try ctx.out.writeAll("\n");
+        }
+        if (apply_hash == null) {
+            try ctx.out.print("preview hash: {s}\n", .{seen_hash});
+            return .ok;
+        }
+        if (!std.mem.eql(u8, apply_hash.?, &seen_hash)) {
+            try ctx.out.print("preview changed: expected {s}, got {s}; preview again before applying\n", .{ apply_hash.?, seen_hash });
+            return .failed;
+        }
+        const apply_reply = try call(ctx, "POST", "/api/projects/assign/apply", try jsonBody(ctx, .{ .snapshot = preview.snapshot }));
+        if (!try settle(ctx, apply_reply)) return .ok;
+        const result = try parse(store_mod.AssignmentResult, ctx, apply_reply.body);
+        try ctx.out.print("changed {d} intervals ({d} ms focus)\n", .{ result.changed, result.focus_ms });
+        return .ok;
+    }
+    return error.Usage;
+}
+
 fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !Exit {
     const eql = std.mem.eql;
+    if (eql(u8, command, "project")) return projectCommand(ctx, args);
     if (eql(u8, command, "status")) {
         if (args.len != 0) return error.Usage;
         return status(ctx);
     }
-    if (eql(u8, command, "switch") or eql(u8, command, "parallel")) {
-        const o = try options(ctx, args, &.{ "-m", "--text" });
+    if (eql(u8, command, "switch") or eql(u8, command, "track") or eql(u8, command, "parallel")) {
+        const o = try options(ctx, args, &.{ "-m", "--text", "--project" });
         if (o.words.len == 0) return error.Usage;
         const text = o.values[0] orelse o.values[1];
-        const target = if (eql(u8, command, "switch")) "/api/switch" else "/api/parallel";
-        const reply = try call(ctx, "POST", target, try jsonBody(ctx, .{ .task = try joined(ctx, o.words), .text = text }));
+        const target = if (eql(u8, command, "parallel")) "/api/parallel" else "/api/switch";
+        var body: std.json.ObjectMap = .empty;
+        try body.put(ctx.a, "task", .{ .string = try joined(ctx, o.words) });
+        try body.put(ctx.a, "text", if (text) |value| .{ .string = value } else .null);
+        if (o.values[2]) |raw| {
+            const id = try projectId(raw);
+            try body.put(ctx.a, "project_id", if (id) |value| .{ .integer = value } else .null);
+        }
+        const reply = try call(ctx, "POST", target, try jsonBody(ctx, std.json.Value{ .object = body }));
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { task: Task, created: bool }, ctx, reply.body);
-        try ctx.out.writeAll(if (eql(u8, command, "switch")) "focus     " else "parallel  ");
+        try ctx.out.writeAll(if (eql(u8, command, "parallel")) "parallel  " else "focus     ");
         try writeTask(ctx.out, r.task);
         try ctx.out.writeAll(if (r.created) " (new task)\n" else "\n");
         return .ok;
@@ -427,7 +576,7 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         for (args) |arg| {
             if (eql(u8, arg, "--unattended")) attended = false else try rest.append(ctx.a, arg);
         }
-        const o = try options(ctx, rest.items, &.{ "--source", "--run", "--event", "--subject", "--default" });
+        const o = try options(ctx, rest.items, &.{ "--source", "--run", "--event", "--subject", "--default", "--project-key", "--project-hint", "--first-prompt" });
         if (o.words.len != 1 or o.values[0] == null or o.values[1] == null) return error.Usage;
         const reply = try call(ctx, "POST", "/api/capture", try jsonBody(ctx, .{
             .source = o.values[0].?,
@@ -436,6 +585,9 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
             .kind = o.words[0],
             .subject = o.values[3],
             .default_subject = o.values[4],
+            .project_key = o.values[5],
+            .project_hint = o.values[6],
+            .first_prompt = o.values[7],
             .attended = attended,
         }));
         if (!try settle(ctx, reply)) return .failed;

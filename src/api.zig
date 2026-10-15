@@ -21,6 +21,7 @@ pub const default_port: u16 = 47100;
 pub const setting_keys = [_][]const u8{
     "reporting_zone",  "daily_work_minutes", "lunch_minutes",     "http_port",
     "post_sessions",
+    "project_provider_field",
     // Dashboard preferences.
     "ui_day_order",    "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",      "ui_show_add_entry", "ui_chart_visible", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch",
     "ui_chart_days",   "ui_left_collapsed",  "ui_lang",           "ui_summary_format", "ui_autofill_obs",   "ui_links",
@@ -48,6 +49,26 @@ pub const App = struct {
     /// The provider's static traits; empty without one.
     traits: Traits = .{},
     running_post: ?*const fn () ?i64 = null,
+    declared_fields: []const []const u8 = &.{},
+    declared_fields_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+
+    pub fn clearDeclaredFields(app: *App) void {
+        app.declared_fields_arena.deinit();
+        app.declared_fields_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        app.declared_fields = &.{};
+    }
+
+    pub fn loadDeclaredFields(app: *App, json: []const u8) !void {
+        var replacement = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer replacement.deinit();
+        const a = replacement.allocator();
+        const parsed = try std.json.parseFromSliceLeaky([]const struct { name: []const u8 }, a, json, .{ .ignore_unknown_fields = true });
+        var names: std.ArrayList([]const u8) = .empty;
+        for (parsed) |field| if (field.name.len > 0) try names.append(a, field.name);
+        app.clearDeclaredFields();
+        app.declared_fields_arena = replacement;
+        app.declared_fields = names.items;
+    }
 };
 
 pub const ProviderStatus = struct {
@@ -151,13 +172,13 @@ fn fail(a: std.mem.Allocator, f: Fail) Response {
 
 fn errorResponse(a: std.mem.Allocator, err: anyerror) Response {
     const status: std.http.Status = switch (err) {
-        error.UnknownTask, error.UnknownInterval, error.UnknownNote => .not_found,
-        error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen => .conflict,
+        error.UnknownTask, error.UnknownInterval, error.UnknownNote, error.UnknownProject => .not_found,
+        error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen, error.DuplicateProject, error.AmbiguousTask => .conflict,
         error.InvalidRange => .bad_request,
         error.NoFocus, error.NoOpenInterval, error.AlreadyOpen, error.SomethingOpen, error.BindingConflict, error.PostingBlocked, error.PostingInFlight, error.InvalidState, error.NoProvider, error.NotBound, error.NothingToPost, error.SessionOpen => .conflict,
         error.UnknownPosting => .not_found,
         error.ProviderOutput => .bad_gateway,
-        error.EmptyText, error.InvalidSetting, error.UnknownZone, error.InvalidTime, error.InvalidDate, error.InvalidSchedule => .bad_request,
+        error.EmptyText, error.InvalidSetting, error.UnknownZone, error.InvalidTime, error.InvalidDate, error.InvalidSchedule, error.InvalidProjectLabel, error.InvalidProjectKey => .bad_request,
         else => .internal_server_error,
     };
     return fail(a, .{ .status = status, .code = @errorName(err) });
@@ -258,6 +279,7 @@ fn is(req: Request, method: std.http.Method, path: []const u8, want: []const u8)
 fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !Response {
     if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true });
     if (is(req, .GET, path, "/api/version")) return send(a, .ok, .{ .version = @import("build_options").version, .pid = GetCurrentProcessId(), .update_repo = @import("build_options").update_repo });
+    if (try projectsRoute(app, a, req, path, params)) |response| return response;
     if (try history(app, a, req, path)) |r| return r;
     if (is(req, .GET, path, "/api/search")) return search(app, a, params);
     if (is(req, .GET, path, "/api/daytotals")) return dayTotals(app, a, params);
@@ -316,14 +338,16 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             return send(a, .ok, .{ .task = t, .fields = try query.fields(app.store, a, id) });
         }
         if (req.method == .PATCH) {
-            const body = try parseBody(struct { title: []const u8 }, a, req.body) orelse return badRequest(a, "body");
-            try app.store.setTitle(id, std.mem.trim(u8, body.title, " \t"), app.clock());
+            const body = try parseBody(struct { title: ?[]const u8 = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+            const choice = try projectChoice(a, req.body);
+            if (body.title == null and choice == .omitted) return badRequest(a, "body");
+            try app.store.updateTask(id, if (body.title) |title| std.mem.trim(u8, title, " \t") else null, choice, app.clock());
             return send(a, .ok, .{ .task = (try query.task(app.store, a, id)).? });
         }
     }
     if (is(req, .POST, path, "/api/tasks")) {
-        const body = try parseBody(struct { title: []const u8 }, a, req.body) orelse return badRequest(a, "body");
-        const id = try app.store.createTask(std.mem.trim(u8, body.title, " \t"), app.clock());
+        const body = try parseBody(struct { title: []const u8, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const id = try app.store.createTaskWithProject(std.mem.trim(u8, body.title, " \t"), try projectChoice(a, req.body), app.clock());
         return send(a, .created, .{ .task = (try query.task(app.store, a, id)).? });
     }
     if (is(req, .POST, path, "/api/capture")) {
@@ -334,6 +358,9 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             kind: []const u8,
             subject: ?[]const u8 = null,
             default_subject: ?[]const u8 = null,
+            project_key: ?[]const u8 = null,
+            project_hint: ?[]const u8 = null,
+            first_prompt: ?[]const u8 = null,
             attended: bool = true,
             note: ?[]const u8 = null,
         };
@@ -349,32 +376,34 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         if (kind == .subject and body.subject == null) return badRequest(a, "subject");
         if (body.note) |n| if (n.len > 2000) return badRequest(a, "note");
         if (body.event) |event| if (try app.store.captureEventSeen(body.source, event)) return send(a, .ok, .{ .applied = false });
-        var c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = body.note };
-        if (body.subject) |s| c.task = try captureTask(app, a, s) orelse return badRequest(a, "subject");
-        if (body.default_subject) |s| if (!try app.store.captureRunHasTask(body.source, body.run)) {
-            c.default_task = try captureTask(app, a, s) orelse return badRequest(a, "default_subject");
-        };
-        const applied = try app.store.capture(c, app.clock());
-        return send(a, .ok, .{ .applied = applied });
+        if (body.project_key) |key| if (key.len == 0 or key.len > 2048) return badRequest(a, "project_key");
+        if (body.project_hint) |hint| if (hint.len > 200) return badRequest(a, "project_hint");
+        if (body.first_prompt) |seed| if (seed.len > 2000) return badRequest(a, "first_prompt");
+        const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = body.note,
+            .subject = body.subject, .default_subject = body.default_subject, .project_key = body.project_key, .project_hint = body.project_hint, .first_prompt = body.first_prompt };
+        const result = try app.store.captureDetailed(c, app.clock());
+        return send(a, .ok, result);
     }
     if (is(req, .POST, path, "/api/switch") or is(req, .POST, path, "/api/parallel")) {
-        const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const choice = try projectChoice(a, req.body);
+        const scope = try choiceScope(app, choice);
         var created = false;
-        const id = switch (try query.resolve(app.store, a, body.task)) {
+        const id = switch (try query.resolve(app.store, a, body.task, scope)) {
             .found => |id| id,
             .ambiguous => |list| return ambiguous(a, list),
             .none => blk: {
                 const title = std.mem.trim(u8, body.task, " \t");
                 if (title.len > 0 and title[0] == '#') return error.UnknownTask;
                 created = true;
-                break :blk try app.store.createTask(title, app.clock());
+                break :blk try app.store.createTaskWithProject(title, if (choice == .omitted and scope == null) .omitted else .{ .selected = scope }, app.clock());
             },
         };
         const text = if (body.text) |t| if (std.mem.trim(u8, t, " \t").len == 0) null else t else null;
         const interval = if (std.mem.eql(u8, path, "/api/switch"))
-            try app.store.switchTo(id, text, app.clock())
+            try app.store.switchToProject(id, text, choice, app.clock())
         else
-            try app.store.openParallel(id, text, app.clock());
+            try app.store.openParallelProject(id, text, choice, app.clock());
         return send(a, .ok, .{ .interval = interval, .task = (try query.task(app.store, a, id)).?, .created = created });
     }
     if (is(req, .POST, path, "/api/stop")) {
@@ -448,6 +477,59 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
     return notFound(a);
 }
 
+fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !?Response {
+    if (is(req, .GET, path, "/api/projects")) {
+        const archived = try param(a, params, "archived") orelse "0";
+        if (!std.mem.eql(u8, archived, "0") and !std.mem.eql(u8, archived, "1")) return badRequest(a, "archived");
+        return send(a, .ok, .{ .projects = try query.projects(app.store, a, std.mem.eql(u8, archived, "1")) });
+    }
+    if (is(req, .POST, path, "/api/projects")) {
+        const body = try parseBody(struct { label: []const u8 }, a, req.body) orelse return badRequest(a, "body");
+        const id = try app.store.createProject(body.label, app.clock());
+        return send(a, .created, .{ .project = (try query.project(app.store, a, id)).? });
+    }
+    if (is(req, .GET, path, "/api/project-keys")) return send(a, .ok, .{ .keys = try query.captureProjectKeys(app.store, a) });
+    if (is(req, .PATCH, path, "/api/project-keys")) {
+        const body = try parseBody(struct { source: []const u8, project_key: []const u8, project_id: i64 }, a, req.body) orelse return badRequest(a, "body");
+        if (body.project_id <= 0) return badRequest(a, "project_id");
+        var hint: ?[]const u8 = null;
+        for (try query.captureProjectKeys(app.store, a)) |key| if (std.mem.eql(u8, key.source, body.source) and std.mem.eql(u8, key.project_key, body.project_key)) { hint = key.project_hint; break; };
+        if (hint == null) return error.UnknownProject;
+        try app.store.setCaptureProjectKey(body.source, body.project_key, hint.?, body.project_id, app.clock());
+        return send(a, .ok, .{ .mapping = query.CaptureProjectKey{ .source = body.source, .project_key = body.project_key, .project_hint = hint.?, .project_id = body.project_id } });
+    }
+    if (is(req, .POST, path, "/api/projects/assign/preview")) {
+        const Scope = struct { task_id: ?i64 = null, interval_ids: ?[]const i64 = null, unassigned_suggestions: bool = false };
+        const body = try parseBody(struct { scope: Scope, project_id: ?i64 }, a, req.body) orelse return badRequest(a, "body");
+        const count: u8 = @intFromBool(body.scope.task_id != null) + @as(u8, @intFromBool(body.scope.interval_ids != null)) + @as(u8, @intFromBool(body.scope.unassigned_suggestions));
+        if (count != 1) return badRequest(a, "scope");
+        if (body.project_id) |id| if (id <= 0) return badRequest(a, "project_id");
+        var scope: store_mod.AssignmentScope = .unassigned_suggestions;
+        if (body.scope.task_id) |id| {
+            if (id <= 0 or try query.task(app.store, a, id) == null) return error.UnknownTask;
+            scope = .{ .task_id = id };
+        }
+        if (body.scope.interval_ids) |ids| {
+            if (ids.len == 0) return badRequest(a, "interval_ids");
+            for (ids) |id| if (id <= 0) return badRequest(a, "interval_ids");
+            scope = .{ .interval_ids = ids };
+        }
+        return send(a, .ok, try query.projectAssignmentPreview(app.store, a, scope, body.project_id));
+    }
+    if (is(req, .POST, path, "/api/projects/assign/apply")) {
+        const body = try parseBody(struct { snapshot: store_mod.AssignmentSnapshot }, a, req.body) orelse return badRequest(a, "body");
+        return send(a, .ok, try app.store.applyProjectAssign(body.snapshot, body.snapshot.project_id, app.clock()));
+    }
+    if (req.method == .PATCH) if (idBetween(path, "/api/projects/", "")) |id| {
+        if (id <= 0) return badRequest(a, "id");
+        const body = try parseBody(struct { label: ?[]const u8 = null, archived: ?bool = null }, a, req.body) orelse return badRequest(a, "body");
+        if ((body.label == null) == (body.archived == null)) return badRequest(a, "body");
+        if (body.label) |label| try app.store.renameProject(id, label, app.clock()) else try app.store.archiveProject(id, body.archived.?, app.clock());
+        return send(a, .ok, .{ .project = (try query.project(app.store, a, id)).? });
+    };
+    return null;
+}
+
 fn knownSetting(app: *const App, key: []const u8) bool {
     for (setting_keys) |k| if (std.mem.eql(u8, k, key)) return true;
     return providerSetting(app, key) != null;
@@ -470,20 +552,16 @@ const Existing = union(enum) { id: i64, response: Response };
 /// An existing task, or the response to send instead (ambiguous match).
 /// A captured subject names a task as `switch` does, and is created when
 /// nothing matches. Null when it is ambiguous or names a missing `#id`.
-fn captureTask(app: *App, a: std.mem.Allocator, text: []const u8) !?i64 {
-    return switch (try query.resolve(app.store, a, text)) {
+fn captureTask(app: *App, a: std.mem.Allocator, text: []const u8, scope: ?i64) !?i64 {
+    return switch (try query.resolve(app.store, a, text, scope)) {
         .found => |id| id,
         .ambiguous => null,
-        .none => blk: {
-            const title = std.mem.trim(u8, text, " \t");
-            if (title.len == 0 or title[0] == '#') break :blk null;
-            break :blk try app.store.createTask(title, app.clock());
-        },
+        .none => null,
     };
 }
 
 fn resolveExisting(app: *App, a: std.mem.Allocator, text: []const u8) !Existing {
-    return switch (try query.resolve(app.store, a, text)) {
+    return switch (try query.resolve(app.store, a, text, try focusProject(app))) {
         .found => |id| .{ .id = id },
         .none => error.UnknownTask,
         .ambiguous => |list| .{ .response = ambiguous(a, list) },
@@ -495,6 +573,28 @@ fn parseBody(comptime T: type, a: std.mem.Allocator, body: []const u8) !?T {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
+}
+
+fn projectChoice(a: std.mem.Allocator, body: []const u8) !store_mod.ProjectChoice {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return error.InvalidProjectLabel;
+    if (value != .object) return error.InvalidProjectLabel;
+    const raw = value.object.get("project_id") orelse return .omitted;
+    return switch (raw) {
+        .null => .{ .selected = null },
+        .integer => |id| if (id > 0) .{ .selected = id } else error.InvalidProjectLabel,
+        else => error.InvalidProjectLabel,
+    };
+}
+
+fn focusProject(app: *App) !?i64 {
+    var stmt = try app.store.db.prepare("SELECT project_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+    defer stmt.finalize();
+    if (try stmt.step() != .row) return null;
+    return if (stmt.columnIsNull(0)) null else stmt.columnI64(0);
+}
+
+fn choiceScope(app: *App, choice: store_mod.ProjectChoice) !?i64 {
+    return switch (choice) { .omitted => try focusProject(app), .selected => |id| id };
 }
 
 fn param(a: std.mem.Allocator, params: []const u8, name: []const u8) !?[]const u8 {
@@ -659,6 +759,7 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
         }
     }.lessThan);
     const intervals = try query.intervalsBetween(app.store, a, bounds.start_ms, bounds.end_ms);
+    const project_totals = try query.projectTotalsBetween(app.store, a, bounds.start_ms, bounds.end_ms, app.clock());
     // Tasks seen only in parallel still get their fields, for the report.
     var others: std.ArrayList(TaskTotal) = .empty;
     for (intervals) |i| {
@@ -686,6 +787,7 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
         .numbers = numbersOf(n),
         .tasks = totals.items,
         .intervals = intervals,
+        .project_totals = project_totals,
         .summary = try summaryOf(app, a, date.text),
         .lunch_out_ms = if (lunches.len > 0) lunches[0].start_ms else null,
         .lunch_back_ms = if (lunches.len > 0 and !(lunch_open and lunches[lunches.len - 1].end_ms >= app.clock())) lunches[lunches.len - 1].end_ms else null,
@@ -953,6 +1055,7 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
         task: query.Task,
         fields: []query.Field,
         snippet: ?[]const u8,
+        historical_projects: []query.ProjectRef,
         total_ms: i64,
         day_count: usize,
         last_date: ?[]const u8,
@@ -980,6 +1083,7 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
             .task = found.task,
             .fields = try query.fields(app.store, a, found.task.id),
             .snippet = found.snippet,
+            .historical_projects = found.historical_projects,
             .total_ms = total,
             .day_count = keys.len,
             .last_date = if (keys.len > 0) keys[keys.len - 1] else null,
@@ -1023,6 +1127,7 @@ fn frequentTasks(app: *App, a: std.mem.Allocator, params: []const u8) !Response 
 fn chart(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     const day_count = try intParam(a, params, "days", 14, 90) orelse return badRequest(a, "days");
     const group = try param(a, params, "group") orelse "task";
+    if (std.mem.eql(u8, group, "project")) return projectChart(app, a, day_count);
     const z = try loadZone(app, a);
     const today = dayIndex(try dateParam(app, a, null));
     var dates: std.ArrayList([]const u8) = .empty;
@@ -1058,6 +1163,35 @@ fn chart(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
         fn lessThan(_: void, l: Series, r: Series) bool {
             return l.total_ms > r.total_ms;
         }
+    }.lessThan);
+    return send(a, .ok, .{ .dates = dates.items, .series = list });
+}
+
+fn projectChart(app: *App, a: std.mem.Allocator, day_count: u32) !Response {
+    const z = try loadZone(app, a);
+    const today = dayIndex(try dateParam(app, a, null));
+    const Series = struct { project_id: ?i64, label: []const u8, total_ms: i64 = 0, ms: []i64 };
+    var dates: std.ArrayList([]const u8) = .empty;
+    var series: std.StringArrayHashMapUnmanaged(Series) = .empty;
+    for (0..day_count) |col| {
+        const date = try fromCivilDays(a, today - @as(i64, @intCast(day_count - 1 - col)));
+        try dates.append(a, date.text);
+        const bounds = try z.dayBounds(date.year, date.month, date.day);
+        for (try query.projectTotalsBetween(app.store, a, bounds.start_ms, bounds.end_ms, app.clock())) |t| {
+            const key = if (t.project_id) |id| try std.fmt.allocPrint(a, "#{d}", .{id}) else "unassigned";
+            const slot = try series.getOrPut(a, key);
+            if (!slot.found_existing) {
+                const ms = try a.alloc(i64, day_count);
+                @memset(ms, 0);
+                slot.value_ptr.* = .{ .project_id = t.project_id, .label = t.label, .ms = ms };
+            }
+            slot.value_ptr.ms[col] += t.focus_ms;
+            slot.value_ptr.total_ms += t.focus_ms;
+        }
+    }
+    const list = try a.dupe(Series, series.values());
+    std.mem.sort(Series, list, {}, struct {
+        fn lessThan(_: void, l: Series, r: Series) bool { return l.total_ms > r.total_ms; }
     }.lessThan);
     return send(a, .ok, .{ .dates = dates.items, .series = list });
 }
@@ -1204,13 +1338,15 @@ fn idBetween(path: []const u8, prefix: []const u8, suffix: []const u8) ?i64 {
 
 fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Response {
     if (is(req, .POST, path, "/api/intervals")) {
-        const body = try parseBody(struct { task: []const u8, role: []const u8 = "focus", start_ms: i64, end_ms: i64 }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { task: []const u8, role: []const u8 = "focus", start_ms: i64, end_ms: i64, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
         const role = std.meta.stringToEnum(store_mod.Role, body.role) orelse return badRequest(a, "role");
-        const id = switch (try resolveExisting(app, a, body.task)) {
-            .id => |id| id,
-            .response => |r| return r,
+        const choice = try projectChoice(a, req.body);
+        const id = switch (try query.resolve(app.store, a, body.task, try choiceScope(app, choice))) {
+            .found => |found| found,
+            .none => return error.UnknownTask,
+            .ambiguous => |list| return ambiguous(a, list),
         };
-        const interval = try app.store.addInterval(id, role, body.start_ms, body.end_ms, app.clock());
+        const interval = try app.store.addIntervalProject(id, role, body.start_ms, body.end_ms, choice, app.clock());
         return send(a, .created, .{ .interval = interval });
     }
     if (is(req, .POST, path, "/api/intervals/merge")) {
@@ -1224,6 +1360,7 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         return send(a, .ok, .{ .deleted = id });
     };
     if (req.method == .POST) if (idBetween(path, "/api/intervals/", "/move")) |id| {
+        if (try projectChoice(a, req.body) == .selected) return fail(a, .{ .status = .conflict, .code = "AssignmentPreviewRequired" });
         const body = try parseBody(struct { seen: SeenBody, task: i64, from_ms: ?i64 = null, to_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
         const part: ?Store.Part = if (body.from_ms != null and body.to_ms != null) .{ .from = body.from_ms.?, .to = body.to_ms.? } else null;
         const moved = try app.store.moveInterval(id, seenOf(body.seen), body.task, part, app.clock());
@@ -1235,7 +1372,15 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         return send(a, .ok, .{ .deleted = id });
     };
     if (req.method == .PATCH) if (idBetween(path, "/api/intervals/", "")) |id| {
-        const body = try parseBody(struct { seen: SeenBody, start_ms: i64, end_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { seen: SeenBody, start_ms: i64, end_ms: ?i64 = null, snapshot: ?store_mod.AssignmentSnapshot = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const choice = try projectChoice(a, req.body);
+        if (choice == .selected) {
+            const snapshot = body.snapshot orelse return fail(a, .{ .status = .conflict, .code = "AssignmentPreviewRequired" });
+            if (snapshot.intervals.len != 1 or snapshot.intervals[0].id != id or snapshot.project_id != choice.selected) return error.Stale;
+            if (body.start_ms != body.seen.start_ms or body.end_ms != body.seen.end_ms) return badRequest(a, "separate edits from assignment");
+            _ = try app.store.applyProjectAssign(snapshot, snapshot.project_id, app.clock());
+            return send(a, .ok, .{ .interval = id });
+        }
         try app.store.editInterval(id, seenOf(body.seen), body.start_ms, body.end_ms, app.clock());
         return send(a, .ok, .{ .interval = id });
     };
@@ -1256,6 +1401,12 @@ const ui_flags = [_][]const u8{ "ui_hide_weekends", "ui_show_keys", "ui_show_add
 /// Dashboard preferences: checked here, since the store does not know them.
 fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
     const v = value orelse return true;
+    if (std.mem.eql(u8, key, "project_provider_field")) {
+        if (v.len == 0) return true;
+        if (v.len > 200) return false;
+        for (app.declared_fields) |name| if (std.mem.eql(u8, v, name)) return true;
+        return false;
+    }
     if (providerSetting(app, key)) |s| return validProviderValue(s, v);
     for (ui_flags) |f| if (std.mem.eql(u8, key, f)) return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "1");
     const Choice = struct { key: []const u8, values: []const []const u8 };
@@ -1329,11 +1480,19 @@ fn remainingFor(app: *App, a: std.mem.Allocator, date: Date, task: i64, instance
     const bounds = try z.dayBounds(date.year, date.month, date.day);
     const focus = try query.focusOnDay(app.store, a, task, bounds.start_ms, bounds.end_ms);
     const coverage = try query.coverageOn(app.store, a, date.text, instance, ref);
-    const focus_spans = try a.alloc(sessions.Span, focus.spans.len);
-    for (focus.spans, 0..) |span, i| focus_spans[i] = .{ .start_ms = span.start_ms, .end_ms = span.end_ms };
+    var focus_spans: std.ArrayList(sessions.Span) = .empty;
+    var prior_span: ?i64 = null;
+    for (focus.spans) |span| {
+        if (span.posting_span_id != null and span.posting_span_id == prior_span and focus_spans.items.len > 0 and focus_spans.items[focus_spans.items.len - 1].end_ms == span.start_ms) {
+            focus_spans.items[focus_spans.items.len - 1].end_ms = span.end_ms;
+        } else {
+            try focus_spans.append(a, .{ .start_ms = span.start_ms, .end_ms = span.end_ms });
+        }
+        prior_span = span.posting_span_id;
+    }
     const covered_spans = try a.alloc(sessions.Span, coverage.len);
     for (coverage, 0..) |span, i| covered_spans[i] = .{ .start_ms = span.start_ms, .end_ms = span.end_ms };
-    const pieces = try sessions.remaining(a, &z, bounds.start_ms, bounds.end_ms, focus_spans, covered_spans);
+    const pieces = try sessions.remaining(a, &z, bounds.start_ms, bounds.end_ms, focus_spans.items, covered_spans);
     return .{ .pieces = pieces, .open_session = focus.open_session };
 }
 
@@ -1575,6 +1734,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
         .fields => {
             if (!succeeded(outcome)) return providerFailure(a, outcome, null);
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, outcome.done.out, .{}) catch return error.ProviderOutput;
+            try app.loadDeclaredFields(outcome.done.out);
             return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions, .not_signed_in_code = app.traits.not_signed_in_code, .status = app.provider_status });
         },
         .lookup => |l| {
@@ -1749,6 +1909,7 @@ const Fixture = struct {
     }
 
     fn deinit(f: *Fixture) void {
+        f.app.clearDeclaredFields();
         f.arena.deinit();
         f.db.close();
     }
@@ -1957,6 +2118,352 @@ test "settings change together or not at all" {
 
 fn contains(body: []const u8, part: []const u8) bool {
     return std.mem.indexOf(u8, body, part) != null;
+}
+
+fn apiScalar(db: *sqlite.Db, sql: []const u8) !i64 {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    try std.testing.expectEqual(.row, try stmt.step());
+    return stmt.columnI64(0);
+}
+
+test "manual focus keeps its project when capture maps the same task elsewhere" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"A\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"B\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"k\",\"project_hint\":\"capture\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"source\":\"agent\",\"project_key\":\"k\",\"project_id\":2}").status);
+    const manual = f.call(.POST, "/api/switch", "{\"task\":\"T\",\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, manual.status);
+    const t = (try std.json.parseFromSliceLeaky(struct { task: query.Task }, f.arena.allocator(), manual.body, .{ .ignore_unknown_fields = true })).task.id;
+    test_now += 30_000;
+    const prompt = try std.fmt.allocPrint(f.arena.allocator(), "{{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"#{d}\",\"note\":\"do work\"}}", .{t});
+    const result = f.call(.POST, "/api/capture", prompt);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+    try std.testing.expect(contains(result.body, "\"project_id\":2"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='focus' AND project_id=1 AND captured=0"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes WHERE text='do work' AND source='prompt'"));
+}
+
+test "title lookup is scoped to project and reports ambiguity within it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Same\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"same\",\"project_id\":2}");
+    const a = f.call(.POST, "/api/switch", "{\"task\":\"SAME\",\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, a.status);
+    try std.testing.expect(contains(a.body, "\"id\":1"));
+    const b = f.call(.POST, "/api/switch", "{\"task\":\"SAME\",\"project_id\":2}");
+    try std.testing.expectEqual(std.http.Status.ok, b.status);
+    try std.testing.expect(contains(b.body, "\"id\":2"));
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"SAME\",\"project_id\":2}");
+    const ambiguous_result = f.call(.POST, "/api/switch", "{\"task\":\"same\",\"project_id\":2}");
+    try std.testing.expectEqual(std.http.Status.conflict, ambiguous_result.status);
+    try std.testing.expect(contains(ambiguous_result.body, "AmbiguousTask"));
+    const by_id = f.call(.POST, "/api/switch", "{\"task\":\"#1\",\"project_id\":2}");
+    try std.testing.expectEqual(std.http.Status.ok, by_id.status);
+    try std.testing.expect(contains(by_id.body, "\"id\":1"));
+}
+
+test "shared captured task alternates projects between runs" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_136_800_000;
+    const task = f.call(.POST, "/api/tasks", "{\"title\":\"Shared\"}");
+    try std.testing.expectEqual(std.http.Status.created, task.status);
+    // Each run names its project on start; the first sight creates it.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"b\",\"project_hint\":\"B\"}").status);
+    const first = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"first\"}");
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    test_now += 20_000;
+    const second = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b1\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"second\"}");
+    try std.testing.expectEqual(std.http.Status.ok, second.status);
+    test_now += 20_000;
+    const third = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a2\",\"kind\":\"prompt\",\"note\":\"third\"}");
+    try std.testing.expectEqual(std.http.Status.ok, third.status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND captured=1"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2"));
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM notes n JOIN intervals i ON i.id=n.interval_id WHERE i.task_id=1"));
+}
+
+test "grace continuation carries old project through gap before split" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_136_800_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"first_prompt\":\"Task\",\"note\":\"keep\"}").status);
+    test_now += 20_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a2\",\"kind\":\"stop\"}");
+    test_now += 10_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a3\",\"kind\":\"end\"}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"b\",\"project_hint\":\"B\"}");
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b1\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"new\"}").status);
+    try std.testing.expectEqual(@as(i64, 40_000), try apiScalar(&f.db, "SELECT end_ms-start_ms FROM intervals WHERE project_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2 AND posting_span_id=(SELECT id FROM intervals WHERE project_id=1)"));
+}
+
+test "history add resolves a title in chosen project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Same\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Same\",\"project_id\":2}");
+    const body = try std.fmt.allocPrint(f.arena.allocator(), "{{\"task\":\"same\",\"project_id\":2,\"start_ms\":{d},\"end_ms\":{d}}}", .{ test_now - 120_000, test_now - 60_000 });
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/intervals", body).status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND project_id=2"));
+}
+
+test "capture promotes manual parallel without changing its project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/parallel", "{\"task\":\"T\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"b\",\"project_hint\":\"B\"}");
+    test_now += 20_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"#1\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND role='focus' AND end_ms IS NULL AND project_id=1"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2"));
+}
+
+test "subject uses target default when key is absent" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Old\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"New\",\"project_id\":2}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"old\"}");
+    test_now += 20_000;
+    const subject = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"subject\",\"subject\":\"#2\"}");
+    try std.testing.expectEqual(std.http.Status.ok, subject.status);
+    try std.testing.expect(contains(subject.body, "\"project_id\":2"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND project_id=2 AND end_ms IS NULL"));
+}
+
+test "same-task subject with changed key splits captured project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"first_prompt\":\"T\",\"note\":\"old\"}");
+    test_now += 20_000;
+    const changed = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"x\",\"kind\":\"subject\",\"subject\":\"#1\",\"project_key\":\"b\",\"project_hint\":\"B\"}");
+    try std.testing.expectEqual(std.http.Status.ok, changed.status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND captured=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2 AND end_ms IS NULL"));
+}
+
+test "a project change during a run's grace waits until work resumes" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"first_prompt\":\"T\"}");
+    test_now += 20_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"t\",\"kind\":\"stop\"}");
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"x\",\"kind\":\"subject\",\"subject\":\"#1\",\"project_key\":\"b\",\"project_hint\":\"B\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1"));
+    test_now += 10_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"q\",\"kind\":\"prompt\"}");
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2 AND end_ms IS NULL"));
+}
+
+test "task patch rolls back title when project is invalid" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Original\"}");
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.PATCH, "/api/tasks/1", "{\"title\":\"Changed\",\"project_id\":999}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND title='Original'"));
+}
+
+test "provider field validation uses all loaded declarations without provider GET" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    var fields: std.ArrayList(u8) = .empty;
+    const a = f.arena.allocator();
+    try fields.appendSlice(a, "[");
+    for (0..70) |i| {
+        if (i != 0) try fields.appendSlice(a, ",");
+        try fields.appendSlice(a, try std.fmt.allocPrint(a, "{{\"name\":\"field{d}\"}}", .{i}));
+    }
+    try fields.appendSlice(a, "]");
+    try f.app.loadDeclaredFields(fields.items);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"field69\"}").status);
+    f.app.clearDeclaredFields();
+    try f.app.loadDeclaredFields("[{\"name\":\"replacement\"}]");
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"field69\"}").status);
+}
+
+test "capture key changes split captured time, terminal context waits, and duplicate is inert" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_136_800_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"A\",\"project_hint\":\"Alpha\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"b\",\"kind\":\"busy\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    const first = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p1\",\"kind\":\"prompt\",\"first_prompt\":\"Investigate startup failure\",\"note\":\"first note\"}");
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    try std.testing.expect(contains(first.body, "\"project_id\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='Investigate startup failure' AND project_id=1"));
+    test_now += 20_000;
+    const second = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p2\",\"kind\":\"prompt\",\"project_key\":\"B\",\"project_hint\":\"Beta\",\"note\":\"second note\"}");
+    try std.testing.expectEqual(std.http.Status.ok, second.status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE captured=1 AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes WHERE text='first note' AND interval_id=(SELECT id FROM intervals WHERE project_id=1)"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes WHERE text='second note' AND interval_id=(SELECT id FROM intervals WHERE project_id=2)"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=1 AND posting_span_id=id"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2 AND posting_span_id=(SELECT id FROM intervals WHERE project_id=1)"));
+    const duplicate = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p2\",\"kind\":\"prompt\",\"project_key\":\"C\",\"project_hint\":\"Gamma\"}");
+    try std.testing.expect(contains(duplicate.body, "\"applied\":false"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"stop\",\"kind\":\"stop\",\"project_key\":\"A\"}").status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/projects/1", "{\"archived\":true}").status);
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p3\",\"kind\":\"prompt\"}").status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND project_id=1"));
+}
+
+test "capture keys keep distinct long hints and reject blank first hints" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    var hint: [200]u8 = undefined;
+    @memset(&hint, 'x');
+    const a = f.arena.allocator();
+    const first = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"one\",\"event\":\"a\",\"kind\":\"start\",\"project_key\":\"one\",\"project_hint\":\"{s}\"}}", .{hint[0..]});
+    const second = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"two\",\"event\":\"b\",\"kind\":\"start\",\"project_key\":\"two\",\"project_hint\":\"{s}\"}}", .{hint[0..]});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", first).status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", second).status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(DISTINCT label) FROM projects WHERE length(CAST(label AS BLOB))<=200"));
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"bad\",\"event\":\"x\",\"kind\":\"start\",\"project_key\":\"bad\",\"project_hint\":\"  \"}").status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+}
+
+test "explicit Unassigned blocks first provider fallback and invalid labels are ignored" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.GET, "/api/provider", "").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"unknown\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"client\"}").status);
+    const explicit = f.call(.POST, "/api/tasks", "{\"title\":\"explicit\",\"project_id\":null}");
+    try std.testing.expectEqual(std.http.Status.created, explicit.status);
+    const id = (try std.json.parseFromSliceLeaky(struct { task: query.Task }, f.arena.allocator(), explicit.body, .{ .ignore_unknown_fields = true })).task.id;
+    try f.store.bindWithFields(id, "fake", "E-1", &.{.{ .name = "client", .value = "Valid" }}, test_now);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='explicit' AND project_id IS NULL AND project_choice_explicit=1 AND project_fallback_eligible=0"));
+    const pending = try f.store.createTask("pending", test_now);
+    try f.store.bindWithFields(pending, "fake", "P-1", &.{.{ .name = "client", .value = " bad " }}, test_now);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='pending' AND project_id IS NULL AND project_fallback_eligible=0"));
+    try f.store.bindWithFields(pending, "fake", "P-1", &.{.{ .name = "client", .value = "Valid" }}, test_now);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    const eligible = try f.store.createTask("eligible", test_now);
+    try f.store.bindWithFields(eligible, "fake", "E-2", &.{.{ .name = "client", .value = "Valid" }}, test_now);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects WHERE label='Valid'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='eligible' AND project_id=(SELECT id FROM projects WHERE label='Valid') AND project_fallback_eligible=0"));
+}
+
+test "project assignment preview is read-only and apply checks task role totals and scope" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    const task_id = try f.store.createTaskWithProject("T", .{ .selected = 1 }, test_now);
+    const other = try f.store.createTask("other", test_now);
+    const start = test_now - 120_000;
+    const end = test_now - 60_000;
+    const interval = try f.store.addInterval(task_id, .focus, start, end, test_now);
+    const edit_path = try std.fmt.allocPrint(a, "/api/intervals/{d}", .{interval});
+    const edit = try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d},\"project_id\":2}}", .{ start, end, start, end });
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.PATCH, edit_path, edit).status);
+    const move_path = try std.fmt.allocPrint(a, "/api/intervals/{d}/move", .{interval});
+    const move = try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"task\":{d},\"project_id\":2}}", .{ start, end, other });
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, move_path, move).status);
+    const preview_body = try std.fmt.allocPrint(a, "{{\"scope\":{{\"task_id\":{d}}},\"project_id\":2}}", .{task_id});
+    const preview = f.call(.POST, "/api/projects/assign/preview", preview_body);
+    try std.testing.expectEqual(std.http.Status.ok, preview.status);
+    const parsed = try std.json.parseFromSliceLeaky(store_mod.AssignmentPreview, a, preview.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqual(@as(usize, 1), parsed.snapshot.intervals.len);
+    try std.testing.expectEqual(@as(i64, 60_000), parsed.snapshot.intervals[0].focus_ms);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=1"));
+    const apply_body = try std.json.Stringify.valueAlloc(a, .{ .snapshot = parsed.snapshot }, .{});
+    try f.db.exec("UPDATE intervals SET role='parallel' WHERE id=1");
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+    try f.db.exec("UPDATE intervals SET role='focus' WHERE id=1");
+    try f.db.exec("UPDATE intervals SET task_id=2 WHERE id=1");
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+    try f.db.exec("UPDATE intervals SET task_id=1 WHERE id=1");
+    const applied = f.call(.POST, "/api/projects/assign/apply", apply_body);
+    try std.testing.expectEqual(std.http.Status.ok, applied.status);
+    try std.testing.expect(contains(applied.body, "\"changed\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2"));
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+}
+
+test "forty seconds split by project posts as one unchanged session" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    f.app.traits = parseTraits(f.arena.allocator(), "{\"sessions\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"post_sessions\":\"1\"}").status);
+    const day_start = (try (try zone.Zone.load("UTC")).dayBounds(2026, 3, 10)).start_ms;
+    test_now = day_start + 10 * 3_600_000 + 10_000;
+    const baseline = try f.store.createTask("baseline", test_now);
+    const split = try f.store.createTask("split", test_now);
+    try f.store.bind(baseline, "fake", "BASE", test_now);
+    try f.store.bind(split, "fake", "SPLIT", test_now);
+    const a = try f.store.createProject("A", test_now);
+    const b = try f.store.createProject("B", test_now);
+    const baseline_start = day_start + 9 * 3_600_000 + 10_000;
+    _ = try f.store.addIntervalProject(baseline, .focus, baseline_start, baseline_start + 40_000, .{ .selected = a }, test_now);
+    _ = try f.store.switchToProject(split, null, .{ .selected = a }, test_now);
+    test_now += 20_000;
+    _ = try f.store.switchToProject(split, null, .{ .selected = b }, test_now);
+    test_now += 20_000;
+    try f.store.stop(split, test_now);
+    try std.testing.expectEqual(@as(i64, 40_000), try apiScalar(&f.db, "SELECT sum(end_ms-start_ms) FROM intervals WHERE task_id=2 AND role='focus'"));
+    const offer = f.call(.GET, "/api/postings?date=2026-03-10", "");
+    try std.testing.expectEqual(std.http.Status.ok, offer.status);
+    try std.testing.expect(contains(offer.body, "\"total_focus_ms\":40000"));
+    worker.Fake.post_code = 0;
+    worker.Fake.quote_code = 0;
+    worker.Fake.fake_policy_past_only = false;
+    const baseline_post = f.call(.POST, "/api/postings", "{\"date\":\"2026-03-10\",\"task\":\"#1\"}");
+    try std.testing.expectEqual(std.http.Status.created, baseline_post.status);
+    const split_post = f.call(.POST, "/api/postings", "{\"date\":\"2026-03-10\",\"task\":\"#2\"}");
+    try std.testing.expectEqual(std.http.Status.created, split_post.status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM postings WHERE covered_end_ms-covered_start_ms=40000"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(DISTINCT amount_micro) FROM postings WHERE state='confirmed'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM postings WHERE task_id=2 AND covered_start_ms=(SELECT min(start_ms) FROM intervals WHERE task_id=2) AND covered_end_ms=(SELECT max(end_ms) FROM intervals WHERE task_id=2)"));
 }
 
 /// A fixture with the fake provider and 61 minutes of focus on task #1 today.

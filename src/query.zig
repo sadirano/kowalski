@@ -8,19 +8,23 @@ pub const Task = struct {
     id: i64,
     title: []const u8,
     ref: ?[]const u8 = null,
+    project_id: ?i64 = null,
+    project_label: ?[]const u8 = null,
 };
 
 fn dupeOpt(a: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
     return if (value) |v| try a.dupe(u8, v) else null;
 }
 
-const task_columns = "t.id,t.title,(SELECT external_ref FROM task_bindings b WHERE b.task_id=t.id)";
+const task_columns = "t.id,t.title,(SELECT external_ref FROM task_bindings b WHERE b.task_id=t.id),t.project_id,(SELECT label FROM projects p WHERE p.id=t.project_id)";
 
 fn readTask(a: std.mem.Allocator, stmt: *sqlite.Statement, first: c_int) !Task {
     return .{
         .id = stmt.columnI64(first),
         .title = try a.dupe(u8, stmt.columnText(first + 1).?),
         .ref = try dupeOpt(a, stmt.columnText(first + 2)),
+        .project_id = if (stmt.columnIsNull(first + 3)) null else stmt.columnI64(first + 3),
+        .project_label = try dupeOpt(a, stmt.columnText(first + 4)),
     };
 }
 
@@ -32,6 +36,128 @@ pub fn task(store: *Store, a: std.mem.Allocator, id: i64) !?Task {
     return try readTask(a, &stmt, 0);
 }
 
+pub const Project = struct { id: i64, label: []const u8, archived: bool };
+
+fn readProject(a: std.mem.Allocator, stmt: *sqlite.Statement) !Project {
+    return .{ .id = stmt.columnI64(0), .label = try a.dupe(u8, stmt.columnText(1).?), .archived = stmt.columnI64(2) != 0 };
+}
+
+pub fn project(store: *Store, a: std.mem.Allocator, id: i64) !?Project {
+    var stmt = try store.db.prepare("SELECT id,label,archived FROM projects WHERE id=?1");
+    defer stmt.finalize();
+    try stmt.bindI64(1, id);
+    return if (try stmt.step() == .row) try readProject(a, &stmt) else null;
+}
+
+pub fn projects(store: *Store, a: std.mem.Allocator, include_archived: bool) ![]Project {
+    var stmt = try store.db.prepare("SELECT id,label,archived FROM projects WHERE ?1=1 OR archived=0 ORDER BY archived,label COLLATE NOCASE,id");
+    defer stmt.finalize();
+    try stmt.bindI64(1, @intFromBool(include_archived));
+    var rows: std.ArrayList(Project) = .empty;
+    while (try stmt.step() == .row) try rows.append(a, try readProject(a, &stmt));
+    return rows.items;
+}
+
+pub const CaptureProjectKey = struct { source: []const u8, project_key: []const u8, project_hint: []const u8, project_id: i64 };
+
+pub fn captureProjectKeys(store: *Store, a: std.mem.Allocator) ![]CaptureProjectKey {
+    var stmt = try store.db.prepare("SELECT source,project_key,project_hint,project_id FROM capture_project_keys ORDER BY source,project_key");
+    defer stmt.finalize();
+    var rows: std.ArrayList(CaptureProjectKey) = .empty;
+    while (try stmt.step() == .row) try rows.append(a, .{ .source = try a.dupe(u8, stmt.columnText(0).?), .project_key = try a.dupe(u8, stmt.columnText(1).?), .project_hint = try a.dupe(u8, stmt.columnText(2).?), .project_id = stmt.columnI64(3) });
+    return rows.items;
+}
+
+fn wholeToken(text: []const u8, label: []const u8) bool {
+    if (label.len == 0 or text.len < label.len) return false;
+    for (0..text.len - label.len + 1) |i| {
+        if (!std.ascii.eqlIgnoreCase(text[i .. i + label.len], label)) continue;
+        const before = i == 0 or !std.ascii.isAlphanumeric(text[i - 1]);
+        const after = i + label.len == text.len or !std.ascii.isAlphanumeric(text[i + label.len]);
+        if (before and after) return true;
+    }
+    return false;
+}
+
+pub fn projectAssignmentPreview(store: *Store, a: std.mem.Allocator, scope: store_mod.AssignmentScope, target: ?i64) !store_mod.AssignmentPreview {
+    var target_label: ?[]const u8 = null;
+    if (target) |id| target_label = (try project(store, a, id) orelse return error.UnknownProject).label;
+    const zone_setting = try store.getSetting("reporting_zone");
+    defer if (zone_setting) |name| store.allocator.free(name);
+    const zone_name = try a.dupe(u8, zone_setting orelse "UTC");
+    const provider_setting = try store.getSetting("project_provider_field");
+    defer if (provider_setting) |name| store.allocator.free(name);
+    var stmt = try store.db.prepare("SELECT i.id,i.task_id,i.project_id,i.role,i.start_ms,i.end_ms,t.title FROM intervals i JOIN tasks t ON t.id=i.task_id ORDER BY i.id");
+    defer stmt.finalize();
+    var rows: std.ArrayList(store_mod.AssignmentRow) = .empty;
+    var skipped: std.ArrayList(store_mod.AssignmentRow) = .empty;
+    var selected_count: usize = 0;
+    while (try stmt.step() == .row) {
+        const id = stmt.columnI64(0);
+        const task_id = stmt.columnI64(1);
+        const old_project: ?i64 = if (stmt.columnIsNull(2)) null else stmt.columnI64(2);
+        var reason: []const u8 = "selected";
+        switch (scope) {
+            .task_id => |want| {
+                if (want != task_id) continue;
+                reason = "task";
+            },
+            .interval_ids => |ids| {
+                var chosen = false;
+                for (ids) |want| if (want == id) { chosen = true; break; };
+                if (!chosen) continue;
+                selected_count += 1;
+            },
+            .unassigned_suggestions => {
+                if (old_project != null or target_label == null) continue;
+                const label = target_label.?;
+                if (wholeToken(stmt.columnText(6).?, label)) {
+                    reason = "title";
+                } else if (provider_setting) |field| {
+                    var field_stmt = try store.db.prepare("SELECT value FROM task_fields WHERE task_id=?1 AND name=?2");
+                    defer field_stmt.finalize();
+                    try field_stmt.bindI64(1, task_id);
+                    try field_stmt.bindText(2, field);
+                    if (try field_stmt.step() != .row or !wholeToken(field_stmt.columnText(0).?, label)) continue;
+                    reason = "provider_field";
+                } else continue;
+            },
+        }
+        if (old_project == target) continue;
+        const end_ms: ?i64 = if (stmt.columnIsNull(5)) null else stmt.columnI64(5);
+        const role = try a.dupe(u8, stmt.columnText(3).?);
+        const row: store_mod.AssignmentRow = .{
+            .id = id, .task_id = task_id, .project_id = old_project,
+            .role = role, .start_ms = stmt.columnI64(4), .end_ms = end_ms,
+            .focus_ms = if (end_ms != null and std.mem.eql(u8, role, "focus")) end_ms.? - stmt.columnI64(4) else 0,
+            .reason = reason,
+        };
+        if (end_ms == null) try skipped.append(a, row) else try rows.append(a, row);
+    }
+    if (scope == .interval_ids and selected_count != scope.interval_ids.len) return error.UnknownInterval;
+    const totals = try store_mod.assignmentTotals(a, rows.items, zone_name);
+    return .{ .snapshot = .{ .project_id = target, .intervals = rows.items, .totals = totals, .reporting_zone = zone_name }, .skipped = skipped.items };
+}
+
+pub const ProjectTotal = struct { project_id: ?i64, label: []const u8, focus_ms: i64 };
+
+pub fn projectTotalsBetween(store: *Store, a: std.mem.Allocator, start_ms: i64, end_ms: i64, now_ms: i64) ![]ProjectTotal {
+    var stmt = try store.db.prepare("SELECT i.project_id,p.label,sum(min(coalesce(i.end_ms,?3),?2)-max(i.start_ms,?1)) FROM intervals i LEFT JOIN projects p ON p.id=i.project_id WHERE i.role='focus' AND i.start_ms<?2 AND coalesce(i.end_ms,?3)>?1 GROUP BY i.project_id ORDER BY p.label COLLATE NOCASE");
+    defer stmt.finalize();
+    try stmt.bindI64(1, start_ms);
+    try stmt.bindI64(2, end_ms);
+    try stmt.bindI64(3, now_ms);
+    var rows: std.ArrayList(ProjectTotal) = .empty;
+    var has_unassigned = false;
+    while (try stmt.step() == .row) {
+        const project_id: ?i64 = if (stmt.columnIsNull(0)) null else stmt.columnI64(0);
+        if (project_id == null) has_unassigned = true;
+        try rows.append(a, .{ .project_id = project_id, .label = try a.dupe(u8, stmt.columnText(1) orelse "Unassigned"), .focus_ms = stmt.columnI64(2) });
+    }
+    if (!has_unassigned) try rows.append(a, .{ .project_id = null, .label = "Unassigned", .focus_ms = 0 });
+    return rows.items;
+}
+
 pub const Resolution = union(enum) {
     found: i64,
     none,
@@ -40,7 +166,7 @@ pub const Resolution = union(enum) {
 
 /// `#N` names a kowalski id. Other text matches an external ref exactly, then
 /// a title ignoring ASCII case. Several matches at the same step are ambiguous.
-pub fn resolve(store: *Store, a: std.mem.Allocator, text: []const u8) !Resolution {
+pub fn resolve(store: *Store, a: std.mem.Allocator, text: []const u8, scope: ?i64) !Resolution {
     const trimmed = std.mem.trim(u8, text, " \t");
     if (trimmed.len == 0) return .none;
     if (trimmed[0] == '#') {
@@ -49,12 +175,15 @@ pub fn resolve(store: *Store, a: std.mem.Allocator, text: []const u8) !Resolutio
     }
     const steps = [_][]const u8{
         "SELECT " ++ task_columns ++ " FROM tasks t JOIN task_bindings k ON k.task_id=t.id WHERE k.external_ref=?1 ORDER BY t.id LIMIT 20",
-        "SELECT " ++ task_columns ++ " FROM tasks t WHERE t.title=?1 COLLATE NOCASE ORDER BY t.id LIMIT 20",
+        "SELECT " ++ task_columns ++ " FROM tasks t WHERE t.title=?1 COLLATE NOCASE AND t.project_id IS ?2 ORDER BY t.id LIMIT 20",
     };
-    for (steps) |sql| {
+    for (steps, 0..) |sql, step| {
         var stmt = try store.db.prepare(sql);
         defer stmt.finalize();
         try stmt.bindText(1, trimmed);
+        if (step == 1) {
+            if (scope) |id| try stmt.bindI64(2, id) else try stmt.bindNull(2);
+        }
         var found: std.ArrayList(Task) = .empty;
         while (try stmt.step() == .row) try found.append(a, try readTask(a, &stmt, 0));
         if (found.items.len == 1) return .{ .found = found.items[0].id };
@@ -67,6 +196,8 @@ pub const TaskListing = struct {
     id: i64,
     title: []const u8,
     ref: ?[]const u8,
+    project_id: ?i64 = null,
+    project_label: ?[]const u8 = null,
     last_ms: ?i64,
 };
 
@@ -83,7 +214,7 @@ pub fn listTasks(store: *Store, a: std.mem.Allocator, q: ?[]const u8, limit: u32
     var rows: std.ArrayList(TaskListing) = .empty;
     while (try stmt.step() == .row) {
         const t = try readTask(a, &stmt, 0);
-        try rows.append(a, .{ .id = t.id, .title = t.title, .ref = t.ref, .last_ms = if (stmt.columnIsNull(3)) null else stmt.columnI64(3) });
+        try rows.append(a, .{ .id = t.id, .title = t.title, .ref = t.ref, .project_id = t.project_id, .project_label = t.project_label, .last_ms = if (stmt.columnIsNull(5)) null else stmt.columnI64(5) });
     }
     return rows.items;
 }
@@ -115,6 +246,9 @@ pub const Interval = struct {
     notes: []Note,
     /// Opened by captured activity, not by hand: its focus is an estimate.
     captured: bool = false,
+    project_id: ?i64 = null,
+    project_label: ?[]const u8 = null,
+    posting_span_id: ?i64 = null,
 };
 
 fn notesOf(store: *Store, a: std.mem.Allocator, interval: i64) ![]Note {
@@ -126,7 +260,7 @@ fn notesOf(store: *Store, a: std.mem.Allocator, interval: i64) ![]Note {
     return rows.items;
 }
 
-const interval_select = "SELECT i.id,i.role,i.start_ms,i.end_ms,i.opened_by,i.closed_by,i.text," ++ task_columns ++ ",i.captured FROM intervals i JOIN tasks t ON t.id=i.task_id ";
+const interval_select = "SELECT i.id,i.role,i.start_ms,i.end_ms,i.opened_by,i.closed_by,i.text," ++ task_columns ++ ",i.captured,i.project_id,(SELECT label FROM projects p WHERE p.id=i.project_id),i.posting_span_id FROM intervals i JOIN tasks t ON t.id=i.task_id ";
 
 fn readIntervals(store: *Store, a: std.mem.Allocator, stmt: *sqlite.Statement) ![]Interval {
     var rows: std.ArrayList(Interval) = .empty;
@@ -141,7 +275,10 @@ fn readIntervals(store: *Store, a: std.mem.Allocator, stmt: *sqlite.Statement) !
             .text = try dupeOpt(a, stmt.columnText(6)),
             .task = try readTask(a, stmt, 7),
             .notes = &.{},
-            .captured = stmt.columnI64(10) == 1,
+            .captured = stmt.columnI64(12) == 1,
+            .project_id = if (stmt.columnIsNull(13)) null else stmt.columnI64(13),
+            .project_label = try dupeOpt(a, stmt.columnText(14)),
+            .posting_span_id = if (stmt.columnIsNull(15)) null else stmt.columnI64(15),
         });
     }
     for (rows.items) |*row| row.notes = try notesOf(store, a, row.id);
@@ -164,13 +301,13 @@ pub fn intervalsBetween(store: *Store, a: std.mem.Allocator, start_ms: i64, end_
     return readIntervals(store, a, &stmt);
 }
 
-pub const Saved = struct { task: Task, role: []const u8 };
+pub const Saved = struct { task: Task, role: []const u8, project_id: ?i64 = null, project_label: ?[]const u8 = null };
 
 pub fn savedSet(store: *Store, a: std.mem.Allocator) ![]Saved {
-    var stmt = try store.db.prepare("SELECT s.role," ++ task_columns ++ " FROM saved_set s JOIN tasks t ON t.id=s.task_id ORDER BY s.role='parallel', t.id");
+    var stmt = try store.db.prepare("SELECT s.role," ++ task_columns ++ ",s.project_id,(SELECT label FROM projects p WHERE p.id=s.project_id) FROM saved_set s JOIN tasks t ON t.id=s.task_id ORDER BY s.role='parallel', t.id");
     defer stmt.finalize();
     var rows: std.ArrayList(Saved) = .empty;
-    while (try stmt.step() == .row) try rows.append(a, .{ .role = try a.dupe(u8, stmt.columnText(0).?), .task = try readTask(a, &stmt, 1) });
+    while (try stmt.step() == .row) try rows.append(a, .{ .role = try a.dupe(u8, stmt.columnText(0).?), .task = try readTask(a, &stmt, 1), .project_id = if (stmt.columnIsNull(6)) null else stmt.columnI64(6), .project_label = try dupeOpt(a, stmt.columnText(7)) });
     return rows.items;
 }
 
@@ -290,12 +427,12 @@ pub fn postingsOn(store: *Store, a: std.mem.Allocator, day: []const u8, task_id:
     return list.items;
 }
 
-pub const Span = struct { start_ms: i64, end_ms: i64 };
+pub const Span = struct { start_ms: i64, end_ms: i64, posting_span_id: ?i64 = null };
 
 pub const DayFocus = struct { spans: []Span, open_session: bool };
 
 pub fn focusOnDay(store: *Store, a: std.mem.Allocator, task_id: i64, start_ms: i64, end_ms: i64) !DayFocus {
-    var stmt = try store.db.prepare("SELECT start_ms,end_ms FROM intervals WHERE task_id=?1 AND role='focus' AND start_ms<?3 AND (end_ms IS NULL OR end_ms>?2) ORDER BY start_ms");
+    var stmt = try store.db.prepare("SELECT start_ms,end_ms,posting_span_id FROM intervals WHERE task_id=?1 AND role='focus' AND start_ms<?3 AND (end_ms IS NULL OR end_ms>?2) ORDER BY start_ms");
     defer stmt.finalize();
     try stmt.bindI64(1, task_id);
     try stmt.bindI64(2, start_ms);
@@ -306,7 +443,7 @@ pub fn focusOnDay(store: *Store, a: std.mem.Allocator, task_id: i64, start_ms: i
         if (stmt.columnIsNull(1)) { open = true; continue; }
         const first = @max(start_ms, stmt.columnI64(0));
         const last = @min(end_ms, stmt.columnI64(1));
-        if (first < last) try spans.append(a, .{ .start_ms = first, .end_ms = last });
+        if (first < last) try spans.append(a, .{ .start_ms = first, .end_ms = last, .posting_span_id = if (stmt.columnIsNull(2)) null else stmt.columnI64(2) });
     }
     return .{ .spans = spans.items, .open_session = open };
 }
@@ -369,7 +506,17 @@ pub fn focusSpans(store: *Store, a: std.mem.Allocator, task_id: i64) ![]OpenSpan
     return rows.items;
 }
 
-pub const Found = struct { task: Task, snippet: ?[]const u8 };
+pub const ProjectRef = struct { project_id: ?i64, label: ?[]const u8 };
+pub const Found = struct { task: Task, snippet: ?[]const u8, historical_projects: []ProjectRef };
+
+fn historicalProjects(store: *Store, a: std.mem.Allocator, task_id: i64) ![]ProjectRef {
+    var stmt = try store.db.prepare("SELECT DISTINCT i.project_id,p.label FROM intervals i LEFT JOIN projects p ON p.id=i.project_id WHERE i.task_id=?1 ORDER BY i.project_id");
+    defer stmt.finalize();
+    try stmt.bindI64(1, task_id);
+    var rows: std.ArrayList(ProjectRef) = .empty;
+    while (try stmt.step() == .row) try rows.append(a, .{ .project_id = if (stmt.columnIsNull(0)) null else stmt.columnI64(0), .label = try dupeOpt(a, stmt.columnText(1)) });
+    return rows.items;
+}
 
 /// Tasks whose title, ref, field values, session text or notes contain `q`
 /// (ASCII case ignored), most recently worked first. `snippet` is the first
@@ -381,6 +528,8 @@ pub fn search(store: *Store, a: std.mem.Allocator, q: []const u8, limit: u32) ![
         "FROM tasks t WHERE instr(lower(t.title),lower(?1))>0 " ++
         "OR EXISTS(SELECT 1 FROM task_bindings b WHERE b.task_id=t.id AND instr(lower(b.external_ref),lower(?1))>0) " ++
         "OR EXISTS(SELECT 1 FROM task_fields f WHERE f.task_id=t.id AND instr(lower(f.value),lower(?1))>0) " ++
+        "OR EXISTS(SELECT 1 FROM projects p WHERE p.id=t.project_id AND instr(lower(p.label),lower(?1))>0) " ++
+        "OR EXISTS(SELECT 1 FROM intervals i JOIN projects p ON p.id=i.project_id WHERE i.task_id=t.id AND instr(lower(p.label),lower(?1))>0) " ++
         "OR EXISTS(SELECT 1 FROM intervals i WHERE i.task_id=t.id AND instr(lower(i.text),lower(?1))>0) " ++
         "OR EXISTS(SELECT 1 FROM notes n JOIN intervals i ON i.id=n.interval_id WHERE i.task_id=t.id AND instr(lower(n.text),lower(?1))>0) " ++
         "ORDER BY (SELECT max(start_ms) FROM intervals i WHERE i.task_id=t.id) IS NULL, (SELECT max(start_ms) FROM intervals i WHERE i.task_id=t.id) DESC, t.id DESC LIMIT ?2");
@@ -388,7 +537,10 @@ pub fn search(store: *Store, a: std.mem.Allocator, q: []const u8, limit: u32) ![
     try stmt.bindText(1, q);
     try stmt.bindI64(2, limit);
     var rows: std.ArrayList(Found) = .empty;
-    while (try stmt.step() == .row) try rows.append(a, .{ .task = try readTask(a, &stmt, 0), .snippet = try dupeOpt(a, stmt.columnText(3)) });
+    while (try stmt.step() == .row) {
+        const t = try readTask(a, &stmt, 0);
+        try rows.append(a, .{ .task = t, .snippet = try dupeOpt(a, stmt.columnText(5)), .historical_projects = try historicalProjects(store, a, t.id) });
+    }
     return rows.items;
 }
 
@@ -402,7 +554,7 @@ pub fn frequent(store: *Store, a: std.mem.Allocator, since_ms: i64, now_ms: i64,
     try stmt.bindI64(2, since_ms);
     try stmt.bindI64(3, limit);
     var rows: std.ArrayList(Frequent) = .empty;
-    while (try stmt.step() == .row) try rows.append(a, .{ .task = try readTask(a, &stmt, 0), .focus_ms = stmt.columnI64(3) });
+    while (try stmt.step() == .row) try rows.append(a, .{ .task = try readTask(a, &stmt, 0), .focus_ms = stmt.columnI64(5) });
     return rows.items;
 }
 
@@ -418,12 +570,12 @@ test "resolve by id, ref and title" {
     const two = try store.createTask("login PAGE", 2);
     const three = try store.createTask("Billing", 3);
     try store.bind(three, "p", "1234", 4);
-    try std.testing.expectEqual(Resolution{ .found = three }, try resolve(&store, a, "1234"));
-    try std.testing.expectEqual(Resolution{ .found = one }, try resolve(&store, a, "#1"));
-    try std.testing.expectEqual(Resolution{ .found = three }, try resolve(&store, a, " billing "));
-    try std.testing.expectEqual(Resolution.none, try resolve(&store, a, "#99"));
-    try std.testing.expectEqual(Resolution.none, try resolve(&store, a, "nothing"));
-    const amb = try resolve(&store, a, "LOGIN page");
+    try std.testing.expectEqual(Resolution{ .found = three }, try resolve(&store, a, "1234", null));
+    try std.testing.expectEqual(Resolution{ .found = one }, try resolve(&store, a, "#1", null));
+    try std.testing.expectEqual(Resolution{ .found = three }, try resolve(&store, a, " billing ", null));
+    try std.testing.expectEqual(Resolution.none, try resolve(&store, a, "#99", null));
+    try std.testing.expectEqual(Resolution.none, try resolve(&store, a, "nothing", null));
+    const amb = try resolve(&store, a, "LOGIN page", null);
     try std.testing.expectEqual(@as(usize, 2), amb.ambiguous.len);
     try std.testing.expectEqual(two, amb.ambiguous[1].id);
 }

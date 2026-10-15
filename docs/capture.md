@@ -6,15 +6,19 @@ runs to `POST /api/capture` (or `kowalski capture`), and kowalski opens and
 closes intervals from them.
 
 ```json
-{"source":"agent","run":"<session id>","event":"<unique id>","kind":"prompt",
- "default_subject":"my-repo","attended":true}
+{"source":"agent","run":"<session id>","event":"<unique id>","kind":"prompt","project_key":"<stable source key>","project_hint":"my-repo","first_prompt":"Investigate startup failure","attended":true}
 ```
 
 - `source` and `run` name one run (one session). `event` is a stable id:
   an event sent again is ignored, so a source can retry freely.
 - `subject` names the run's task as `kowalski switch` does (a ref, `#id`
-  or a title; a new title creates the task). `default_subject` is the task
-  until the run names one, such as its repository.
+  or a title; a new title creates the task).
+- `project_key` is an opaque stable source identity; `project_hint` is only
+  its display hint. Kowalski maps `(source, project_key)` to a project and
+  creates one on first sight. A known key can be repointed later. The first
+  qualifying prompt in an unnamed run creates a local task titled from `first_prompt`
+  (trimmed to about 60 characters); `subject`/`track` can name another task
+  later. Legacy `default_subject` remains accepted for older sources.
 - `attended: false` marks a run nobody watches; it never takes the focus.
 - `note` (on `prompt`, `busy` or `stop`, up to 2000 characters) records a
   line on the run's interval: what was asked, a report along the way, or
@@ -58,3 +62,9 @@ closes intervals from them.
 - The setting `capture_hold_sources` lists sources whose working run keeps
   the focus, such as a game being played: other runs' prompts meanwhile
   run in parallel. The holding run gives the focus up when it stops.
+
+A run remembers its project key and re-resolves its mapping for each event.
+A changed effective project while working splits its interval at that
+event's timestamp; the earlier portion keeps its prior project. Terminal
+events do not reopen time. An archived mapped project continues to receive
+capture. Event retries do not create projects, tasks or duplicate intervals.
