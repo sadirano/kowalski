@@ -67,14 +67,26 @@ pub fn ensure(db: *sqlite.Db) !void {
             "CREATE TABLE provider_quarantine(sha256 TEXT PRIMARY KEY);" ++
             "INSERT OR IGNORE INTO provider_quarantine(sha256) SELECT loading FROM provider_trust WHERE loading IS NOT NULL;",
     );
-    try db.exec("PRAGMA user_version=6");
+    // 7: time captured from outside sources (agent sessions, a game overlay):
+    // each run's subject and state, and the events already applied.
+    if (version < 7) try db.exec(
+        "CREATE TABLE capture_runs(source TEXT NOT NULL, run TEXT NOT NULL, task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL, attended INTEGER NOT NULL CHECK(attended IN (0,1)), working INTEGER NOT NULL DEFAULT 0 CHECK(working IN (0,1)), role TEXT CHECK(role IN ('focus','parallel')), lease_until_ms INTEGER, idle_since_ms INTEGER, started_ms INTEGER NOT NULL, ended_ms INTEGER, PRIMARY KEY(source,run));" ++
+            "CREATE TABLE capture_events(source TEXT NOT NULL, event TEXT NOT NULL, run TEXT NOT NULL, kind TEXT NOT NULL, at_ms INTEGER NOT NULL, PRIMARY KEY(source,event));",
+    );
+    // 8: which intervals capture opened (their focus is an estimate), and
+    // which notes a captured prompt or a run's outcome wrote.
+    if (version < 8) try db.exec(
+        "ALTER TABLE intervals ADD COLUMN captured INTEGER NOT NULL DEFAULT 0 CHECK(captured IN (0,1));" ++
+            "ALTER TABLE notes ADD COLUMN source TEXT CHECK(source IN ('prompt','outcome'));",
+    );
+    try db.exec("PRAGMA user_version=8");
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
     if (try check.step() != .done) return error.ForeignKeyViolation;
     try tx.commit();
 }
 
-pub const current: i64 = 6;
+pub const current: i64 = 8;
 
 const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
@@ -172,7 +184,7 @@ test "schema constraints and version" {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO lunches(out_ms) VALUES(2)"));
     try db.exec("UPDATE lunches SET back_ms=3");
     try db.exec("INSERT INTO lunches(out_ms) VALUES(4)");
-    try db.exec("PRAGMA user_version=7");
+    try db.exec("PRAGMA user_version=9");
     try std.testing.expectError(error.SchemaVersion, ensure(&db));
 }
 
@@ -193,7 +205,7 @@ fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
 }
 
 fn assertV5(db: *sqlite.Db) !void {
-    try std.testing.expectEqual(@as(i64, 6), try scalar(db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 8), try scalar(db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
     try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
     try std.testing.expectEqual(@as(i64, 12), try scalar(db, "SELECT id FROM intervals"));

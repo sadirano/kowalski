@@ -27,6 +27,9 @@ pub const usage =
     \\  stop <task>                  close a task's open interval
     \\  pause | resume               save and close everything open, or bring it back
     \\  note [-t <task>] <text>      note on the focus, or on the named task
+    \\  capture <kind> --source <s> --run <r> [--event <id>] [--subject <task>]
+    \\          [--default <task>] [--unattended]
+    \\                               record an outside run (start|subject|prompt|busy|stop|end)
     \\  tasks [<filter>]             tasks by recent use
     \\  new <title>                  create a task without opening it
     \\  rename <#id> <title>         change a task's title
@@ -416,6 +419,26 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         const reply = try call(ctx, "POST", if (eql(u8, command, "pause")) "/api/pause" else "/api/resume", "");
         if (!try settle(ctx, reply)) return .ok;
         try renderState(ctx, try parse(State, ctx, reply.body));
+        return .ok;
+    }
+    if (eql(u8, command, "capture")) {
+        var rest: std.ArrayList([]const u8) = .empty;
+        var attended = true;
+        for (args) |arg| {
+            if (eql(u8, arg, "--unattended")) attended = false else try rest.append(ctx.a, arg);
+        }
+        const o = try options(ctx, rest.items, &.{ "--source", "--run", "--event", "--subject", "--default" });
+        if (o.words.len != 1 or o.values[0] == null or o.values[1] == null) return error.Usage;
+        const reply = try call(ctx, "POST", "/api/capture", try jsonBody(ctx, .{
+            .source = o.values[0].?,
+            .run = o.values[1].?,
+            .event = o.values[2],
+            .kind = o.words[0],
+            .subject = o.values[3],
+            .default_subject = o.values[4],
+            .attended = attended,
+        }));
+        if (!try settle(ctx, reply)) return .failed;
         return .ok;
     }
     if (eql(u8, command, "note")) {

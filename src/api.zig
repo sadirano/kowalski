@@ -29,6 +29,9 @@ pub const setting_keys = [_][]const u8{
     "paid_breaks",
     // Windows where a screen lock pauses: "17:00-23:59"; empty is none.
     "lock_pause",
+    // Capture sources whose working run keeps the focus against other runs'
+    // prompts, such as a game the user plays: "src1,src2"; empty is none.
+    "capture_hold_sources",
 };
 
 pub const App = struct {
@@ -323,6 +326,37 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         const id = try app.store.createTask(std.mem.trim(u8, body.title, " \t"), app.clock());
         return send(a, .created, .{ .task = (try query.task(app.store, a, id)).? });
     }
+    if (is(req, .POST, path, "/api/capture")) {
+        const Body = struct {
+            source: []const u8,
+            run: []const u8,
+            event: ?[]const u8 = null,
+            kind: []const u8,
+            subject: ?[]const u8 = null,
+            default_subject: ?[]const u8 = null,
+            attended: bool = true,
+            note: ?[]const u8 = null,
+        };
+        // Fields a newer source sends are skipped, so an updated hook never breaks an older daemon.
+        const body = std.json.parseFromSliceLeaky(Body, a, req.body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return badRequest(a, "body"),
+        };
+        const kind = std.meta.stringToEnum(store_mod.CaptureKind, body.kind) orelse return badRequest(a, "kind");
+        for ([_]?[]const u8{ body.source, body.run, body.event, body.subject, body.default_subject }) |field| {
+            if (field) |f| if (f.len == 0 or f.len > 200) return badRequest(a, "length");
+        }
+        if (kind == .subject and body.subject == null) return badRequest(a, "subject");
+        if (body.note) |n| if (n.len > 2000) return badRequest(a, "note");
+        if (body.event) |event| if (try app.store.captureEventSeen(body.source, event)) return send(a, .ok, .{ .applied = false });
+        var c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = body.note };
+        if (body.subject) |s| c.task = try captureTask(app, a, s) orelse return badRequest(a, "subject");
+        if (body.default_subject) |s| if (!try app.store.captureRunHasTask(body.source, body.run)) {
+            c.default_task = try captureTask(app, a, s) orelse return badRequest(a, "default_subject");
+        };
+        const applied = try app.store.capture(c, app.clock());
+        return send(a, .ok, .{ .applied = applied });
+    }
     if (is(req, .POST, path, "/api/switch") or is(req, .POST, path, "/api/parallel")) {
         const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
         var created = false;
@@ -434,6 +468,20 @@ fn ambiguous(a: std.mem.Allocator, list: []const query.Task) Response {
 const Existing = union(enum) { id: i64, response: Response };
 
 /// An existing task, or the response to send instead (ambiguous match).
+/// A captured subject names a task as `switch` does, and is created when
+/// nothing matches. Null when it is ambiguous or names a missing `#id`.
+fn captureTask(app: *App, a: std.mem.Allocator, text: []const u8) !?i64 {
+    return switch (try query.resolve(app.store, a, text)) {
+        .found => |id| id,
+        .ambiguous => null,
+        .none => blk: {
+            const title = std.mem.trim(u8, text, " \t");
+            if (title.len == 0 or title[0] == '#') break :blk null;
+            break :blk try app.store.createTask(title, app.clock());
+        },
+    };
+}
+
 fn resolveExisting(app: *App, a: std.mem.Allocator, text: []const u8) !Existing {
     return switch (try query.resolve(app.store, a, text)) {
         .found => |id| .{ .id = id },
@@ -2653,4 +2701,31 @@ test "settings validate preferences and paid breaks credit only the pause" {
     const settings = f.call(.GET, "/api/settings", "");
     try std.testing.expect(contains(settings.body, "\"key\":\"ui_day_order\",\"value\":\"newest\""));
     try std.testing.expect(contains(settings.body, "\"key\":\"paid_breaks\",\"value\":\"\""));
+}
+
+test "capture applies an event once and names tasks like switch" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e1\",\"kind\":\"prompt\",\"default_subject\":\"kowalski\"}").status);
+    const again = f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e1\",\"kind\":\"prompt\",\"default_subject\":\"kowalski\"}");
+    try std.testing.expect(contains(again.body, "\"applied\":false"));
+    const opened = f.call(.GET, "/api/state", "");
+    try std.testing.expect(contains(opened.body, "\"title\":\"kowalski\""));
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e2\",\"kind\":\"subject\",\"subject\":\"Issue 12\"}").status);
+    try std.testing.expect(contains(f.call(.GET, "/api/state", "").body, "\"title\":\"Issue 12\""));
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"kind\":\"subject\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"kind\":\"nap\"}").status);
+    // A field this daemon does not know yet is skipped, not refused.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e3\",\"kind\":\"busy\",\"from_a_newer_hook\":\"x\"}").status);
+    // A retried subject event changes nothing, not even by recreating a renamed task.
+    try f.db.exec("UPDATE tasks SET title='Renamed' WHERE title='Issue 12'");
+    const retried = f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e2\",\"kind\":\"subject\",\"subject\":\"Issue 12\"}");
+    try std.testing.expect(contains(retried.body, "\"applied\":false"));
+    var count = try f.db.prepare("SELECT count(*) FROM tasks WHERE title='Issue 12'");
+    defer count.finalize();
+    _ = try count.step();
+    try std.testing.expectEqual(@as(i64, 0), count.columnI64(0));
 }

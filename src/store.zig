@@ -48,6 +48,30 @@ pub const Error = error{
 pub const max_time_ms: i64 = 253_402_300_800_000;
 
 pub const Role = enum { focus, parallel };
+
+/// One event from an outside time source; see `Store.capture`.
+pub const CaptureKind = enum { start, subject, prompt, busy, stop, end };
+pub const Capture = struct {
+    source: []const u8,
+    run: []const u8,
+    /// Stable id from the source; a repeat is ignored. Null skips the check.
+    event: ?[]const u8 = null,
+    kind: CaptureKind,
+    /// The task a `subject` event names.
+    task: ?i64 = null,
+    /// The run's task until a `subject` names one (e.g. its repository).
+    default_task: ?i64 = null,
+    /// False for a run nobody watches: it never takes the focus.
+    attended: bool = true,
+    /// A note for the run's open interval: the prompt's text on `prompt`,
+    /// what came of the turn on `stop`. Written once per event id.
+    note: ?[]const u8 = null,
+};
+/// A working run that sends nothing for this long is taken as gone.
+pub const capture_lease_ms: i64 = 20 * 60_000;
+/// A run's task stays open this long after its turn ends, so the next
+/// prompt carries on the same interval; unused, it closes at the turn's end.
+pub const capture_idle_ms: i64 = 5 * 60_000;
 pub const OpenedBy = enum { @"switch", parallel, @"resume" };
 pub const ClosedBy = enum { @"switch", pause, stop, recovered };
 pub const PostingState = enum { sending, confirmed, unknown, cancelled };
@@ -132,6 +156,8 @@ pub const Store = struct {
     pub fn onHeartbeat(s: *Store, now_ms: i64) Error!void {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        // Captured runs gone quiet close on time, not at the next event.
+        try s.expireRuns(now_ms);
         try s.heartbeat(now_ms);
         try tx.commit();
     }
@@ -338,6 +364,386 @@ pub const Store = struct {
         _ = try stmt.step();
         if (s.db.changes() == 0) return error.NoOpenInterval;
         try tx.commit();
+    }
+
+    /// Applies one event from an outside source (an agent session, a game
+    /// overlay). A run that works on a task keeps that task open: the
+    /// attended run the user last prompted holds the focus, other working
+    /// runs run in parallel. Returns false for an event id already applied.
+    pub fn capture(s: *Store, c: Capture, now_ms: i64) Error!bool {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        const at = try s.intervalTime(now_ms);
+        if (c.event) |event| {
+            var stmt = try s.db.prepare("INSERT OR IGNORE INTO capture_events(source,event,run,kind,at_ms) VALUES(?1,?2,?3,?4,?5)");
+            defer stmt.finalize();
+            try stmt.bindText(1, c.source);
+            try stmt.bindText(2, event);
+            try stmt.bindText(3, c.run);
+            try stmt.bindText(4, @tagName(c.kind));
+            try stmt.bindI64(5, at);
+            _ = try stmt.step();
+            if (s.db.changes() == 0) {
+                try tx.commit();
+                return false;
+            }
+        }
+        try s.expireRuns(at);
+        {
+            var stmt = try s.db.prepare("INSERT INTO capture_runs(source,run,task_id,attended,started_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(source,run) DO UPDATE SET attended=excluded.attended, task_id=coalesce(task_id,excluded.task_id)");
+            defer stmt.finalize();
+            try stmt.bindText(1, c.source);
+            try stmt.bindText(2, c.run);
+            if (c.default_task) |t| try stmt.bindI64(3, t) else try stmt.bindNull(3);
+            try stmt.bindI64(4, @intFromBool(c.attended));
+            try stmt.bindI64(5, at);
+            _ = try stmt.step();
+        }
+        if (c.kind == .subject and c.task == null) return error.UnknownTask;
+        var run = try s.captureRun(c.source, c.run);
+        // A subject sent with any event names the run's task before the event applies.
+        if (c.task) |task| if (run.task != task) {
+            try s.moveRun(c, run, task, at, c.kind != .prompt);
+            run = try s.captureRun(c.source, c.run);
+        };
+        switch (c.kind) {
+            .start, .subject => {},
+            .prompt => {
+                const role: Role = if (c.attended) .focus else .parallel;
+                try s.setRun(c, run.task, true, role, at + capture_lease_ms);
+                try s.setRole(c, try s.engage(c, run.task, role, at));
+            },
+            .busy => {
+                if (run.working or run.idle != null) {
+                    try s.setRun(c, run.task, true, run.role, at + capture_lease_ms);
+                    try s.setRole(c, try s.engage(c, run.task, run.role orelse .parallel, at));
+                } else {
+                    try s.setRun(c, run.task, true, .parallel, at + capture_lease_ms);
+                    _ = try s.engage(c, run.task, .parallel, at);
+                }
+            },
+            .stop => if (run.working) {
+                // Kept open for a short grace: a prompt soon after carries on.
+                try s.setRun(c, run.task, false, run.role, at + capture_idle_ms);
+                try s.setIdle(c, at);
+            },
+            .end => {
+                try s.setRun(c, run.task, false, null, null);
+                if (run.working or run.idle != null) try s.releaseTask(c, run.task, run.idle orelse at, .stop);
+                {
+                    var stmt = try s.db.prepare("UPDATE capture_runs SET ended_ms=?3 WHERE source=?1 AND run=?2");
+                    defer stmt.finalize();
+                    try stmt.bindText(1, c.source);
+                    try stmt.bindText(2, c.run);
+                    try stmt.bindI64(3, at);
+                    _ = try stmt.step();
+                }
+            },
+        }
+        if (c.note) |text| if (c.kind != .start and c.kind != .end) try s.captureNote(c, at, text);
+        try s.heartbeat(at);
+        try tx.commit();
+        return true;
+    }
+
+    fn captureNote(s: *Store, c: Capture, at: i64, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const run = try s.captureRun(c.source, c.run);
+        const task = run.task orelse return;
+        const interval = try s.openIntervalOf(task) orelse return;
+        var stmt = try s.db.prepare("INSERT INTO notes(interval_id,at_ms,text,source) VALUES(?1,max(?2,(SELECT start_ms FROM intervals WHERE id=?1)),?3,?4)");
+        defer stmt.finalize();
+        try stmt.bindI64(1, interval);
+        try stmt.bindI64(2, at);
+        try stmt.bindText(3, trimmed);
+        // A report along the way (busy) is plain, as if written by hand.
+        switch (c.kind) {
+            .prompt => try stmt.bindText(4, "prompt"),
+            .stop => try stmt.bindText(4, "outcome"),
+            else => try stmt.bindNull(4),
+        }
+        _ = try stmt.step();
+    }
+
+    /// The run works on `task` from now on; a working run moves its time there.
+    /// `engage_now` is false for a prompt, which engages in its own role next.
+    fn moveRun(s: *Store, c: Capture, run: CaptureRun, task: i64, at: i64, engage_now: bool) !void {
+        try s.setRun(c, task, run.working, run.role, run.lease_until);
+        try s.setIdle(c, run.idle);
+        if (run.working or run.idle != null) {
+            try s.releaseTask(c, run.task, at, .@"switch");
+            if (engage_now) try s.setRole(c, try s.engage(c, task, run.role orelse .parallel, at));
+        }
+    }
+
+    /// The role the run's task actually got: a prompt that could not take
+    /// the focus works in parallel, and must not take it later unprompted.
+    fn setRole(s: *Store, c: Capture, role: Role) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET role=?3 WHERE source=?1 AND run=?2 AND task_id IS NOT NULL");
+        defer stmt.finalize();
+        try stmt.bindText(1, c.source);
+        try stmt.bindText(2, c.run);
+        try stmt.bindText(3, @tagName(role));
+        _ = try stmt.step();
+    }
+
+    /// `idle`: when the run's turn ended, while its task is kept open.
+    const CaptureRun = struct { task: ?i64, working: bool, role: ?Role, lease_until: ?i64, idle: ?i64 };
+
+    /// Whether this event was applied already, so a retry changes nothing,
+    /// not even by creating the task it names.
+    pub fn captureEventSeen(s: *Store, source: []const u8, event: []const u8) Error!bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM capture_events WHERE source=?1 AND event=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, source);
+        try stmt.bindText(2, event);
+        return try stmt.step() == .row;
+    }
+
+    /// Whether a captured run already has a task, so its default is not needed.
+    pub fn captureRunHasTask(s: *Store, source: []const u8, run: []const u8) Error!bool {
+        const r = s.captureRun(source, run) catch |err| switch (err) {
+            error.InvalidState => return false,
+            else => return err,
+        };
+        return r.task != null;
+    }
+
+    fn captureRun(s: *Store, source: []const u8, run: []const u8) !CaptureRun {
+        var stmt = try s.db.prepare("SELECT task_id,working,role,lease_until_ms,idle_since_ms FROM capture_runs WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, source);
+        try stmt.bindText(2, run);
+        if (try stmt.step() != .row) return error.InvalidState;
+        return .{
+            .task = if (stmt.columnIsNull(0)) null else stmt.columnI64(0),
+            .working = stmt.columnI64(1) == 1,
+            .role = if (stmt.columnText(2)) |r| std.meta.stringToEnum(Role, r) else null,
+            .lease_until = if (stmt.columnIsNull(3)) null else stmt.columnI64(3),
+            .idle = if (stmt.columnIsNull(4)) null else stmt.columnI64(4),
+        };
+    }
+
+    fn setRun(s: *Store, c: Capture, task: ?i64, working: bool, role: ?Role, lease_until: ?i64) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET task_id=?3,working=?4,role=?5,lease_until_ms=?6,idle_since_ms=NULL WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, c.source);
+        try stmt.bindText(2, c.run);
+        if (task) |t| try stmt.bindI64(3, t) else try stmt.bindNull(3);
+        try stmt.bindI64(4, @intFromBool(working));
+        try stmt.bindOptionalText(5, if (role) |r| @tagName(r) else null);
+        if (lease_until) |l| try stmt.bindI64(6, l) else try stmt.bindNull(6);
+        _ = try stmt.step();
+    }
+
+    fn setIdle(s: *Store, c: Capture, since: ?i64) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET idle_since_ms=?3 WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, c.source);
+        try stmt.bindText(2, c.run);
+        if (since) |v| try stmt.bindI64(3, v) else try stmt.bindNull(3);
+        _ = try stmt.step();
+    }
+
+    /// Whether a working run of a holding source (capture_hold_sources)
+    /// has the focus on another task, so this run's prompt leaves it there.
+    fn focusHeld(s: *Store, c: Capture, task: i64) !bool {
+        const list = try s.getSetting("capture_hold_sources") orelse return false;
+        defer s.allocator.free(list);
+        if (holdsFocus(list, c.source)) return false;
+        var stmt = try s.db.prepare("SELECT r.source FROM capture_runs r JOIN intervals i ON i.task_id=r.task_id AND i.end_ms IS NULL AND i.role='focus' WHERE r.working=1 AND r.task_id<>?1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        while (try stmt.step() == .row) if (holdsFocus(list, stmt.columnText(0).?)) return true;
+        return false;
+    }
+
+    fn holdsFocus(list: []const u8, source: []const u8) bool {
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |item| if (std.mem.eql(u8, std.mem.trim(u8, item, " "), source)) return true;
+        return false;
+    }
+
+    fn openIntervalOf(s: *Store, task: i64) !?i64 {
+        var stmt = try s.db.prepare("SELECT id FROM intervals WHERE task_id=?1 AND end_ms IS NULL");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        return if (try stmt.step() == .row) stmt.columnI64(0) else null;
+    }
+
+    /// Opens the task in this role. Taking the focus moves the task that
+    /// had it to parallel when another run still works on it.
+    fn engage(s: *Store, c: Capture, task: ?i64, role: Role, at: i64) !Role {
+        const t = task orelse return role;
+        var open_role: ?Role = null;
+        {
+            var stmt = try s.db.prepare("SELECT role FROM intervals WHERE task_id=?1 AND end_ms IS NULL");
+            defer stmt.finalize();
+            try stmt.bindI64(1, t);
+            if (try stmt.step() == .row) open_role = std.meta.stringToEnum(Role, stmt.columnText(0).?);
+        }
+        // Tracking by hand outranks capture: a prompt does not take a focus
+        // the user chose; its run works in parallel until then.
+        const manual_focus = blk: {
+            var stmt = try s.db.prepare("SELECT 1 FROM intervals WHERE end_ms IS NULL AND role='focus' AND captured=0 AND task_id<>?1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, t);
+            break :blk try stmt.step() == .row;
+        };
+        if (role == .parallel or manual_focus or try s.focusHeld(c, t)) {
+            if (open_role == null) try s.continueOrOpen(t, .parallel, at);
+            return .parallel;
+        }
+        if (open_role == .focus) return .focus;
+        var previous: ?i64 = null;
+        {
+            var stmt = try s.db.prepare("SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+            defer stmt.finalize();
+            if (try stmt.step() == .row) previous = stmt.columnI64(0);
+        }
+        // A captured focus whose runs all sit in their grace ends where the
+        // last turn ended: the grace is not attention once another task takes over.
+        if (previous) |p| if (!try s.otherRunWorking(c, p)) {
+            var stmt = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,(SELECT max(idle_since_ms) FROM capture_runs WHERE task_id=?1),coalesce((SELECT max(r.ended_ms) FROM capture_runs r WHERE r.task_id=?1 AND r.ended_ms>=intervals.start_ms),0)),closed_by='switch' WHERE task_id=?1 AND end_ms IS NULL AND role='focus' AND captured=1 AND EXISTS (SELECT 1 FROM capture_runs WHERE task_id=?1 AND idle_since_ms IS NOT NULL)");
+            defer stmt.finalize();
+            try stmt.bindI64(1, p);
+            _ = try stmt.step();
+        };
+        try s.closeFocus(.@"switch", at);
+        if (open_role == .parallel) {
+            const own = (try s.openIntervalOf(t)).?;
+            var stmt = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,?1),closed_by='switch' WHERE id=?2");
+            defer stmt.finalize();
+            try stmt.bindI64(1, at);
+            try stmt.bindI64(2, own);
+            _ = try stmt.step();
+        }
+        try s.continueOrOpen(t, .focus, at);
+        try s.db.exec("DELETE FROM saved_set");
+        if (previous) |p| if (try s.otherRunWorks(c, p)) {
+            if (try s.otherRunWorking(c, p)) try s.continueOrOpen(p, .parallel, at);
+            var stmt = try s.db.prepare("UPDATE capture_runs SET role='parallel' WHERE (working=1 OR idle_since_ms IS NOT NULL) AND task_id=?1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, p);
+            _ = try stmt.step();
+        };
+        return .focus;
+    }
+
+    /// Carries on the task's last interval in this role when it ended
+    /// within the grace (a turn's end, a daemon restart, a short focus
+    /// handoff), so a conversation stays one row. Opens a new one when the
+    /// task ran since, a lunch began in the gap, or, for the focus, another
+    /// focus took the gap.
+    fn continueOrOpen(s: *Store, task: i64, role: Role, at: i64) !void {
+        var id: i64 = 0;
+        var end: i64 = 0;
+        {
+            var stmt = try s.db.prepare("SELECT id,end_ms FROM intervals WHERE task_id=?1 AND role=?2 AND captured=1 AND end_ms IS NOT NULL AND end_ms<=?3 AND end_ms>=?4 ORDER BY end_ms DESC LIMIT 1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, task);
+            try stmt.bindText(2, @tagName(role));
+            try stmt.bindI64(3, at);
+            try stmt.bindI64(4, at - capture_idle_ms);
+            if (try stmt.step() != .row) return s.openCaptured(task, role, at);
+            id = stmt.columnI64(0);
+            end = stmt.columnI64(1);
+        }
+        var stmt = try s.db.prepare("SELECT 1 FROM intervals WHERE id<>?1 AND ((task_id=?2 AND coalesce(end_ms,?4)>?3) OR (?5='focus' AND role='focus' AND start_ms<?4 AND coalesce(end_ms,?4)>?3)) UNION ALL SELECT 1 FROM lunches WHERE out_ms>=?3 AND out_ms<=?4");
+        defer stmt.finalize();
+        try stmt.bindI64(1, id);
+        try stmt.bindI64(2, task);
+        try stmt.bindI64(3, end);
+        try stmt.bindI64(4, at);
+        try stmt.bindText(5, @tagName(role));
+        if (try stmt.step() == .row) return s.openCaptured(task, role, at);
+        var reopen = try s.db.prepare("UPDATE intervals SET end_ms=NULL,closed_by=NULL WHERE id=?1");
+        defer reopen.finalize();
+        try reopen.bindI64(1, id);
+        _ = try reopen.step();
+    }
+
+    fn openCaptured(s: *Store, task: i64, role: Role, at: i64) !void {
+        const id = try s.openInterval(task, role, if (role == .focus) .@"switch" else .parallel, null, at);
+        var stmt = try s.db.prepare("UPDATE intervals SET captured=1 WHERE id=?1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, id);
+        _ = try stmt.step();
+    }
+
+    fn otherRunWorks(s: *Store, c: Capture, task: i64) !bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM capture_runs WHERE (working=1 OR idle_since_ms IS NOT NULL) AND task_id=?1 AND NOT (source=?2 AND run=?3)");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        try stmt.bindText(2, c.source);
+        try stmt.bindText(3, c.run);
+        return try stmt.step() == .row;
+    }
+
+    /// Whether another run is mid-turn on the task (not just in its grace).
+    fn otherRunWorking(s: *Store, c: Capture, task: i64) !bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM capture_runs WHERE working=1 AND task_id=?1 AND NOT (source=?2 AND run=?3)");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        try stmt.bindText(2, c.source);
+        try stmt.bindText(3, c.run);
+        return try stmt.step() == .row;
+    }
+
+    /// Closes the task's captured interval unless another run still works on
+    /// it, at the latest point any run left it: the run that leaves last never
+    /// cuts off time an earlier one worked. An interval opened by hand is the
+    /// user's to close.
+    fn releaseTask(s: *Store, c: Capture, task: ?i64, at: i64, reason: ClosedBy) !void {
+        const t = task orelse return;
+        if (try s.otherRunWorks(c, t)) return;
+        var stmt = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,?1,coalesce((SELECT max(r.ended_ms) FROM capture_runs r WHERE r.task_id=intervals.task_id AND r.ended_ms>=intervals.start_ms),0)),closed_by=?2 WHERE task_id=?3 AND end_ms IS NULL AND captured=1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, at);
+        try stmt.bindText(2, sqlText(reason));
+        try stmt.bindI64(3, t);
+        _ = try stmt.step();
+    }
+
+    /// A working run that sent nothing for a lease stops where its lease
+    /// ran out: a session that crashed or lost its end event. An idle run
+    /// whose grace ran out stops where its turn ended.
+    fn expireRuns(s: *Store, at: i64) !void {
+        var source_buf: [256]u8 = undefined;
+        var run_buf: [256]u8 = undefined;
+        while (true) {
+            var c: Capture = .{ .source = "", .run = "", .kind = .stop };
+            var task: ?i64 = null;
+            var until: i64 = 0;
+            var idle = false;
+            {
+                var stmt = try s.db.prepare("SELECT source,run,task_id,lease_until_ms,idle_since_ms FROM capture_runs WHERE (working=1 OR idle_since_ms IS NOT NULL) AND lease_until_ms<?1 LIMIT 1");
+                defer stmt.finalize();
+                try stmt.bindI64(1, at);
+                if (try stmt.step() != .row) return;
+                const source = stmt.columnText(0).?;
+                const run = stmt.columnText(1).?;
+                if (source.len > source_buf.len or run.len > run_buf.len) return error.TooLarge;
+                @memcpy(source_buf[0..source.len], source);
+                @memcpy(run_buf[0..run.len], run);
+                c.source = source_buf[0..source.len];
+                c.run = run_buf[0..run.len];
+                task = if (stmt.columnIsNull(2)) null else stmt.columnI64(2);
+                idle = !stmt.columnIsNull(4);
+                until = if (idle) stmt.columnI64(4) else stmt.columnI64(3);
+            }
+            try s.setRun(c, task, false, null, null);
+            {
+                var stmt = try s.db.prepare("UPDATE capture_runs SET ended_ms=?3 WHERE source=?1 AND run=?2");
+                defer stmt.finalize();
+                try stmt.bindText(1, c.source);
+                try stmt.bindText(2, c.run);
+                try stmt.bindI64(3, until);
+                _ = try stmt.step();
+            }
+            try s.releaseTask(c, task, until, if (idle) .stop else .recovered);
+        }
     }
 
     pub fn pause(s: *Store, now_ms: i64) Error!void {
@@ -923,6 +1329,10 @@ pub const Store = struct {
             if (n < 1024) return error.InvalidSetting;
         } else if (std.mem.eql(u8, key, "lock_pause")) {
             if (lockWindowsContain(val, 0) == null) return error.InvalidSetting;
+        } else if (std.mem.eql(u8, key, "capture_hold_sources")) {
+            if (val.len > 1000) return error.InvalidSetting;
+            var it = std.mem.splitScalar(u8, val, ',');
+            while (it.next()) |item| if (std.mem.trim(u8, item, " ").len > 200) return error.InvalidSetting;
         }
     }
 
@@ -1059,7 +1469,7 @@ test "store refuses a future schema version" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
-    try db.exec("PRAGMA user_version=7");
+    try db.exec("PRAGMA user_version=9");
     try std.testing.expectError(error.SchemaVersion, Store.init(&db, std.testing.allocator));
 }
 
@@ -1645,4 +2055,309 @@ test "notes at a time can be moved, edited and deleted inside their interval" {
     try s.deleteNote(note, 2_000);
     try std.testing.expectError(error.UnknownNote, s.deleteNote(note, 2_000));
     try std.testing.expectError(error.UnknownInterval, s.addNoteAt(9, 1_000, "x", 2_000));
+}
+
+
+test "captured runs share one focus and keep turns together" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const repo_a = try s.createTask("repo-a", 1);
+    const repo_b = try s.createTask("repo-b", 2);
+    const repo_c = try s.createTask("repo-c", 3);
+    const issue = try s.createTask("issue", 4);
+    const issue2 = try s.createTask("issue-2", 5);
+    const min: i64 = 60_000;
+    const Run = struct {
+        s: *Store,
+        base: Capture,
+        last: *i64,
+        /// Sends one event at minute `m`, with the daemon beating up to it.
+        fn send(r: @This(), kind: CaptureKind, event: []const u8, m: f64, task: ?i64) !bool {
+            const at: i64 = @intFromFloat(m * 60_000.0);
+            while (r.last.* + 60_000 < at) {
+                r.last.* += 60_000;
+                try r.s.onHeartbeat(r.last.*);
+            }
+            r.last.* = at;
+            var c = r.base;
+            c.kind = kind;
+            c.event = event;
+            c.task = task;
+            return r.s.capture(c, at);
+        }
+    };
+    var last: i64 = 10;
+    const A: Run = .{ .s = &s, .last = &last, .base = .{ .source = "claude", .run = "A", .kind = .start, .default_task = repo_a } };
+    const B: Run = .{ .s = &s, .last = &last, .base = .{ .source = "claude", .run = "B", .kind = .start, .default_task = repo_b } };
+    const C: Run = .{ .s = &s, .last = &last, .base = .{ .source = "claude", .run = "C", .kind = .start, .default_task = repo_c } };
+    const D: Run = .{ .s = &s, .last = &last, .base = .{ .source = "bot", .run = "D", .kind = .start, .default_task = repo_c, .attended = false } };
+    const open_focus = "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'";
+
+    // A prompt takes the focus; a repeated event id changes nothing.
+    try std.testing.expect(try A.send(.prompt, "a1", 1, null));
+    try std.testing.expect(!try A.send(.prompt, "a1", 2, null));
+    try std.testing.expectEqual(repo_a, try testScalar(&db, open_focus));
+    // B is prompted while A works: B has the focus, A goes on in parallel.
+    _ = try B.send(.prompt, "b1", 10, null);
+    try std.testing.expectEqual(repo_b, try testScalar(&db, open_focus));
+    try std.testing.expectEqual(repo_a, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    // A names its issue: its time moves there, still in parallel.
+    _ = try A.send(.subject, "a2", 12, issue);
+    try std.testing.expectEqual(issue, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    // B's turn ends and the next prompt comes within the grace: one interval.
+    _ = try B.send(.stop, "b2", 20, null);
+    _ = try B.send(.prompt, "b3", 23, null);
+    _ = try B.send(.stop, "b4", 30, null);
+    // Past the grace, B's interval ends where its last turn did.
+    _ = try A.send(.busy, "a3", 36, null);
+    var stmt_b = try db.prepare("SELECT count(*),max(end_ms) FROM intervals WHERE task_id=?1");
+    defer stmt_b.finalize();
+    try stmt_b.bindI64(1, repo_b);
+    try std.testing.expectEqual(.row, try stmt_b.step());
+    try std.testing.expectEqual(@as(i64, 1), stmt_b.columnI64(0));
+    try std.testing.expectEqual(30 * min, stmt_b.columnI64(1));
+    // A goes silent past its lease: the daemon's heartbeat alone closes it
+    // where the lease ran out, with no other event arriving.
+    while (last < (36 + 21) * min) {
+        last += min;
+        try s.onHeartbeat(last);
+    }
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL"));
+    _ = try C.send(.start, "c0", 36 + 22, null);
+    try std.testing.expectEqual(36 * min + capture_lease_ms, try testScalar(&db, "SELECT max(end_ms) FROM intervals WHERE task_id=4"));
+    // C names its issue seconds after its prompt: the short repo interval stays
+    // (it is counted time); the report groups it away.
+    _ = try C.send(.prompt, "c1", 60, null);
+    _ = try C.send(.subject, "c2", 60.5, issue2);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND captured=1"));
+    try std.testing.expectEqual(issue2, try testScalar(&db, open_focus));
+    // An unattended run never takes the focus.
+    _ = try D.send(.prompt, "d1", 61, null);
+    try std.testing.expectEqual(issue2, try testScalar(&db, open_focus));
+    try std.testing.expectEqual(repo_c, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    // A run's end closes it at once.
+    _ = try C.send(.end, "c3", 70, null);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+}
+
+test "captured runs carry on across a restart and a short handoff" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("a", 1);
+    const b = try s.createTask("b", 2);
+    const min: i64 = 60_000;
+    var A: Capture = .{ .source = "claude", .run = "A", .kind = .prompt, .default_task = a };
+    var B: Capture = .{ .source = "claude", .run = "B", .kind = .prompt, .default_task = b };
+    _ = try s.capture(A, 1 * min);
+    try s.onHeartbeat(2 * min);
+    // A daemon restart pauses everything; A's next tool use carries on.
+    try s.pause(3 * min);
+    A.kind = .busy;
+    _ = try s.capture(A, 4 * min);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL"));
+    // B takes the focus; A goes on in parallel, then B stops and A is
+    // prompted again: A's focus cannot carry over B's, so it is a new row,
+    // and A's parallel stretch stays as it was.
+    _ = try s.capture(B, 5 * min);
+    B.kind = .stop;
+    _ = try s.capture(B, 7 * min);
+    A.kind = .prompt;
+    _ = try s.capture(A, 8 * min);
+    try std.testing.expectEqual(a, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1"));
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1 AND role='focus'"));
+}
+
+test "a holding source keeps the focus while its run works" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const game = try s.createTask("game", 1);
+    const chat = try s.createTask("chat", 2);
+    const min: i64 = 60_000;
+    try s.setSetting("capture_hold_sources", "agent, game", 3);
+    const focused = "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'";
+    var G: Capture = .{ .source = "game", .run = "G", .kind = .prompt, .event = "g1", .default_task = game };
+    _ = try s.capture(G, 1 * min);
+    // Talking to an agent meanwhile runs in parallel.
+    var C: Capture = .{ .source = "claude", .run = "C", .kind = .prompt, .event = "c1", .default_task = chat };
+    _ = try s.capture(C, 2 * min);
+    try std.testing.expectEqual(game, try testScalar(&db, focused));
+    try std.testing.expectEqual(chat, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    // Once the game's run stops working, a prompt takes the focus again.
+    G.kind = .stop;
+    G.event = "g2";
+    _ = try s.capture(G, 3 * min);
+    C.event = "c2";
+    _ = try s.capture(C, 4 * min);
+    try std.testing.expectEqual(chat, try testScalar(&db, focused));
+    // Without the setting, the last prompt holds the focus as before.
+    try s.setSetting("capture_hold_sources", null, 5 * min);
+    G.kind = .prompt;
+    G.event = "g3";
+    _ = try s.capture(G, 6 * min);
+    C.event = "c3";
+    _ = try s.capture(C, 7 * min);
+    try std.testing.expectEqual(chat, try testScalar(&db, focused));
+}
+
+test "captured prompts and outcomes become notes; manual focus outranks capture" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("a", 1);
+    const manual = try s.createTask("manual", 2);
+    const min: i64 = 60_000;
+    var A: Capture = .{ .source = "claude", .run = "A", .kind = .prompt, .event = "p1", .default_task = a, .note = "  fix the login page\n" };
+    _ = try s.capture(A, 1 * min);
+    // A source may report along the way, as a game overlay does.
+    A.kind = .busy;
+    A.event = "b1";
+    A.note = "tests pass";
+    _ = try s.capture(A, 1 * min + 30_000);
+    A.kind = .stop;
+    A.event = "s1";
+    A.note = "The login page is fixed.";
+    _ = try s.capture(A, 2 * min);
+    // A repeated event writes no second note.
+    _ = try s.capture(A, 2 * min + 1000);
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT count(*) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM notes WHERE source='prompt' AND text='fix the login page'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM notes WHERE source='outcome'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM notes WHERE source IS NULL AND text='tests pass'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT captured FROM intervals WHERE task_id=1"));
+    // The user switches by hand; a later prompt leaves that focus alone.
+    _ = try s.switchTo(manual, null, 3 * min);
+    A.kind = .prompt;
+    A.event = "p2";
+    A.note = null;
+    _ = try s.capture(A, 4 * min);
+    try std.testing.expectEqual(manual, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(a, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+}
+
+
+test "capture closes shared work at the last leave and leaves manual intervals alone" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const x = try s.createTask("x", 1);
+    const m = try s.createTask("manual", 2);
+    const min: i64 = 60_000;
+    // A stops at 3, B ends at 5, A's grace runs out later: the work ends at 5.
+    var A: Capture = .{ .source = "claude", .run = "A", .kind = .prompt, .event = "a1", .default_task = x };
+    var B: Capture = .{ .source = "claude", .run = "B", .kind = .prompt, .event = "b1", .default_task = x };
+    _ = try s.capture(A, 1 * min);
+    _ = try s.capture(B, 2 * min);
+    A.kind = .stop;
+    A.event = "a2";
+    _ = try s.capture(A, 3 * min);
+    B.kind = .end;
+    B.event = "b2";
+    _ = try s.capture(B, 5 * min);
+    try s.onHeartbeat(9 * min);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL"));
+    try std.testing.expectEqual(5 * min, try testScalar(&db, "SELECT max(end_ms) FROM intervals WHERE task_id=1"));
+    // A run on a task tracked by hand neither closes nor carries on the user's interval.
+    _ = try s.switchTo(m, null, 10 * min);
+    var C: Capture = .{ .source = "claude", .run = "C", .kind = .prompt, .event = "c1", .default_task = m };
+    _ = try s.capture(C, 11 * min);
+    C.kind = .end;
+    C.event = "c2";
+    _ = try s.capture(C, 12 * min);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND end_ms IS NULL AND captured=0"));
+    try s.stop(m, 13 * min);
+    const D: Capture = .{ .source = "claude", .run = "D", .kind = .prompt, .event = "d1", .default_task = m };
+    _ = try s.capture(D, 14 * min);
+    try std.testing.expectEqual(13 * min, try testScalar(&db, "SELECT end_ms FROM intervals WHERE task_id=2 AND captured=0"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND end_ms IS NULL AND captured=1"));
+}
+
+test "capture: subjects on any event, roles that stick, and grace that ends at the turn" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const x = try s.createTask("x", 1);
+    const y = try s.createTask("y", 2);
+    const z = try s.createTask("z", 3);
+    const min: i64 = 60_000;
+    const open_focus = "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'";
+    // A subject sent with a prompt records time on that task.
+    var R: Capture = .{ .source = "claude", .run = "R", .kind = .prompt, .event = "r1", .task = y };
+    _ = try s.capture(R, 1 * min);
+    try std.testing.expectEqual(y, try testScalar(&db, open_focus));
+    R.kind = .end;
+    R.event = "r2";
+    R.task = null;
+    _ = try s.capture(R, 2 * min);
+    // A prompt held back by a holding source stays parallel after the holder leaves.
+    try s.setSetting("capture_hold_sources", "game", 3 * min);
+    var G: Capture = .{ .source = "game", .run = "G", .kind = .prompt, .event = "g1", .default_task = x };
+    _ = try s.capture(G, 3 * min);
+    var A: Capture = .{ .source = "claude", .run = "A", .kind = .prompt, .event = "a1", .default_task = y };
+    _ = try s.capture(A, 4 * min);
+    try std.testing.expectEqual(x, try testScalar(&db, open_focus));
+    G.kind = .end;
+    G.event = "g2";
+    _ = try s.capture(G, 5 * min);
+    var B: Capture = .{ .source = "claude", .run = "B", .kind = .prompt, .event = "b1", .default_task = z };
+    _ = try s.capture(B, 6 * min);
+    A.kind = .busy;
+    A.event = "a2";
+    _ = try s.capture(A, 7 * min);
+    try std.testing.expectEqual(z, try testScalar(&db, open_focus));
+    // B's turn ends at 8; when A is prompted at 10, z's focus ends at 8, with no parallel left behind.
+    B.kind = .stop;
+    B.event = "b2";
+    _ = try s.capture(B, 8 * min);
+    A.kind = .prompt;
+    A.event = "a3";
+    _ = try s.capture(A, 10 * min);
+    try std.testing.expectEqual(y, try testScalar(&db, open_focus));
+    try std.testing.expectEqual(8 * min, try testScalar(&db, "SELECT max(end_ms) FROM intervals WHERE task_id=3 AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND end_ms IS NULL"));
+}
+
+test "capture: a grace handoff keeps a later end, and an unattended prompt naming a task stays parallel" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const x = try s.createTask("x", 1);
+    const y = try s.createTask("y", 2);
+    const min: i64 = 60_000;
+    // A stops on x at 3, B ends on x at 5, C takes the focus at 6: x's focus ends at 5.
+    var A: Capture = .{ .source = "claude", .run = "A", .kind = .prompt, .event = "a1", .default_task = x };
+    var B: Capture = .{ .source = "claude", .run = "B", .kind = .prompt, .event = "b1", .default_task = x };
+    _ = try s.capture(A, 1 * min);
+    _ = try s.capture(B, 2 * min);
+    A.kind = .stop;
+    A.event = "a2";
+    _ = try s.capture(A, 3 * min);
+    B.kind = .end;
+    B.event = "b2";
+    _ = try s.capture(B, 5 * min);
+    const C: Capture = .{ .source = "claude", .run = "C", .kind = .prompt, .event = "c1", .default_task = y };
+    _ = try s.capture(C, 6 * min);
+    try std.testing.expectEqual(5 * min, try testScalar(&db, "SELECT max(end_ms) FROM intervals WHERE task_id=1 AND role='focus'"));
+    // A focused run whose unattended prompt names a new task works there in parallel.
+    const z = try s.createTask("z", 3);
+    var R: Capture = .{ .source = "claude", .run = "R", .kind = .prompt, .event = "r1", .default_task = x };
+    _ = try s.capture(R, 7 * min);
+    try std.testing.expectEqual(x, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    R.event = "r2";
+    R.task = z;
+    R.attended = false;
+    _ = try s.capture(R, 8 * min);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND end_ms IS NULL AND role='parallel'"));
 }
