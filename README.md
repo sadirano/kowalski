@@ -82,7 +82,14 @@ From a terminal in the Kowalski folder:
 Everyday tracking needs only the dashboard. Scripts, other applications and
 AI agents can do more through the CLI and the local HTTP API.
 
-Scripts and agents can switch tasks, add notes and correct recorded
+### Automatic capture
+
+Outside sources, such as AI agent sessions, can record time without anyone
+pressing start and stop. They send run events through `kowalski capture` or
+`POST /api/capture`, and Kowalski opens and closes intervals from them. See
+[Captured time](docs/capture.md).
+
+Scripts and agents can also switch tasks, add notes and correct recorded
 intervals. All of this needs an integration you set up; Kowalski works fully
 without one.
 
@@ -145,6 +152,7 @@ release ZIP and publishes it on GitHub.
 - [User Guide](docs/guide.md): dashboard, shortcuts and CLI
 - [Design notes](docs/DESIGN.md): architecture and implementation decisions
 - [UI notes](docs/UI.md): interface design
+- [Captured time](docs/capture.md): recording time from outside sources
 - [Provider contract](docs/provider-contract.md): provider lifecycle, data formats and compatibility
 
 ## Credits
