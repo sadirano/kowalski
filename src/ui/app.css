@@ -251,6 +251,8 @@
   .card-col{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
   .card-col .task-card{margin-bottom:0}
   .report-bar{display:flex;justify-content:flex-end;margin-bottom:6px}
+  .task-project{color:var(--acc);margin-right:6px}
+  .task-project::after{content:" ·";color:var(--muted)}
   .link-btn{background:none;border:none;color:var(--muted);font-size:12px;cursor:pointer;padding:2px 4px}
   .link-btn:hover{color:var(--txt)}
   .task-hdr.fold{cursor:pointer}
@@ -717,6 +719,7 @@
   .rd-rticks span:last-child{transform:translateX(-100%)}
   .rd-tab{font:13px/1.4 system-ui,sans-serif;color:var(--muted);background:transparent;border:1px solid transparent;border-radius:4px;padding:6px 9px;cursor:pointer;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:baseline;text-align:left}
   .rd-tt{min-width:0;overflow-wrap:anywhere}
+  .rd-project{display:block;font-size:11px;color:var(--muted)}
   .rd-tab:hover{background:var(--hover);color:var(--txt)}
   .rd-tab[aria-selected=true]{border-color:var(--acc);color:var(--txt);background:#4f8ef714}
   .rd-tab.lit{border-color:var(--warn);color:var(--txt);background:#f59e0b14}

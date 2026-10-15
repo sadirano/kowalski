@@ -128,7 +128,7 @@ function renderReader(rep, area) {
   area.innerHTML = `<div class="rd">
     <nav class="rd-tabs" role="tablist">${tasks.map(e => `<button class="rd-tab" role="tab" data-t="${e.task.id}" aria-selected="${e.task.id === _readerTask}" onclick="readerPick(${e.task.id})"
         onmouseenter="readerLight(${e.task.id})" onmouseleave="readerLight(null)" onfocus="readerLight(${e.task.id})" onblur="readerLight(null)">
-        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}</span><span class="rd-t">${fmtMs(e.focus_ms)}</span></button>`).join('')}</nav>
+        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}</small></span><span class="rd-t">${fmtMs(e.focus_ms)}</span></button>`).join('')}</nav>
     <div class="rd-main" id="rd-main">${readerMainHtml(rep)}</div>
     <div class="rd-work">
       <div class="rd-workhead"><div class="rd-legend"><span><i class="rd-sw f"></i>${esc(t('rd_legend_you'))}</span><span><i class="rd-sw p"></i>${esc(t('rd_legend_par'))}</span><span><i class="rd-sw o"></i>${esc(t('rd_legend_other'))}</span></div></div>

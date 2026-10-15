@@ -139,19 +139,21 @@ function renderReport(rep) {
       : `onclick="event.stopPropagation();switchToTaskByIdx(${taskIdx})"`;
 
     const meta = esc(entry.fields.map(field => field.value).filter(Boolean).concat(task.title).join(' · '));
+    // The projects this task's time went to today; most tasks have one.
+    const projectTag = [...new Set(sessions.map(s => s.project_id).filter(id => id != null))].map(projectName).map(esc).join(', ');
     const ref = task.ref ? refLink(task.ref) : esc('#' + task.id);
     const head = grid
       ? `<div class="task-hdr fold" onclick="toggleTaskFold(${task.id})" title="${escAttr(t(folded ? 'expand' : 'collapse'))}">
         <div class="task-line">
           <span class="task-fold">${folded ? '▸' : '▾'}</span>
           <span class="task-id" onclick="event.stopPropagation()">${ref}</span>
-          <span class="task-meta">${meta}</span>
+          <span class="task-meta">${projectTag ? `<span class="task-project">${projectTag}</span>` : ''}${meta}</span>
           ${folded && span ? `<span class="task-eps">${span}</span>` : ''}
         </div>`
       : `<div class="task-hdr">
         <div>
           <div class="task-id">${ref}</div>
-          <div class="task-meta">${meta}</div>
+          <div class="task-meta">${projectTag ? `<span class="task-project">${projectTag}</span>` : ''}${meta}</div>
         </div>`;
     const card = `<div class="task-card${folded ? ' folded' : ''}" data-task="${task.id}" ondragover="dragOverTask(event,${taskIdx})" ondragleave="dragLeaveTask(event)" ondrop="dropOnTask(event,${taskIdx})">
       ${head}
