@@ -1044,6 +1044,13 @@ test "empty update repo gives a disabled API answer" {
     try std.testing.expectEqualStrings("{\"state\":\"disabled\"}", response.body);
 }
 
+fn updateChannel(d: *Daemon) !update.Channel {
+    const saved = try d.app.store.getSetting("update_channel");
+    defer if (saved) |value| d.app.store.allocator.free(value);
+    if (saved) |value| return if (std.mem.eql(u8, value, "preview")) .preview else .stable;
+    return if (std.mem.indexOf(u8, update.current_version, "-preview.") != null) .preview else .stable;
+}
+
 fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     const is_update = std.mem.eql(u8, path, "/api/update");
@@ -1066,7 +1073,8 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
         const last = update.outcome(saved);
         if (std.mem.eql(u8, request.target, "/api/update?outcome=1")) return api.answer(a, .ok, .{ .last = last });
         if (disabledUpdateResponse(a, update.release_repo, request.method) != null) return api.answer(a, .ok, .{ .state = "disabled", .last = last });
-        const result = update.check(a, d.io, fetcher) catch |err| {
+        const channel = updateChannel(d) catch return api.answer(a, .internal_server_error, .{ .@"error" = "settings" });
+        const result = update.check(a, d.io, fetcher, channel) catch |err| {
             log("update check failed: {s}", .{@errorName(err)});
             return api.answer(a, .bad_gateway, .{ .@"error" = "update_check", .message = @errorName(err) });
         };
@@ -1082,7 +1090,8 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
     const version = if (body.file) |file| update.versionFromFile(file) orelse return api.answer(a, .bad_request, .{ .@"error" = "file" }) else body.version orelse return api.answer(a, .bad_request, .{ .@"error" = "version" });
     if (body.file != null and !request.local_file) return api.answer(a, .forbidden, .{ .@"error" = "file_cli_only" });
     if (update.parseVersion(version) == null) return api.answer(a, .bad_request, .{ .@"error" = "version" });
-    var installed = update.install(a, d.io, fetcher, d.db_path, version, body.file) catch |err| {
+    const channel = updateChannel(d) catch return api.answer(a, .internal_server_error, .{ .@"error" = "settings" });
+    var installed = update.install(a, d.io, fetcher, channel, d.db_path, version, body.file) catch |err| {
         log("update install failed: {s}", .{@errorName(err)});
         const message: []const u8 = switch (err) {
             error.UnsignedRelease => "this release is not signed; kowalski will not install it",

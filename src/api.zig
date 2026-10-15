@@ -20,7 +20,7 @@ pub const default_port: u16 = 47100;
 /// Settings the API may change; anything else is refused.
 pub const setting_keys = [_][]const u8{
     "reporting_zone",  "daily_work_minutes", "lunch_minutes",     "http_port",
-    "post_sessions",
+    "post_sessions", "update_channel",
     // Dashboard preferences.
     "ui_day_order",    "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",      "ui_show_add_entry", "ui_chart_visible", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch",
     "ui_chart_days",   "ui_left_collapsed",  "ui_lang",           "ui_summary_format", "ui_autofill_obs",   "ui_links",
@@ -1218,6 +1218,7 @@ fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
         .{ .key = "ui_time_format", .values = &.{ "system", "24", "12" } },
         .{ .key = "ui_chart_view", .values = &.{ "bars", "lanes" } },
         .{ .key = "ui_task_order", .values = &.{ "time", "ref", "added" } },
+        .{ .key = "update_channel", .values = &.{ "stable", "preview" } },
     };
     for (choices) |c| if (std.mem.eql(u8, key, c.key)) {
         for (c.values) |allowed| if (std.mem.eql(u8, v, allowed)) return true;
@@ -1890,6 +1891,9 @@ test "settings accept known keys only and validate" {
     try f.init();
     defer f.deinit();
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"daily_work_minutes\":\"480\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"stable\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"preview\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"nightly\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"nope\":\"1\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"daily_work_minutes\":\"0\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"http_port\":\"80\"}").status);

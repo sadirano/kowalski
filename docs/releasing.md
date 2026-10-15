@@ -7,6 +7,10 @@ Use a Windows machine with Zig 0.17, the release signing key, and `gh`.
 3. Run `zig build sign -- kowalski-vX.Y.Z-windows-x86_64.zip`. The command writes `kowalski-vX.Y.Z-windows-x86_64.zip.sig` and prints its path and SHA-256. Use `--key <path>` after the ZIP path to select another key file.
 4. Publish both assets with `gh release create vX.Y.Z kowalski-vX.Y.Z-windows-x86_64.zip kowalski-vX.Y.Z-windows-x86_64.zip.sig`.
 
+## Preview releases
+
+Keep the coming stable version in `build.zig.zon` and build with `zig build -Dpreview=N`. Name the directory and ZIP `kowalski-vX.Y.Z-preview.N-windows-x86_64` and `kowalski-vX.Y.Z-preview.N-windows-x86_64.zip`. Sign the ZIP as usual, then publish with `gh release create vX.Y.Z-preview.N <zip> <sig> --prerelease`. Stable builds never see these releases; users opt in under Settings > Updates.
+
 For an offline install, put the ZIP and matching `.sig` together and run
 `kowalski update --from <absolute path to ZIP>`. The updater verifies the same
 signature and archive layout as a downloaded release. The previous daemon
