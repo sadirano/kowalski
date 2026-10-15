@@ -35,6 +35,8 @@ pub const App = struct {
     store: *Store,
     port: u16,
     clock: *const fn () i64,
+    /// The database this daemon has open; empty in tests.
+    db_path: []const u8 = "",
     trial_nonce: ?[]const u8 = null,
     trial_ready: bool = false,
     /// Set by POST /api/shutdown; the daemon stops after answering.
@@ -253,7 +255,7 @@ fn is(req: Request, method: std.http.Method, path: []const u8, want: []const u8)
 }
 
 fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !Response {
-    if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true });
+    if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true, .db = app.db_path });
     if (is(req, .GET, path, "/api/version")) return send(a, .ok, .{ .version = @import("build_options").version, .pid = GetCurrentProcessId(), .update_repo = @import("build_options").update_repo });
     if (try history(app, a, req, path)) |r| return r;
     if (is(req, .GET, path, "/api/search")) return search(app, a, params);
@@ -1775,6 +1777,18 @@ test "requests need loopback host, marker and same origin" {
     try std.testing.expectEqual(std.http.Status.method_not_allowed, handle(&f.app, a, .{ .method = .PUT, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true }).status);
     // GET never changes anything: a mutation route under GET is not found.
     try std.testing.expectEqual(std.http.Status.not_found, f.call(.GET, "/api/pause", "").status);
+}
+
+test "health reports the open database" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.db_path = try std.fs.path.resolve(f.arena.allocator(), &.{"scratch/work.db"});
+    const reply = f.call(.GET, "/api/health", "");
+    try std.testing.expectEqual(std.http.Status.ok, reply.status);
+    const health = try std.json.parseFromSliceLeaky(struct { ok: bool, db: []const u8 }, f.arena.allocator(), reply.body, .{});
+    try std.testing.expect(health.ok);
+    try std.testing.expectEqualStrings(f.app.db_path, health.db);
 }
 
 test "switch creates, resolves and runs parallel work with targeted notes" {

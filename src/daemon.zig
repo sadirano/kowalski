@@ -244,7 +244,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
 
     var traits_arena = std.heap.ArenaAllocator.init(gpa);
     defer traits_arena.deinit();
-    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .running_post = worker.runningPost, .trial_nonce = options.trial_nonce } };
+    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .db_path = options.db_path, .running_post = worker.runningPost, .trial_nonce = options.trial_nonce } };
     // The tour's sandbox sits next to the database and never outlives a run.
     const tour_path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", tour_mod.file_name });
     defer gpa.free(tour_path);

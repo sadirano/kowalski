@@ -69,6 +69,8 @@ pub const Context = struct {
     out: *Io.Writer,
     err: *Io.Writer,
     call_override: ?*const fn (*Context, []const u8, []const u8, ?[]const u8) anyerror!Reply = null,
+    db_checked: bool = false,
+    other_db_path: ?[]const u8 = null,
 };
 
 const Reply = struct { status: u16, body: []const u8 };
@@ -84,6 +86,34 @@ pub fn readPort(ctx: *Context) !u16 {
 }
 
 fn call(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+    if (!ctx.db_checked and !std.mem.eql(u8, target, "/api/health")) {
+        const health = try callUnchecked(ctx, "GET", "/api/health", null);
+        if (health.status != 200) return error.NoDaemon;
+        const parsed = try parse(struct { db: ?[]const u8 = null }, ctx, health.body);
+        if (parsed.db) |daemon_db| {
+            if (!try sameDatabase(ctx.a, daemon_db, ctx.db_path)) {
+                ctx.other_db_path = daemon_db;
+                return error.OtherDatabase;
+            }
+        }
+        ctx.db_checked = true;
+    }
+    return callUnchecked(ctx, method, target, body);
+}
+
+fn sameDatabase(a: std.mem.Allocator, left: []const u8, right: []const u8) !bool {
+    const l = try std.fs.path.resolve(a, &.{left});
+    const r = try std.fs.path.resolve(a, &.{right});
+    if (l.len != r.len) return false;
+    for (l, r) |lc, rc| {
+        const ln = std.ascii.toLower(if (lc == '/') @as(u8, '\\') else lc);
+        const rn = std.ascii.toLower(if (rc == '/') @as(u8, '\\') else rc);
+        if (ln != rn) return false;
+    }
+    return true;
+}
+
+fn callUnchecked(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
     if (ctx.call_override) |override| return override(ctx, method, target, body);
     const port = try readPort(ctx);
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -168,6 +198,11 @@ pub fn ping(ctx: *Context) bool {
 /// Runs one command. Output goes to ctx.out / ctx.err; the caller flushes.
 pub fn run(ctx: *Context, command: []const u8, args: []const []const u8) !Exit {
     return dispatch(ctx, command, args) catch |err| switch (err) {
+        error.OtherDatabase => {
+            const message = try std.fmt.allocPrint(ctx.a, "kowalski: the daemon on port {d} has another database open ({s}); {s} needs its own daemon", .{ readPort(ctx) catch api.default_port, ctx.other_db_path.?, ctx.db_path });
+            try asciiLine(ctx.err, message);
+            return .no_daemon;
+        },
         error.NoDaemon => {
             try ctx.err.writeAll("kowalski: the daemon is not running (start it with: kowalski start)\n");
             return .no_daemon;
@@ -882,6 +917,7 @@ test "JSON source enrollment confirms the proposal and prints the final response
     const Fake = struct {
         var calls: usize = 0;
         fn callSource(_: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
             try std.testing.expectEqualStrings("POST", method);
             try std.testing.expectEqualStrings("/api/provider/source", target);
             calls += 1;
@@ -907,6 +943,54 @@ test "JSON source enrollment confirms the proposal and prints the final response
     try std.testing.expectEqual(Exit.ok, try providerSource(&ctx, &.{ "folder", "--key", key, "--yes" }));
     try std.testing.expectEqual(@as(usize, 2), Fake.calls);
     try std.testing.expectEqualStrings("{\"enrolled\":true}\n", out.written());
+}
+
+test "daemon database guard refuses a different file and accepts matching or legacy health" {
+    const Fake = struct {
+        const Mode = enum { different, same, legacy };
+        var mode: Mode = .different;
+        var calls: usize = 0;
+        fn request(_: *Context, method: []const u8, target: []const u8, _: ?[]const u8) !Reply {
+            calls += 1;
+            if (std.mem.eql(u8, target, "/api/health")) {
+                try std.testing.expectEqualStrings("GET", method);
+                return .{ .status = 200, .body = switch (mode) {
+                    .different => "{\"ok\":true,\"db\":\"live\\\\work.db\"}",
+                    .same => "{\"ok\":true,\"db\":\"SCRATCH/WORK.DB\"}",
+                    .legacy => "{\"ok\":true}",
+                } };
+            }
+            try std.testing.expectEqualStrings("POST", method);
+            try std.testing.expectEqualStrings("/api/notes", target);
+            return .{ .status = 200, .body = "{\"ok\":true}" };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "scratch\\work.db", .json = true,
+        .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+
+    try std.testing.expectEqual(Exit.no_daemon, try run(&ctx, "note", &.{"sample"}));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqualStrings("kowalski: the daemon on port 47100 has another database open (live\\work.db); scratch\\work.db needs its own daemon\n", err.written());
+
+    Fake.mode = .same;
+    Fake.calls = 0;
+    ctx.db_checked = false;
+    ctx.other_db_path = null;
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{"sample"}));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{"again"}));
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+
+    Fake.mode = .legacy;
+    Fake.calls = 0;
+    ctx.db_checked = false;
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{"sample"}));
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
 }
 
 fn asciiLine(w: *Io.Writer, bytes: []const u8) !void {
