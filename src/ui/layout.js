@@ -77,7 +77,7 @@ function endResize(e) {
   h.removeEventListener('pointermove', onResizeMove);
   h.removeEventListener('pointerup', endResize);
   h.removeEventListener('pointercancel', endResize);
-  if (chartInst) chartInst.resize(); // the content column width just changed
+  if (chartInst) chartInst.onResize(); // the content column width just changed
 }
 
 // The Timeline preference is a pixel width. Only the rendered width is fitted

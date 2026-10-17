@@ -85,7 +85,7 @@ function toggleChartExpand() {
   btn.textContent = chartExpanded ? '⤡' : '⤢';
   btn.title = label;
   btn.setAttribute('aria-label', label);
-  if (chartInst) chartInst.resize();
+  if (chartInst) chartInst.onResize();
 }
 
 

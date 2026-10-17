@@ -1211,7 +1211,6 @@ const ui_files = [_]UiFile{
     .{ .path = "/sw.js", .body = @embedFile("ui/sw.js"), .kind = js },
     .{ .path = "/icon-192.png", .body = @embedFile("ui/icon-192.png"), .kind = "image/png" },
     .{ .path = "/icon-512.png", .body = @embedFile("ui/icon-512.png"), .kind = "image/png" },
-    .{ .path = "/vendor/chart-4.4.0.min.js", .body = @embedFile("ui/vendor/chart-4.4.0.min.js"), .kind = js },
     .{ .path = "/ui/app.css", .body = @embedFile("ui/app.css"), .kind = css },
     .{ .path = "/ui/util.js", .body = @embedFile("ui/util.js"), .kind = js },
     .{ .path = "/ui/i18n.js", .body = @embedFile("ui/i18n.js"), .kind = js },
@@ -1231,6 +1230,7 @@ const ui_files = [_]UiFile{
     .{ .path = "/ui/sidebar.js", .body = @embedFile("ui/sidebar.js"), .kind = js },
     .{ .path = "/ui/report.js", .body = @embedFile("ui/report.js"), .kind = js },
     .{ .path = "/ui/reader.js", .body = @embedFile("ui/reader.js"), .kind = js },
+    .{ .path = "/ui/barchart.js", .body = @embedFile("ui/barchart.js"), .kind = js },
     .{ .path = "/ui/charts.js", .body = @embedFile("ui/charts.js"), .kind = js },
     .{ .path = "/ui/tour.js", .body = @embedFile("ui/tour.js"), .kind = js },
     .{ .path = "/ui/boot.js", .body = @embedFile("ui/boot.js"), .kind = js },
@@ -1386,5 +1386,5 @@ test "every local file the dashboard references is served" {
         }
     }
     try std.testing.expect(count > 0);
-    try std.testing.expectEqual(@as(usize, 22), ui_count); // stylesheet and 21 scripts
+    try std.testing.expectEqual(@as(usize, 23), ui_count); // stylesheet and 22 scripts
 }

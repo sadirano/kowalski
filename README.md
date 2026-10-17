@@ -161,6 +161,4 @@ Task search was proposed and first built by [VStorch](https://github.com/VStorch
 
 ## License
 
-Kowalski is open source under the [MIT License](LICENSE). The dashboard
-vendors Chart.js 4.4.0 (MIT) under `src/ui/vendor/`, with its license beside
-it.
+Kowalski is open source under the [MIT License](LICENSE).

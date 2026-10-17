@@ -23,21 +23,6 @@ function chartColors(keys) {
   });
 }
 
-// Dashed line at the daily target, drawn over the bars.
-const targetLinePlugin = {
-  id: 'targetLine',
-  afterDatasetsDraw(chart, _args, opts) {
-    if (!(opts.hours > 0)) return;
-    const { ctx, chartArea: a, scales: { y } } = chart;
-    const py = y.getPixelForValue(opts.hours);
-    if (py < a.top || py > a.bottom) return;
-    ctx.save();
-    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(a.left, py); ctx.lineTo(a.right, py); ctx.stroke();
-    ctx.restore();
-  },
-};
-
 // Every series with time in the range, biggest first, each with its colour.
 function rankSeries(series) {
   const ranked = series.map(s => ({ ...s,
@@ -57,7 +42,6 @@ let _chartRanked = [];
 let _chartDates = [];
 
 function renderChart(data) {
-  if (chartInst) { chartInst.destroy(); chartInst = null; }
   id('chart-legend').innerHTML = '';
   id('chart-lanes').innerHTML = '';
   if (!data?.dates?.length) return;
@@ -80,57 +64,16 @@ function renderChart(data) {
 }
 
 function renderBars() {
-  const dates = _chartDates;
-  const sel = dates.indexOf(selectedDate);
-
-  // One dataset per series, stacked, biggest at the bottom. The selected day
-  // is full opacity, the rest dimmed; only the topmost non-empty segment of a
-  // column is rounded.
-  const datasets = _chartRanked.map(s => ({
-    label: s.label,
-    key: s.key,
-    data: s.ms.map(ms => ms / 3600000),
-    ms: s.ms,
-    color: s.color,
-    hidden: _chartHidden.has(s.key),
-    backgroundColor: chartShades(s.color, dates.length, sel, true),
-    borderRadius: c => topSegment(c) ? { topLeft: 3, topRight: 3 } : 0,
-    borderSkipped: false,
-    maxBarThickness: 36,
-    stack: 'day',
-  }));
-
-  chartInst = new Chart(id('chart'), {
-    type: 'bar',
-    data: { labels: dates.map(d => shortDate(d)), datasets },
-    plugins: [targetLinePlugin],
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      onClick: (_e, items) => { if (items.length) goToDate(dates[items[0].index]); },
-      plugins: {
-        legend: { display: false },
-        targetLine: { hours: (S?.daily_work_minutes || 0) / 60 },
-        tooltip: {
-          filter: c => c.dataset.ms[c.dataIndex] > 0,
-          itemSort: (a, b) => b.dataset.ms[b.dataIndex] - a.dataset.ms[a.dataIndex],
-          callbacks: {
-            label: c => ` ${fmtMs(c.dataset.ms[c.dataIndex])}  ${c.dataset.label}`,
-            footer: items => items.length > 1
-              ? t('card_total') + ' ' + fmtMs(items.reduce((n, c) => n + c.dataset.ms[c.dataIndex], 0)) : '',
-          },
-        },
-      },
-      scales: {
-        x: { stacked: true, grid: { display: false },
-             ticks: { color: c => c.index === sel ? '#e2e8f0' : '#64748b', maxRotation: 0, autoSkipPadding: 8 } },
-        y: { stacked: true, grid: { color: '#2a2d3d' }, border: { display: false },
-             ticks: { color: '#64748b', maxTicksLimit: 5, callback: v => v+'h' }, beginAtZero: true },
-      },
-    },
+  // Stacked bars, biggest series at the bottom, the selected day bright and a
+  // dashed line at the daily target; one canvas, kept across renders.
+  if (!chartInst) chartInst = new BuiltinBarChart(id('chart'));
+  chartInst.setData({
+    dates: _chartDates,
+    ranked: _chartRanked,
+    selectedDate,
+    dailyTargetHours: (S?.daily_work_minutes || 0) / 60,
+    hiddenSet: _chartHidden,
   });
-  chartInst.$sel = sel;
 }
 
 // Task lanes: one row per series, one cell per day, brighter for more hours;
@@ -152,29 +95,9 @@ function renderLanes() {
   id('chart-lanes').innerHTML = `<div class="lanes-grid" style="grid-template-columns:${cols}">${head}${body}</div>`;
 }
 
-// Bar colours for one series: the selected day full, the rest dimmed, and
-// everything faded when another series is being pointed at in the list.
-function chartShades(color, n, sel, lit) {
-  return Array.from({ length: n }, (_, j) => color + (!lit ? '26' : j === sel || sel < 0 ? 'ff' : 'b3'));
-}
-
 // Pointing at a list row keeps that series bright and fades the rest.
 function focusChartSeries(key) {
-  if (!chartInst) return;
-  chartInst.data.datasets.forEach(d => {
-    const lit = key == null || d.key === key;
-    d.backgroundColor = chartShades(d.color, d.data.length, chartInst.$sel, lit);
-  });
-  chartInst.update('none');
-}
-
-// True when no dataset above this one has time in the same column.
-function topSegment(c) {
-  const sets = c.chart.data.datasets;
-  for (let k = sets.length - 1; k > c.datasetIndex; k--) {
-    if (c.chart.isDatasetVisible(k) && sets[k].data[c.dataIndex] > 0) return false;
-  }
-  return true;
+  if (chartInst) chartInst.focusSeries(key);
 }
 
 // The list beside the bars: every series in the range, biggest first, with
@@ -199,9 +122,7 @@ function toggleChartSeries(i) {
   if (_chartHidden.has(s.key)) _chartHidden.delete(s.key); else _chartHidden.add(s.key);
   renderChartList();
   if (chartView === 'lanes') { renderLanes(); return; }
-  if (!chartInst) return;
-  chartInst.setDatasetVisibility(i, !_chartHidden.has(s.key));
-  chartInst.update();
+  if (chartInst) chartInst.toggleSeries(_chartHidden);
 }
 
 function setChartView(view) {
