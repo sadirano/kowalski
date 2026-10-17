@@ -69,6 +69,7 @@
     <div class="hdr-task-text">
       <div class="hdr-ref idle" id="hdr-ref">No active session</div>
       <div class="hdr-detail" id="hdr-detail"></div>
+      <div class="capture-popover" id="capture-popover" hidden></div>
     </div>
   </div>
   <div class="hdr-right">
@@ -317,6 +318,7 @@
   <div class="edit-project-actions"><button type="button" class="set-btn" onclick="previewEditProject()" data-i18n="project_preview">Preview assignment</button><button type="button" class="set-btn" id="edit-project-apply" onclick="applyEditProject()" data-i18n="project_apply" disabled>Apply assignment</button></div>
   <small class="edit-project-hint" data-i18n="project_edit_hint">Project changes apply separately from time edits.</small>
   <div id="edit-project-result" class="project-message" role="status"></div>
+  <div class="edit-project-actions"><button type="button" class="set-btn" id="edit-end-activity" onclick="applyIntervalAction('end-at-activity')" data-i18n="end_at_activity" style="display:none">End at last activity</button><button type="button" class="set-btn" id="edit-take-focus" onclick="applyIntervalAction('take-focus')" data-i18n="take_focus" style="display:none">Make this my focus</button></div>
   <div class="popup-row">
     <button class="apply-btn" onclick="applyEditTime()" style="flex:1" data-i18n="save">Save</button>
     <span class="cancel-link" onclick="closeEditTime()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>

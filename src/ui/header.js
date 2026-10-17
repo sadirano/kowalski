@@ -45,11 +45,30 @@ async function loadCurrent() {
       btn.classList.remove('active');
     }
     btn.innerHTML = icon(working ? 'pause' : 'play');
-    id('hdr-session').classList.toggle('working', !!working);
+    const runs = S.capture?.runs || [];
+    const chip = id('hdr-session');
+    chip.classList.toggle('working', !!working);
+    chip.classList.toggle('capture-quiet', runs.some(run => run.state === 'quiet'));
+    const pop = id('capture-popover');
+    pop.hidden = true;
+    if (runs.length) {
+      const count = document.createElement('button');
+      count.type = 'button';
+      count.className = 'capture-count';
+      count.textContent = t(runs.length === 1 ? 'capture_one_session' : 'capture_many_sessions', { n: runs.length });
+      count.onclick = e => { e.stopPropagation(); pop.hidden = !pop.hidden; };
+      detEl.append(document.createTextNode('  ·  '), count);
+      pop.innerHTML = runs.map(run => `<div class="capture-run"><strong>${esc(run.task?.title || t('no_session'))}</strong><span>${esc(run.source)} · ${esc(t('capture_' + run.state))} · ${esc(t('capture_last_activity'))} ${esc(hhmm24(run.last_ms))}</span></div>`).join('');
+    }
     btn.title = t(working ? 'btn_pause' : S.saved.length ? 'btn_resume' : 'btn_start');
     btn.setAttribute('aria-label', btn.title);
   } catch { id('hdr-session').classList.remove('working'); }
 }
+
+document.addEventListener('click', e => {
+  const pop = id('capture-popover');
+  if (pop && !e.target.closest('#hdr-session')) pop.hidden = true;
+});
 
 async function toggleTracker() {
   if (!S) return; // state not loaded yet

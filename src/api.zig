@@ -751,6 +751,7 @@ fn state(app: *App, a: std.mem.Allocator) !Response {
         .focus = focus,
         .focus_fields = if (focus) |f| try query.fields(app.store, a, f.task.id) else &.{},
         .parallel = parallel.items,
+        .capture = .{ .runs = try query.captureRuns(app.store, a, now) },
         .saved = try query.savedSet(app.store, a),
         .numbers = numbersOf(n),
         .daily_work_minutes = try app.store.dailyWorkMinutes(),
@@ -1384,6 +1385,16 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         const body = try parseBody(struct { seen: SeenBody }, a, req.body) orelse return badRequest(a, "body");
         try app.store.deleteInterval(id, seenOf(body.seen), app.clock());
         return send(a, .ok, .{ .deleted = id });
+    };
+    if (req.method == .POST) if (idBetween(path, "/api/intervals/", "/end-at-activity")) |id| {
+        const body = try parseBody(struct { seen: SeenBody }, a, req.body) orelse return badRequest(a, "body");
+        try app.store.endAtLastActivity(id, seenOf(body.seen), app.clock());
+        return send(a, .ok, .{ .interval = id });
+    };
+    if (req.method == .POST) if (idBetween(path, "/api/intervals/", "/take-focus")) |id| {
+        const body = try parseBody(struct { seen: SeenBody }, a, req.body) orelse return badRequest(a, "body");
+        try app.store.takeFocus(id, seenOf(body.seen), app.clock());
+        return send(a, .ok, .{ .interval = id });
     };
     if (req.method == .PATCH) if (idBetween(path, "/api/intervals/", "")) |id| {
         const body = try parseBody(struct { seen: SeenBody, start_ms: i64, end_ms: ?i64 = null, snapshot: ?store_mod.AssignmentSnapshot = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
@@ -2060,6 +2071,28 @@ test "switch creates, resolves and runs parallel work with targeted notes" {
     try std.testing.expect(after.focus != null);
     r = f.call(.POST, "/api/stop", "{\"task\":\"Build\"}");
     try std.testing.expectEqual(std.http.Status.ok, r.status);
+}
+
+test "state reports active capture runs by activity" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = try f.store.createTask("Captured", test_now);
+    try f.db.exec("INSERT INTO capture_runs(source,run,task_id,attended,working,lease_until_ms,started_ms) VALUES ('test','working',1,1,1,1773100600000,1773100000000),('test','quiet',1,1,1,1773100600000,1773100000000),('test','idle',1,1,0,1773100600000,1773100000000),('test','ended',1,1,0,1773100600000,1773100000000),('test','expired',1,1,1,1773099999999,1773100000000)");
+    try f.db.exec("UPDATE capture_runs SET idle_since_ms=1773100000000 WHERE run='idle'; UPDATE capture_runs SET ended_ms=1773100000000 WHERE run='ended'; INSERT INTO capture_events(source,event,run,kind,at_ms) VALUES ('test','w','working','prompt',1773099999000),('test','q','quiet','prompt',1773099400000),('test','i','idle','stop',1773099900000)");
+    const State = struct { capture: struct { runs: []query.CaptureRun } };
+    const state_data = try f.get(State, "/api/state");
+    try std.testing.expectEqual(@as(usize, 3), state_data.capture.runs.len);
+    var working = false;
+    var quiet = false;
+    var idle = false;
+    for (state_data.capture.runs) |run| {
+        try std.testing.expectEqualStrings("Captured", run.task.?.title);
+        if (std.mem.eql(u8, run.run, "working")) working = std.mem.eql(u8, run.state, "working");
+        if (std.mem.eql(u8, run.run, "quiet")) quiet = std.mem.eql(u8, run.state, "quiet");
+        if (std.mem.eql(u8, run.run, "idle")) idle = std.mem.eql(u8, run.state, "idle");
+    }
+    try std.testing.expect(working and quiet and idle);
 }
 
 test "a task is deleted unless it is running" {

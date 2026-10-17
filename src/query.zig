@@ -36,6 +36,28 @@ pub fn task(store: *Store, a: std.mem.Allocator, id: i64) !?Task {
     return try readTask(a, &stmt, 0);
 }
 
+pub const CaptureTask = struct { id: i64, title: []const u8, ref: ?[]const u8 };
+pub const CaptureRun = struct { source: []const u8, run: []const u8, task: ?CaptureTask, state: []const u8, last_ms: i64 };
+
+pub fn captureRuns(store: *Store, a: std.mem.Allocator, now_ms: i64) ![]CaptureRun {
+    var stmt = try store.db.prepare("SELECT source,run,task_id,working,idle_since_ms,(SELECT max(at_ms) FROM capture_events e WHERE e.source=r.source AND e.run=r.run) FROM capture_runs r WHERE ended_ms IS NULL AND lease_until_ms>=?1 AND (working=1 OR idle_since_ms IS NOT NULL) ORDER BY started_ms,source,run");
+    defer stmt.finalize();
+    try stmt.bindI64(1, now_ms);
+    var rows: std.ArrayList(CaptureRun) = .empty;
+    while (try stmt.step() == .row) {
+        const last = if (stmt.columnIsNull(5)) 0 else stmt.columnI64(5);
+        const found = if (stmt.columnIsNull(2)) null else try task(store, a, stmt.columnI64(2));
+        try rows.append(a, .{
+            .source = try a.dupe(u8, stmt.columnText(0).?),
+            .run = try a.dupe(u8, stmt.columnText(1).?),
+            .task = if (found) |t| .{ .id = t.id, .title = t.title, .ref = t.ref } else null,
+            .state = if (stmt.columnI64(3) != 0) (if (last < now_ms - 5 * 60 * 1000) "quiet" else "working") else "idle",
+            .last_ms = last,
+        });
+    }
+    return rows.items;
+}
+
 pub const Project = struct { id: i64, label: []const u8, archived: bool };
 
 fn readProject(a: std.mem.Allocator, stmt: *sqlite.Statement) !Project {

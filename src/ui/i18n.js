@@ -6,6 +6,7 @@
 // is the daemon setting ui_lang.
 const I18N = {
   en: {
+    capture_one_session: '{n} session', capture_many_sessions: '{n} sessions', capture_working: 'working', capture_idle: 'idle', capture_quiet: 'quiet', capture_last_activity: 'last activity', end_at_activity: 'End at last activity', take_focus: 'Make this my focus',
     set_bad_hours: 'Set a daily target between 1 minute and 24 hours.',
     settings_saved: 'Settings saved.', searching: 'Searching…',
     no_session: "Not tracking", btn_start: 'Start', btn_pause: 'Pause', btn_resume: 'Resume',
@@ -170,6 +171,7 @@ const I18N = {
     search_new_title: 'Start a new task titled {q}', switched: 'Switched to {name}',
   },
   pt: {
+    capture_one_session: '{n} sessão', capture_many_sessions: '{n} sessões', capture_working: 'em atividade', capture_idle: 'em espera', capture_quiet: 'silenciosa', capture_last_activity: 'última atividade', end_at_activity: 'Encerrar na última atividade', take_focus: 'Tornar meu foco',
     set_bad_hours: 'Defina uma meta diária entre 1 minuto e 24 horas.',
     settings_saved: 'Configurações salvas.', searching: 'Buscando…',
     no_session: 'Nenhuma sessão ativa', btn_start: 'Iniciar', btn_pause: 'Pausar', btn_resume: 'Retomar',
@@ -336,6 +338,7 @@ const I18N = {
     search_new_title: 'Iniciar nova tarefa com o título {q}', switched: 'Alterado para {name}',
   },
   ja: {
+    capture_one_session: '{n} セッション', capture_many_sessions: '{n} セッション', capture_working: '作業中', capture_idle: '待機中', capture_quiet: '無応答', capture_last_activity: '最終活動', end_at_activity: '最後の活動時刻で終了', take_focus: 'この作業に集中',
     set_bad_hours: '1日の目標は1分から24時間の間で設定してください。',
     settings_saved: '設定を保存しました。', searching: '検索中…',
     no_session: 'アクティブなセッションはありません', btn_start: '開始', btn_pause: '一時停止', btn_resume: '再開',

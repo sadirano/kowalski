@@ -75,6 +75,8 @@ function openEditTime(i) {
   ++_editProjectEpoch;
   const s = _blockData[i];
   _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, project_id: s.project_id };
+  id('edit-end-activity').style.display = s.captured && s.end_ms == null ? '' : 'none';
+  id('edit-take-focus').style.display = s.role === 'parallel' ? '' : 'none';
   _editProjectSnapshot = null;
   id('edit-project-current').textContent = projectName(s.project_id);
   id('edit-project-target').innerHTML = projectOptions(s.project_id ?? 'unassigned');
@@ -87,6 +89,17 @@ function openEditTime(i) {
   id('edit-end').disabled = s.end_ms == null;
   id('edit-overlay').classList.add('show');
   id('edit-popup').classList.add('show');
+}
+
+async function applyIntervalAction(action) {
+  if (!_editBlock) return;
+  const s = _editBlock;
+  try {
+    await apiJSON('POST', '/api/intervals/' + s.id + '/' + action, { seen: seenOf(s) });
+    if (_editBlock === s) closeEditTime();
+    loadDay(selectedDate, { chart: true });
+    loadCurrent();
+  } catch (e) { showError(e.message); }
 }
 
 function closeEditTime() {

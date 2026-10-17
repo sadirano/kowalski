@@ -1640,6 +1640,87 @@ pub const Store = struct {
         try tx.commit();
     }
 
+    pub fn endAtLastActivity(s: *Store, id: i64, seen: Span, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        const row = try s.intervalRow(id);
+        defer s.freeRow(row);
+        try checkSeen(row, seen);
+        if (row.end_ms != null or !row.captured or row.posting_span != null) return error.InvalidState;
+        var latest = try s.db.prepare("SELECT max(?2,coalesce((SELECT max(at_ms) FROM notes WHERE interval_id=?1 AND source IN ('prompt','outcome') AND at_ms>=?2 AND at_ms<=?3),?2),coalesce((SELECT max(e.at_ms) FROM capture_events e JOIN capture_runs r ON r.source=e.source AND r.run=e.run WHERE r.task_id=?4 AND e.at_ms>=?2 AND e.at_ms<=?3),?2))");
+        defer latest.finalize();
+        try latest.bindI64(1, id);
+        try latest.bindI64(2, row.start_ms);
+        try latest.bindI64(3, now_ms);
+        try latest.bindI64(4, row.task);
+        _ = try latest.step();
+        const end = @max(row.start_ms, if (latest.columnIsNull(0)) row.start_ms else latest.columnI64(0));
+        var close = try s.db.prepare("UPDATE intervals SET end_ms=?1,closed_by='stop' WHERE id=?2");
+        defer close.finalize();
+        try close.bindI64(1, end);
+        try close.bindI64(2, id);
+        _ = try close.step();
+        var runs = try s.db.prepare("UPDATE capture_runs SET working=0,idle_since_ms=NULL,lease_until_ms=NULL WHERE task_id=?1 AND (working=1 OR idle_since_ms IS NOT NULL)");
+        defer runs.finalize();
+        try runs.bindI64(1, row.task);
+        _ = try runs.step();
+        try s.markEdited(row.start_ms, now_ms, now_ms);
+        try tx.commit();
+    }
+
+    pub fn takeFocus(s: *Store, id: i64, seen: Span, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        const chosen = try s.intervalRow(id);
+        defer s.freeRow(chosen);
+        try checkSeen(chosen, seen);
+        if (chosen.role != .parallel or chosen.posting_span != null) return error.InvalidState;
+        if (chosen.end_ms) |end| if (end <= chosen.start_ms) return error.InvalidState;
+        const finish = chosen.end_ms orelse max_time_ms;
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(s.allocator);
+        {
+            var find = try s.db.prepare("SELECT id FROM intervals WHERE role='focus' AND start_ms<?1 AND coalesce(end_ms,?2)>?3 AND coalesce(end_ms,?2)>start_ms ORDER BY start_ms,id");
+            defer find.finalize();
+            try find.bindI64(1, finish);
+            try find.bindI64(2, max_time_ms);
+            try find.bindI64(3, chosen.start_ms);
+            while (try find.step() == .row) try ids.append(s.allocator, find.columnI64(0));
+        }
+        for (ids.items) |other_id| {
+            const row = try s.intervalRow(other_id);
+            defer s.freeRow(row);
+            if (row.posting_span != null) return error.InvalidState;
+            const overlap_start = @max(row.start_ms, chosen.start_ms);
+            const overlap_end = @min(row.end_ms orelse max_time_ms, finish);
+            const before = overlap_start > row.start_ms;
+            const after = overlap_end < (row.end_ms orelse max_time_ms);
+            var update = try s.db.prepare("UPDATE intervals SET role='parallel',start_ms=?1,end_ms=?2,closed_by=?3 WHERE id=?4");
+            defer update.finalize();
+            try update.bindI64(1, overlap_start);
+            if (row.end_ms == null and chosen.end_ms == null) try update.bindNull(2) else try update.bindI64(2, overlap_end);
+            if (after) try update.bindText(3, "switch") else if (row.closed_by) |reason| try update.bindText(3, reason) else try update.bindNull(3);
+            try update.bindI64(4, other_id);
+            _ = try update.step();
+            if (before) {
+                const piece = try s.insertPiece(row.task, .focus, row.start_ms, overlap_start, "switch", row.project, row.posting_span, row.captured);
+                try s.moveNotes(other_id, piece, row.start_ms, overlap_start);
+            }
+            if (after) {
+                const tail = try s.insertPiece(row.task, .focus, overlap_end, row.end_ms, row.closed_by orelse "switch", row.project, row.posting_span, row.captured);
+                try s.moveNotes(other_id, tail, overlap_end, null);
+            }
+        }
+        var promote = try s.db.prepare("UPDATE intervals SET role='focus' WHERE id=?1");
+        defer promote.finalize();
+        try promote.bindI64(1, id);
+        _ = try promote.step();
+        // A run's next busy re-engages its task in its stored role: keep those roles in step.
+        try s.db.exec("UPDATE capture_runs SET role=(SELECT i.role FROM intervals i WHERE i.task_id=capture_runs.task_id AND i.end_ms IS NULL) WHERE ended_ms IS NULL AND EXISTS (SELECT 1 FROM intervals i WHERE i.task_id=capture_runs.task_id AND i.end_ms IS NULL AND i.role<>coalesce(capture_runs.role,''))");
+        try s.markEdited(chosen.start_ms, chosen.end_ms orelse now_ms, now_ms);
+        try tx.commit();
+    }
+
     /// Joins `second` into `first`: same task and role, `first` closed and
     /// ending at or before `second` starts. The gap between them becomes
     /// tracked time, so it must be free. `second`'s session text becomes a
@@ -1770,15 +1851,15 @@ pub const Store = struct {
         _ = try stmt.step();
     }
 
-    fn insertPiece(s: *Store, task: i64, role: Role, start: i64, end: i64, closed_by: []const u8, project: ?i64, posting_span: ?i64, captured: bool) !i64 {
+    fn insertPiece(s: *Store, task: i64, role: Role, start: i64, end: ?i64, closed_by: []const u8, project: ?i64, posting_span: ?i64, captured: bool) !i64 {
         var stmt = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,end_ms,opened_by,closed_by,project_id,posting_span_id,captured) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) RETURNING id");
         defer stmt.finalize();
         try stmt.bindI64(1, task);
         try stmt.bindText(2, sqlText(role));
         try stmt.bindI64(3, start);
-        try stmt.bindI64(4, end);
+        if (end) |value| try stmt.bindI64(4, value) else try stmt.bindNull(4);
         try stmt.bindText(5, if (role == .focus) "switch" else "parallel");
-        try stmt.bindText(6, closed_by);
+        if (end == null) try stmt.bindNull(6) else try stmt.bindText(6, closed_by);
         if (project) |p| try stmt.bindI64(7, p) else try stmt.bindNull(7);
         if (posting_span) |span| try stmt.bindI64(8, span) else try stmt.bindNull(8);
         try stmt.bindI64(9, @intFromBool(captured));
@@ -2651,6 +2732,64 @@ test "a task is deleted with its time, unless it is open or was posted" {
     try std.testing.expectError(error.TaskHasPostings, s.deleteTask(c, 9_500));
 }
 
+test "end at last activity uses capture evidence and refuses other spans" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task_id = try s.createTask("Captured", 1);
+    _ = try s.switchTo(task_id, null, 1000);
+    try std.testing.expectError(error.InvalidState, s.endAtLastActivity(1, .{ .start_ms = 1000, .end_ms = null }, 5000));
+    try db.exec("UPDATE intervals SET captured=1 WHERE id=1");
+    try db.exec("INSERT INTO capture_runs(source,run,task_id,attended,working,lease_until_ms,started_ms) VALUES('test','one',1,1,1,999999,1000)");
+    try db.exec("INSERT INTO capture_events(source,event,run,kind,at_ms) VALUES('test','a','one','prompt',2000),('test','b','one','busy',3500)");
+    try db.exec("INSERT INTO notes(interval_id,at_ms,text,source) VALUES(1,3000,'prompt','prompt'),(1,4000,'outcome','outcome')");
+    try std.testing.expectError(error.Stale, s.endAtLastActivity(1, .{ .start_ms = 999, .end_ms = null }, 5000));
+    try s.endAtLastActivity(1, .{ .start_ms = 1000, .end_ms = null }, 5000);
+    try std.testing.expectEqual(@as(i64, 4000), try testScalar(&db, "SELECT end_ms FROM intervals WHERE id=1"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT working FROM capture_runs WHERE run='one'"));
+    try std.testing.expectError(error.InvalidState, s.endAtLastActivity(1, .{ .start_ms = 1000, .end_ms = 4000 }, 6000));
+}
+
+test "take focus splits a longer focus and moves its notes" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 2);
+    _ = try s.addInterval(a, .focus, 1000, 5000, 5000);
+    _ = try s.addInterval(b, .parallel, 2000, 4000, 5000);
+    _ = try s.addNoteAt(1, 1500, "before", 5500);
+    _ = try s.addNoteAt(1, 3000, "middle", 5500);
+    _ = try s.addNoteAt(1, 4500, "after", 5500);
+    try s.takeFocus(2, .{ .start_ms = 2000, .end_ms = 4000 }, 6000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1 AND role='focus' AND start_ms=1000 AND end_ms=2000"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1 AND role='parallel' AND start_ms=2000 AND end_ms=4000"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=1 AND role='focus' AND start_ms=4000 AND end_ms=5000"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=2 AND role='focus'"));
+    try testText(&db, "SELECT group_concat(role||':'||text,',') FROM (SELECT i.role,n.text FROM notes n JOIN intervals i ON i.id=n.interval_id ORDER BY n.at_ms)", "focus:before,parallel:middle,focus:after");
+    try std.testing.expectError(error.InvalidState, s.takeFocus(2, .{ .start_ms = 2000, .end_ms = 4000 }, 7000));
+}
+
+test "take focus accepts an open parallel interval and refuses posted overlap" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 2);
+    _ = try s.switchTo(a, null, 1000);
+    _ = try s.openParallel(b, null, 2000);
+    try db.exec("UPDATE intervals SET posting_span_id=1 WHERE id=1");
+    try std.testing.expectError(error.InvalidState, s.takeFocus(2, .{ .start_ms = 2000, .end_ms = null }, 3000));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND role='focus' AND end_ms IS NULL"));
+    try db.exec("UPDATE intervals SET posting_span_id=NULL WHERE id=1");
+    try s.takeFocus(2, .{ .start_ms = 2000, .end_ms = null }, 3000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=2 AND role='focus' AND end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND role='parallel' AND start_ms=2000 AND end_ms IS NULL"));
+}
+
 test "merge joins one task's intervals and keeps every note's time" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
@@ -3040,4 +3179,35 @@ test "capture: a grace handoff keeps a later end, and an unattended prompt namin
     _ = try s.capture(R, 8 * min);
     try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND end_ms IS NULL AND role='focus'"));
     try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND end_ms IS NULL AND role='parallel'"));
+}
+
+test "take focus keeps capture roles in step" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 2);
+    _ = try s.switchTo(a, null, 1000);
+    _ = try s.openParallel(b, null, 2000);
+    try db.exec("INSERT INTO capture_runs(source,run,task_id,attended,working,role,lease_until_ms,started_ms) VALUES('t','ra',1,1,1,'focus',999999,1000),('t','rb',2,1,1,'parallel',999999,2000)");
+    try s.takeFocus(2, .{ .start_ms = 2000, .end_ms = null }, 3000);
+    try testText(&db, "SELECT group_concat(run||':'||role,',') FROM (SELECT run,role FROM capture_runs ORDER BY run)", "ra:parallel,rb:focus");
+}
+
+test "take focus refuses an empty span and keeps the demoted part's end reason" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const c = try s.createTask("C", 3);
+    const d = try s.createTask("D", 4);
+    _ = try s.addInterval(c, .focus, 10_000, 15_000, 16_000);
+    try db.exec("UPDATE intervals SET closed_by='stop' WHERE task_id=1");
+    _ = try s.addInterval(d, .parallel, 12_000, 13_000, 16_000);
+    try db.exec("UPDATE intervals SET end_ms=12000 WHERE task_id=2");
+    try std.testing.expectError(error.InvalidState, s.takeFocus(try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2"), .{ .start_ms = 12_000, .end_ms = 12_000 }, 17_000));
+    try db.exec("UPDATE intervals SET end_ms=16000 WHERE task_id=2");
+    try s.takeFocus(try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2"), .{ .start_ms = 12_000, .end_ms = 16_000 }, 17_000);
+    try testText(&db, "SELECT closed_by FROM intervals WHERE task_id=1 AND role='parallel'", "stop");
 }
