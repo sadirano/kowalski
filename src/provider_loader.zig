@@ -10,10 +10,14 @@ extern "kernel32" fn ReadFile(windows.HANDLE, [*]u8, u32, *u32, ?*anyopaque) cal
 extern "kernel32" fn GetFinalPathNameByHandleW(windows.HANDLE, [*]u16, u32, u32) callconv(.winapi) u32;
 extern "kernel32" fn GetFullPathNameW([*:0]const u16, u32, [*]u16, ?*?[*]u16) callconv(.winapi) u32;
 extern "kernel32" fn LoadLibraryExW([*:0]const u16, ?windows.HANDLE, u32) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn SetThreadErrorMode(u32, ?*u32) callconv(.winapi) i32;
 extern "kernel32" fn GetProcAddress(windows.HANDLE, [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "version" fn GetFileVersionInfoSizeW([*:0]const u16, ?*u32) callconv(.winapi) u32;
 extern "version" fn GetFileVersionInfoW([*:0]const u16, u32, u32, *anyopaque) callconv(.winapi) i32;
 extern "version" fn VerQueryValueW(*anyopaque, [*:0]const u16, *?*anyopaque, *u32) callconv(.winapi) i32;
+
+const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
 
 pub const Version = struct { product_name: []const u8 = "", file_version: []const u8 = "", company_name: []const u8 = "" };
 pub const Candidate = struct {
@@ -109,7 +113,12 @@ pub fn close(v: Verified) void { _ = CloseHandle(v.handle); }
 
 pub fn load(a: std.mem.Allocator, v: Verified) !Module {
     const wide = try std.unicode.utf8ToUtf16LeAllocZ(a, v.path);
-    const module = LoadLibraryExW(wide, null, 0x800) orelse return error.LoadLibrary;
+    const module = blk: {
+        var old_mode: u32 = undefined;
+        if (SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX, &old_mode) == 0) return error.SetThreadErrorMode;
+        defer _ = SetThreadErrorMode(old_mode, null);
+        break :blk LoadLibraryExW(wide, null, 0x800) orelse return error.LoadLibrary;
+    };
     const entry = GetProcAddress(module, "kowalskiProvider") orelse return error.MissingEntry;
     const info = GetProcAddress(module, "kowalskiProviderInfo") orelse return error.MissingInfo;
     return .{ .handle = module, .entry = @ptrCast(entry), .info = @ptrCast(info) };
