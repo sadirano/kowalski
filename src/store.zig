@@ -21,6 +21,7 @@ pub const Error = error{
     SomethingOpen,
     UnknownTask,
     BindingConflict,
+    TaskBound,
     EmptyText,
     InvalidState,
     PostingBlocked,
@@ -238,6 +239,10 @@ pub const Store = struct {
         defer tx.deinit();
         if (title) |value| {
             if (value.len == 0) return error.EmptyText;
+            var bound = try s.db.prepare("SELECT 1 FROM task_bindings WHERE task_id=?1");
+            defer bound.finalize();
+            try bound.bindI64(1, task);
+            if (try bound.step() == .row) return error.TaskBound;
             var rename = try s.db.prepare("UPDATE tasks SET title=?1 WHERE id=?2");
             defer rename.finalize();
             try rename.bindText(1, value);

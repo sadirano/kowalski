@@ -736,7 +736,12 @@
   .rd-id{color:var(--acc);font:12px var(--mono)}
   .rd-t{font:12px var(--mono);color:var(--muted)}
   .rd-sw{display:inline-block;width:14px;height:8px;vertical-align:middle;margin-right:5px;border-radius:1px}
-  .rd-h1{font:600 24px/1.25 system-ui,sans-serif;margin:0}
+  .rd-h1{font:600 24px/1.25 system-ui,sans-serif;margin:0;display:flex;align-items:baseline;gap:6px}
+  .rd-title{min-width:0;overflow-wrap:anywhere}
+  .rd-title-edit{background:none;border:0;color:var(--muted);cursor:pointer;padding:2px;opacity:0;vertical-align:middle}
+  .rd-h1:hover .rd-title-edit,.rd-title-edit:focus-visible{opacity:1}
+  .rd-title-edit:hover{color:var(--acc)}
+  .rd-title-inp{font:inherit;color:var(--txt);background:var(--bg);border:1px solid var(--acc);border-radius:4px;padding:2px 6px;min-width:0;flex:1}
   .rd-ref{font:500 15px var(--mono);margin-right:10px;color:var(--acc)}
   .rd-headline{color:#a8b3c7;margin-top:8px;font-size:15px}
   .rd-sitting{margin-top:26px;scroll-margin-top:16px}

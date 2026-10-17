@@ -3,8 +3,7 @@
 // One task's day read top to bottom, beside a day map to click a moment on:
 // the task's sittings (its intervals joined while the gaps stay under
 // SITTING_GAP), each with its exchanges: a prompt and what came of it. The
-// map's "At" panel lists what else ran at the pinned minute. Read-only:
-// editing stays in the other layouts.
+// map's "At" panel lists what else ran at the pinned minute.
 const SITTING_GAP = 10 * 60000;
 const READER_FOLD = 3;   // updates under a prompt shown before folding
 let _readerTask = null;  // the task being read; kept across reloads
@@ -215,7 +214,7 @@ function readerMainHtml(rep) {
   const first = list[0].start, last = list[list.length - 1].end;
   const parallel = list.reduce((n, st) => n + st.parallel, 0);
   const vars = { focus: fmtMs(entry.focus_ms), par: fmtMs(parallel), span: fmtMs(last - first), from: fmtTime(first), to: fmtTime(last) };
-  let h = `<h1 class="rd-h1"><span class="rd-ref">${entry.task.ref ? refLink(entry.task.ref) : esc('#' + entry.task.id)}</span>${esc(entry.task.title)}</h1>
+  let h = `<h1 class="rd-h1"${entry.task.ref ? ` title="${escAttr(t('rd_provider_title'))}"` : ''}><span class="rd-ref">${entry.task.ref ? refLink(entry.task.ref) : esc('#' + entry.task.id)}</span><span class="rd-title" id="rd-title">${esc(entry.task.title)}</span>${entry.task.ref ? '' : `<button class="rd-title-edit" type="button" onclick="editReaderTitle()" title="${escAttr(t('rd_edit_title'))}" aria-label="${escAttr(t('rd_edit_title'))}">${icon('edit')}</button>`}</h1>
     <p class="rd-headline">${esc(t(parallel >= 60000 ? 'rd_head_par' : 'rd_head', vars))} ${esc(list.length > 1 ? t('rd_back', { n: list.length - 1 }) : t('rd_one'))}</p>`;
   list.forEach((st, k) => {
     if (k > 0) {
@@ -255,6 +254,43 @@ function readerMainHtml(rep) {
     h += `<div class="rd-t1">${live ? `<span style="color:var(--grn)">${t('now')}</span>` : fmtTime(st.end)}</div></section>`;
   });
   return h;
+}
+
+function editReaderTitle() {
+  const entry = D?.tasks.find(e => e.task.id === _readerTask);
+  const span = id('rd-title');
+  if (!entry || entry.task.ref || !span) return;
+  const oldTitle = entry.task.title;
+  const inp = document.createElement('input');
+  inp.className = 'rd-title-inp';
+  inp.type = 'text';
+  inp.value = oldTitle;
+  inp.setAttribute('aria-label', t('rd_edit_title'));
+  span.replaceWith(inp);
+  id('rd-main').querySelector('.rd-title-edit').hidden = true;
+  let done = false;
+  const cancel = () => { if (!done) { done = true; renderReport(D); } };
+  const save = async () => {
+    if (done) return;
+    const title = inp.value.trim();
+    if (!title || title === oldTitle) { cancel(); return; }
+    done = true;
+    try {
+      await apiJSON('PATCH', `/api/tasks/${entry.task.id}`, { title });
+      await Promise.all([loadCurrent(), loadDay(selectedDate, { chart: true })]);
+    } catch (e) {
+      showError(e.message);
+      done = false;
+      inp.focus();
+    }
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  };
+  inp.onblur = save;
+  inp.focus();
+  inp.select();
 }
 
 function atHtml(rep, t0) {

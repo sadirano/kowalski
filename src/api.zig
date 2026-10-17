@@ -173,6 +173,7 @@ fn fail(a: std.mem.Allocator, f: Fail) Response {
 }
 
 fn errorResponse(a: std.mem.Allocator, err: anyerror) Response {
+    if (err == error.TaskBound) return fail(a, .{ .status = .conflict, .code = "TaskBound", .message = "title comes from the provider" });
     const status: std.http.Status = switch (err) {
         error.UnknownTask, error.UnknownInterval, error.UnknownNote, error.UnknownProject => .not_found,
         error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen, error.DuplicateProject, error.AmbiguousTask => .conflict,
@@ -2124,6 +2125,25 @@ test "a task is deleted unless it is running" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/delete", "").status);
     try std.testing.expectEqual(std.http.Status.not_found, f.call(.GET, "/api/tasks/1", "").status);
     try std.testing.expectEqual(std.http.Status.not_found, f.call(.POST, "/api/tasks/1/delete", "").status);
+}
+
+test "task title can change only without a binding" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Original\"}");
+    const renamed = f.call(.PATCH, "/api/tasks/1", "{\"title\":\"  Corrected  \"}");
+    try std.testing.expectEqual(std.http.Status.ok, renamed.status);
+    try std.testing.expect(contains(renamed.body, "\"title\":\"Corrected\""));
+    try f.store.bind(1, "test", "R-1", test_now);
+    const bound = f.call(.PATCH, "/api/tasks/1", "{\"title\":\"Changed\"}");
+    try std.testing.expectEqual(std.http.Status.conflict, bound.status);
+    try std.testing.expect(contains(bound.body, "TaskBound"));
+    try std.testing.expect(contains(bound.body, "title comes from the provider"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND title='Corrected'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/tasks/1", "{\"project_id\":null}").status);
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Other\"}");
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/tasks/2", "{\"title\":\"  \"}").status);
 }
 
 test "ambiguous titles ask for an id" {
