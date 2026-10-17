@@ -76,7 +76,7 @@ function renderPrefMenu() {
     const ctl = p.kind === 'flag'
       ? `<input type="checkbox" class="sw" id="pref-${i}"${value === '1' ? ' checked' : ''} onchange="savePref(${i},this.checked?'1':'0')">`
       : p.kind === 'days'
-        ? `<input type="number" class="n" id="pref-${i}" min="1" max="90" value="${escAttr(value)}" onchange="savePref(${i},this.value)">`
+        ? `<input type="number" class="n" id="pref-${i}" autocomplete="off" data-lpignore="true" min="1" max="90" value="${escAttr(value)}" onchange="savePref(${i},this.value)">`
         : `<select id="pref-${i}" onchange="savePref(${i},this.value)">${p.options.map(([v, k]) =>
           `<option value="${v}"${v === value ? ' selected' : ''}>${esc(t(k))}</option>`).join('')}</select>`;
     return `<label class="pref-row" for="pref-${i}" data-key="${p.key}"><span>${esc(t(p.label))}</span>${ctl}</label>`;

@@ -3,6 +3,24 @@
 // Installable as an app: the service worker only stands in when the daemon is down.
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
+// Password managers put icon anchors beside fields, which shifts their rows.
+// Only the provider sign-in (username and password) is for them.
+const AUTOFILL_OFF = 'input:not([type=checkbox]):not([type=radio]):not([autocomplete=username]):not([autocomplete=current-password]),textarea';
+function autofillOff(root) {
+  const off = el => {
+    el.setAttribute('data-lpignore', 'true');    // LastPass
+    el.setAttribute('data-1p-ignore', '');       // 1Password
+    el.setAttribute('data-bwignore', '');        // Bitwarden
+    el.setAttribute('data-form-type', 'other');  // Dashlane
+    if (!el.hasAttribute('autocomplete')) el.setAttribute('autocomplete', 'off');
+  };
+  if (root.matches?.(AUTOFILL_OFF)) off(root);
+  root.querySelectorAll?.(AUTOFILL_OFF).forEach(off);
+}
+autofillOff(document);
+new MutationObserver(list => list.forEach(m => m.addedNodes.forEach(n => n.nodeType === 1 && autofillOff(n))))
+  .observe(document.body, { childList: true, subtree: true });
+
 (async () => {
   const browserToday = todayStr();
   applyLang(); // fill static labels before data arrives

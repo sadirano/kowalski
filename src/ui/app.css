@@ -1,3 +1,4 @@
+  :root{color-scheme:dark}
   :root {
     --bg:      #0f1117;
     --surf:    #1a1d27;
@@ -62,10 +63,16 @@
   .pref-menu{position:fixed;z-index:250;display:none;flex-direction:column;gap:2px;min-width:240px;max-width:min(320px,92vw);background:var(--surf);border:1px solid var(--brd);border-radius:8px;box-shadow:0 12px 32px #0009;padding:8px 10px}
   .pref-menu.show{display:flex}
   .pref-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);padding:2px 0 6px}
-  .pref-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;font-size:12.5px;cursor:pointer}
+  .pref-row{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px;min-height:30px;font-size:12.5px;cursor:pointer}
+  .pref-row>input,.pref-row>select{grid-column:2;grid-row:1;justify-self:end}
+  .pref-row>:not(span):not(input):not(select){position:absolute}
+  /* Whatever a password manager injects anyway takes no space and stays hidden. */
+  [data-lastpass-icon-root]{display:none!important}
   .pref-row select,.pref-row input.n{background:var(--bg);color:var(--txt);border:1px solid var(--brd);border-radius:5px;padding:3px 6px;font:inherit}
   .pref-row input.n{width:56px;text-align:right}
   .pref-hint{color:var(--muted);font-size:11px;padding-top:4px}
+  .pref-btn{background:none;border:1px solid transparent;color:var(--muted);border-radius:5px;cursor:pointer;transition:color .12s,background .12s}
+  .pref-btn:hover{background:var(--hover);color:var(--txt)}
   .pref-btn .ico{width:14px;height:14px}
   .set-checks{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px 0}
   .summary-tools{position:absolute;top:8px;right:8px;display:flex;gap:4px;z-index:1}

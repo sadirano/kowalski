@@ -3,7 +3,10 @@
 // daemon and nothing is cached: the data lives there. When the daemon is not
 // running, a page load gets a short page saying so instead of a browser error.
 self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+// An older build cached the app shell; drop those caches so it cannot come back.
+self.addEventListener('activate', e => e.waitUntil(caches.keys()
+  .then(keys => Promise.all(keys.filter(k => k.startsWith('kw-shell-')).map(k => caches.delete(k))))
+  .then(() => self.clients.claim())));
 
 const OFFLINE = `<!doctype html><html><head><meta charset="utf-8"><title>kowalski</title>
 <style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0f1117;color:#e2e8f0;font:14px system-ui,sans-serif}
