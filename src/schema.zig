@@ -94,14 +94,18 @@ pub fn ensure(db: *sqlite.Db) !void {
             "ALTER TABLE capture_runs ADD COLUMN project_id INTEGER REFERENCES projects(id);" ++
             "ALTER TABLE capture_runs ADD COLUMN project_key TEXT;",
     );
-    try db.exec("PRAGMA user_version=9");
+    // 10: a captured run can replace its own provisional task title once.
+    if (version < 10) try db.exec(
+        "ALTER TABLE capture_runs ADD COLUMN provisional_title INTEGER NOT NULL DEFAULT 0 CHECK(provisional_title IN (0,1));",
+    );
+    try db.exec("PRAGMA user_version=10");
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
     if (try check.step() != .done) return error.ForeignKeyViolation;
     try tx.commit();
 }
 
-pub const current: i64 = 9;
+pub const current: i64 = 10;
 
 const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
@@ -185,7 +189,7 @@ test "schema constraints and version" {
     defer db.close();
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 9), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 10), try scalar(&db, "PRAGMA user_version"));
     try db.exec("INSERT INTO projects(label) VALUES('fresh')");
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('FRESH')"));
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('')"));
@@ -204,7 +208,7 @@ test "schema constraints and version" {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO lunches(out_ms) VALUES(2)"));
     try db.exec("UPDATE lunches SET back_ms=3");
     try db.exec("INSERT INTO lunches(out_ms) VALUES(4)");
-    try db.exec("PRAGMA user_version=10");
+    try db.exec("PRAGMA user_version=11");
     try std.testing.expectError(error.SchemaVersion, ensure(&db));
 }
 
@@ -224,8 +228,9 @@ fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
     return stmt.columnI64(0);
 }
 
-fn assertV9(db: *sqlite.Db) !void {
-    try std.testing.expectEqual(@as(i64, 9), try scalar(db, "PRAGMA user_version"));
+fn assertV10(db: *sqlite.Db) !void {
+    try std.testing.expectEqual(@as(i64, 10), try scalar(db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM pragma_table_info('capture_runs') WHERE name='provisional_title' AND \"notnull\"=1 AND dflt_value='0'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
     try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
     try std.testing.expectEqual(@as(i64, 12), try scalar(db, "SELECT id FROM intervals"));
@@ -250,18 +255,18 @@ fn assertV9(db: *sqlite.Db) !void {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES('2026-03-10',11,'example','bad','confirmed','1',1,1,2,1)"));
 }
 
-test "v3 and v4 history upgrades to v9" {
+test "v3 and v4 history upgrades to v10" {
     for ([_]i64{ 3, 4 }) |version| {
         var db: sqlite.Db = .{};
         try db.open(":memory:");
         defer db.close();
         try legacyFixture(&db, version);
         try ensure(&db);
-        try assertV9(&db);
+        try assertV10(&db);
     }
 }
 
-test "fresh v9 has no import provenance" {
+test "fresh v10 has no import provenance" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
@@ -282,7 +287,7 @@ test "file upgrade makes a v4 backup, current file does not" {
     try db.open(path);
     try legacyFixture(&db, 4);
     try ensure(&db);
-    try assertV9(&db);
+    try assertV10(&db);
     try ensure(&db);
     db.close();
     const current_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/current.db", .{tmp.sub_path});
@@ -311,7 +316,7 @@ test "file upgrade makes a v4 backup, current file does not" {
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
-test "populated v5 upgrades to v9 without changing history or trust" {
+test "populated v5 upgrades to v10 without changing history or trust" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const a = std.testing.allocator;
@@ -327,7 +332,7 @@ test "populated v5 upgrades to v9 without changing history or trust" {
     const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try db.exec("INSERT INTO provider_trust(id,sha256,how,approved_ms,last_good,loading) VALUES(1,'" ++ sha ++ "','compared',7,'" ++ sha ++ "','" ++ sha ++ "')");
     try ensure(&db);
-    try assertV9(&db);
+    try assertV10(&db);
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM provider_trust WHERE mode='manual' AND loading='" ++ sha ++ "' AND last_good='" ++ sha ++ "'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM provider_quarantine WHERE sha256='" ++ sha ++ "'"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT value FROM provider_generation WHERE id=1"));
@@ -343,7 +348,7 @@ test "populated v5 upgrades to v9 without changing history or trust" {
     try std.testing.expectEqual(@as(usize, 1), backups);
 }
 
-test "populated v8 upgrades to v9 in place with one v8 backup" {
+test "populated v8 upgrades to v10 in place with one v8 backup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const a = std.testing.allocator;
@@ -355,7 +360,7 @@ test "populated v8 upgrades to v9 in place with one v8 backup" {
     try db.exec(
         "PRAGMA foreign_keys=OFF;" ++
         "DROP INDEX tasks_project;DROP INDEX intervals_project_start;DROP INDEX capture_project_keys_project;" ++
-        "ALTER TABLE capture_runs DROP COLUMN project_key;ALTER TABLE capture_runs DROP COLUMN project_id;" ++
+        "ALTER TABLE capture_runs DROP COLUMN provisional_title;ALTER TABLE capture_runs DROP COLUMN project_key;ALTER TABLE capture_runs DROP COLUMN project_id;" ++
         "ALTER TABLE saved_set DROP COLUMN project_id;" ++
         "ALTER TABLE intervals DROP COLUMN posting_span_id;ALTER TABLE intervals DROP COLUMN project_id;" ++
         "ALTER TABLE tasks DROP COLUMN project_fallback_eligible;ALTER TABLE tasks DROP COLUMN project_choice_explicit;ALTER TABLE tasks DROP COLUMN project_id;" ++
@@ -372,13 +377,13 @@ test "populated v8 upgrades to v9 in place with one v8 backup" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 9), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 10), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND start_ms=100 AND end_ms=200 AND text='work' AND captured=1 AND project_id IS NULL AND posting_span_id IS NULL"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND project_id IS NULL AND project_choice_explicit=0 AND project_fallback_eligible=0"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=19 AND interval_id=18 AND at_ms=150 AND text='note' AND source='prompt'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM day_summaries WHERE day='2026-03-10' AND text='summary'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM postings WHERE id=20 AND task_id=17 AND amount_text='0.5' AND amount_micro=500000 AND provider_data='{}' AND covered_start_ms=100 AND covered_end_ms=200"));
-    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM capture_runs WHERE source='agent' AND run='run' AND project_id IS NULL AND project_key IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM capture_runs WHERE source='agent' AND run='run' AND project_id IS NULL AND project_key IS NULL AND provisional_title=0"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM saved_set WHERE task_id=17 AND project_id IS NULL"));
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
@@ -404,4 +409,30 @@ test "populated v8 upgrades to v9 in place with one v8 backup" {
         try std.testing.expectEqual(@as(i64, 1), try scalar(&copy, "SELECT count(*) FROM postings WHERE id=20 AND covered_start_ms=100 AND covered_end_ms=200"));
     };
     try std.testing.expectEqual(@as(usize, 1), backups);
+}
+
+test "populated v9 gains a cleared provisional flag and keeps history" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    try ensure(&db);
+    try db.exec("ALTER TABLE capture_runs DROP COLUMN provisional_title; PRAGMA user_version=9");
+    try db.exec(
+        "INSERT INTO tasks(id,title,created_ms) VALUES(17,'Session',100);" ++
+            "INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by,captured) VALUES(18,17,'focus',100,200,'switch','stop',1);" ++
+            "INSERT INTO notes(id,interval_id,at_ms,text,source) VALUES(19,18,150,'note','prompt');" ++
+            "INSERT INTO day_summaries(day,text) VALUES('2026-03-10','summary');" ++
+            "INSERT INTO postings(id,day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES(20,'2026-03-10',17,'synthetic','r','confirmed','0.5',500000,200,100,200);" ++
+            "INSERT INTO capture_runs(source,run,task_id,attended,started_ms) VALUES('agent','run',17,1,50);",
+    );
+    try ensure(&db);
+    try ensure(&db);
+    try std.testing.expectEqual(@as(i64, 10), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='run'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND title='Session'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND captured=1"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=19 AND text='note'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM day_summaries WHERE day='2026-03-10' AND text='summary'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM postings WHERE id=20 AND amount_micro=500000"));
+    try std.testing.expectError(error.Sqlite, db.exec("UPDATE capture_runs SET provisional_title=2 WHERE run='run'"));
 }

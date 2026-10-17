@@ -244,6 +244,7 @@ pub const Store = struct {
             try rename.bindI64(2, task);
             _ = try rename.step();
             if (s.db.changes() == 0) return error.UnknownTask;
+            try s.clearProvisionalTitles(task);
         }
         if (choice == .selected) {
             if (choice.selected) |id| if (!try s.projectExists(id)) return error.UnknownProject;
@@ -426,34 +427,68 @@ pub const Store = struct {
         return s.insertTask(title, .{ .selected = scope }, now_ms);
     }
 
+    fn weakSessionSeed(seed: []const u8) bool {
+        const trimmed = std.mem.trim(u8, seed, " \t\r\n");
+        const clean = std.mem.trimEnd(u8, trimmed, " \t\r\n.,!?;:");
+        if (clean.len == 0) return true;
+        const digits = if (clean[0] == '#') clean[1..] else clean;
+        var only_digits = digits.len > 0;
+        for (digits) |ch| if (!std.ascii.isDigit(ch)) {
+            only_digits = false;
+            break;
+        };
+        if (only_digits) return true;
+        const acknowledgements = [_][]const u8{
+            "go ahead", "yes", "ok", "continue", "do it", "proceed", "sure", "thanks",
+            "sim", "pode", "continua", "manda ver",
+        };
+        for (acknowledgements) |ack| if (std.ascii.eqlIgnoreCase(clean, ack)) return true;
+        var words = std.mem.tokenizeAny(u8, clean, " \t\r\n");
+        var count: usize = 0;
+        while (words.next() != null) {
+            count += 1;
+            if (count >= 3) return false;
+        }
+        return true;
+    }
+
     fn sessionTitle(s: *Store, seed: ?[]const u8) ![]const u8 {
         const raw = seed orelse "";
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidCharacter;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(s.allocator);
-        var i: usize = 0;
-        var points: usize = 0;
         var pending_space = false;
-        while (i < raw.len and points < 60) {
-            const width = std.unicode.utf8ByteSequenceLength(raw[i]) catch return error.InvalidCharacter;
-            const part = raw[i .. i + width];
-            if (width == 1 and std.ascii.isWhitespace(part[0])) {
+        for (raw) |ch| {
+            if (std.ascii.isWhitespace(ch)) {
                 if (out.items.len > 0) pending_space = true;
             } else {
-                if (pending_space) {
-                    try out.append(s.allocator, ' ');
-                    pending_space = false;
-                    points += 1;
-                    if (points == 60) break;
-                }
-                try out.appendSlice(s.allocator, part);
-                points += 1;
+                if (pending_space) try out.append(s.allocator, ' ');
+                pending_space = false;
+                try out.append(s.allocator, ch);
             }
-            i += width;
         }
         if (out.items.len == 0) {
             out.deinit(s.allocator);
             return s.allocator.dupe(u8, "Session");
+        }
+        var i: usize = 0;
+        var points: usize = 0;
+        var boundary: ?usize = null;
+        while (i < out.items.len and points < 60) {
+            const ch = out.items[i];
+            const width = std.unicode.utf8ByteSequenceLength(ch) catch unreachable;
+            const next = i + width;
+            points += 1;
+            if (ch == ' ') boundary = i;
+            if ((ch == '.' or ch == '!' or ch == '?') and (next == out.items.len or out.items[next] == ' ')) {
+                out.shrinkRetainingCapacity(i);
+                return out.toOwnedSlice(s.allocator);
+            }
+            i = next;
+        }
+        if (i < out.items.len) {
+            out.shrinkRetainingCapacity(if (out.items[i] == ' ') i else boundary orelse i);
+            try out.appendSlice(s.allocator, "...");
         }
         return out.toOwnedSlice(s.allocator);
     }
@@ -609,7 +644,15 @@ pub const Store = struct {
         try stmt.bindI64(2, task);
         _ = try stmt.step();
         if (s.db.changes() == 0) return error.UnknownTask;
+        try s.clearProvisionalTitles(task);
         try tx.commit();
+    }
+
+    fn clearProvisionalTitles(s: *Store, task: i64) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET provisional_title=0 WHERE task_id=?1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        _ = try stmt.step();
     }
 
     pub fn bind(s: *Store, task: i64, instance: []const u8, ref: []const u8, now_ms: i64) Error!void {
@@ -880,8 +923,12 @@ pub const Store = struct {
         if (c.project_key != null) try s.setRunProjectKey(c, c.project_key);
         var target_task = run.task;
         if (c.kind == .subject) {
+            try s.setProvisionalTitle(c, false);
+            run.provisional_title = false;
             target_task = c.task orelse if (c.subject) |subject| try s.resolveCaptureTask(subject, lookup_project, at) else return error.UnknownTask;
         } else if (c.task != null or c.subject != null) {
+            try s.setProvisionalTitle(c, false);
+            run.provisional_title = false;
             // A subject sent with any event names the run's task before the event applies;
             // a prompt or busy then engages it in its own role.
             const task = c.task orelse try s.resolveCaptureTask(c.subject.?, lookup_project, at);
@@ -901,6 +948,24 @@ pub const Store = struct {
                 const task = try s.insertTask(title, .{ .selected = lookup_project }, at);
                 try s.setRun(c, task, run.working, run.role, run.lease_until);
                 run.task = task;
+                if (!time_only and (c.first_prompt == null or weakSessionSeed(c.first_prompt.?))) {
+                    try s.setProvisionalTitle(c, true);
+                    run.provisional_title = true;
+                }
+            }
+        }
+        if (c.kind == .prompt and !time_only and run.provisional_title and c.task == null and c.subject == null) {
+            if (c.first_prompt) |seed| {
+                if (!weakSessionSeed(seed)) if (run.task) |task| {
+                    const title = try s.sessionTitle(seed);
+                    defer s.allocator.free(title);
+                    var rename = try s.db.prepare("UPDATE tasks SET title=?1 WHERE id=?2");
+                    defer rename.finalize();
+                    try rename.bindText(1, title);
+                    try rename.bindI64(2, task);
+                    _ = try rename.step();
+                    try s.setProvisionalTitle(c, false);
+                };
             }
         }
         if (c.kind != .subject) target_task = run.task;
@@ -1011,7 +1076,7 @@ pub const Store = struct {
     }
 
     /// `idle`: when the run's turn ended, while its task is kept open.
-    const CaptureRun = struct { task: ?i64, working: bool, role: ?Role, lease_until: ?i64, idle: ?i64, project: ?i64 };
+    const CaptureRun = struct { task: ?i64, working: bool, role: ?Role, lease_until: ?i64, idle: ?i64, project: ?i64, provisional_title: bool };
 
     /// Whether this event was applied already, so a retry changes nothing,
     /// not even by creating the task it names.
@@ -1033,7 +1098,7 @@ pub const Store = struct {
     }
 
     fn captureRun(s: *Store, source: []const u8, run: []const u8) !CaptureRun {
-        var stmt = try s.db.prepare("SELECT task_id,working,role,lease_until_ms,idle_since_ms,project_id FROM capture_runs WHERE source=?1 AND run=?2");
+        var stmt = try s.db.prepare("SELECT task_id,working,role,lease_until_ms,idle_since_ms,project_id,provisional_title FROM capture_runs WHERE source=?1 AND run=?2");
         defer stmt.finalize();
         try stmt.bindText(1, source);
         try stmt.bindText(2, run);
@@ -1045,6 +1110,7 @@ pub const Store = struct {
             .lease_until = if (stmt.columnIsNull(3)) null else stmt.columnI64(3),
             .idle = if (stmt.columnIsNull(4)) null else stmt.columnI64(4),
             .project = if (stmt.columnIsNull(5)) null else stmt.columnI64(5),
+            .provisional_title = stmt.columnI64(6) != 0,
         };
     }
 
@@ -1076,7 +1142,7 @@ pub const Store = struct {
     }
 
     fn setRun(s: *Store, c: Capture, task: ?i64, working: bool, role: ?Role, lease_until: ?i64) !void {
-        var stmt = try s.db.prepare("UPDATE capture_runs SET task_id=?3,working=?4,role=?5,lease_until_ms=?6,idle_since_ms=NULL WHERE source=?1 AND run=?2");
+        var stmt = try s.db.prepare("UPDATE capture_runs SET provisional_title=CASE WHEN task_id IS ?3 THEN provisional_title ELSE 0 END,task_id=?3,working=?4,role=?5,lease_until_ms=?6,idle_since_ms=NULL WHERE source=?1 AND run=?2");
         defer stmt.finalize();
         try stmt.bindText(1, c.source);
         try stmt.bindText(2, c.run);
@@ -1084,6 +1150,15 @@ pub const Store = struct {
         try stmt.bindI64(4, @intFromBool(working));
         try stmt.bindOptionalText(5, if (role) |r| @tagName(r) else null);
         if (lease_until) |l| try stmt.bindI64(6, l) else try stmt.bindNull(6);
+        _ = try stmt.step();
+    }
+
+    fn setProvisionalTitle(s: *Store, c: Capture, value: bool) !void {
+        var stmt = try s.db.prepare("UPDATE capture_runs SET provisional_title=?3 WHERE source=?1 AND run=?2");
+        defer stmt.finalize();
+        try stmt.bindText(1, c.source);
+        try stmt.bindText(2, c.run);
+        try stmt.bindI64(3, @intFromBool(value));
         _ = try stmt.step();
     }
 
@@ -2341,7 +2416,7 @@ test "store refuses a future schema version" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
-    try db.exec("PRAGMA user_version=10");
+    try db.exec("PRAGMA user_version=11");
     try std.testing.expectError(error.SchemaVersion, Store.init(&db, std.testing.allocator));
 }
 
@@ -3389,15 +3464,149 @@ test "time-only capture keeps intervals and uses a generic task title" {
     try s.setSetting("capture_text", "time", 1);
     var c: Capture = .{ .source = "agent", .run = "r", .kind = .prompt, .first_prompt = "private text", .note = "prompt" };
     _ = try s.capture(c, 60_000);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
     c.kind = .busy;
     c.note = "report";
     _ = try s.capture(c, 90_000);
     c.kind = .stop;
     c.note = "outcome";
     _ = try s.capture(c, 120_000);
+    c.kind = .prompt;
+    c.first_prompt = "Build the updated account page";
+    _ = try s.capture(c, 150_000);
     try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM notes"));
     try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM tasks WHERE title='Session'"));
     try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE captured=1"));
+}
+
+test "session titles end at sentences or whole words" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const sentence = try s.sessionTitle("Review the account page. Then update the long explanation that follows the first sentence.");
+    defer s.allocator.free(sentence);
+    try std.testing.expectEqualStrings("Review the account page", sentence);
+    const words = try s.sessionTitle("Review the account page and write a detailed explanation covering every case in the new flow");
+    defer s.allocator.free(words);
+    try std.testing.expectEqualStrings("Review the account page and write a detailed explanation...", words);
+    const exact = try s.sessionTitle("A abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdef next");
+    defer s.allocator.free(exact);
+    try std.testing.expectEqualStrings("A abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdef...", exact);
+    const long_word = try s.sessionTitle("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+    defer s.allocator.free(long_word);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh...", long_word);
+}
+
+test "weak captured titles stay provisional until a useful prompt" {
+    const weak = [_]struct { seed: []const u8, title: []const u8 }{
+        .{ .seed = "two words", .title = "two words" },
+        .{ .seed = "315", .title = "315" },
+        .{ .seed = "#315", .title = "#315" },
+        .{ .seed = "GO AHEAD!", .title = "GO AHEAD" },
+        .{ .seed = "MANDA VER.", .title = "MANDA VER" },
+    };
+    for (weak) |case| {
+        var db: sqlite.Db = .{};
+        try db.open(":memory:");
+        defer db.close();
+        var s = try Store.init(&db, std.testing.allocator);
+        var c: Capture = .{ .source = "agent", .run = "r", .kind = .start };
+        _ = try s.capture(c, 1);
+        c.kind = .prompt;
+        c.first_prompt = case.seed;
+        _ = try s.capture(c, 60_000);
+        try testText(&db, "SELECT title FROM tasks WHERE id=1", case.title);
+        try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+        c.first_prompt = "Build the updated account page";
+        _ = try s.capture(c, 120_000);
+        try testText(&db, "SELECT title FROM tasks WHERE id=1", "Build the updated account page");
+        try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+    }
+}
+
+test "captured title follows the first useful prompt but respects manual naming" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    var c: Capture = .{ .source = "agent", .run = "r", .kind = .start };
+    _ = try s.capture(c, 1);
+    c.kind = .prompt;
+    _ = try s.capture(c, 60_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=1", "Session");
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+    c.first_prompt = "Build the updated account page";
+    _ = try s.capture(c, 120_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=1", "Build the updated account page");
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+    c.first_prompt = "Review the account page changes";
+    _ = try s.capture(c, 180_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=1", "Build the updated account page");
+}
+
+test "manual task renames clear a provisional captured title" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    var c: Capture = .{ .source = "agent", .run = "r", .kind = .start };
+    _ = try s.capture(c, 1);
+    c.kind = .prompt;
+    c.first_prompt = "yes";
+    _ = try s.capture(c, 60_000);
+    try s.updateTask(1, "Doctor", .omitted, 90_000);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+    c.first_prompt = "Review the account page changes";
+    _ = try s.capture(c, 120_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=1", "Doctor");
+
+    c = .{ .source = "agent", .run = "other", .kind = .prompt, .first_prompt = "ok" };
+    _ = try s.capture(c, 180_000);
+    try s.setTitle(2, "Nurse", 200_000);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='other'"));
+    c.first_prompt = "Build the updated account page";
+    _ = try s.capture(c, 240_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=2", "Nurse");
+}
+
+test "a subject moves a run away from its provisional title" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const chosen = try s.createTask("Doctor", 1);
+    var c: Capture = .{ .source = "agent", .run = "r", .kind = .start };
+    _ = try s.capture(c, 2);
+    c.kind = .prompt;
+    c.first_prompt = "yes";
+    _ = try s.capture(c, 60_000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+    c.kind = .subject;
+    c.task = chosen;
+    _ = try s.capture(c, 90_000);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='r'"));
+    c.kind = .prompt;
+    c.task = null;
+    c.first_prompt = "Build the updated account page";
+    _ = try s.capture(c, 120_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=1", "Doctor");
+    try testText(&db, "SELECT title FROM tasks WHERE id=2", "yes");
+}
+
+test "an existing subject task keeps its title on later prompts" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("yes", 1);
+    var c: Capture = .{ .source = "agent", .run = "r", .kind = .subject, .task = task };
+    _ = try s.capture(c, 60_000);
+    c.kind = .prompt;
+    c.task = null;
+    c.first_prompt = "Build the updated account page";
+    _ = try s.capture(c, 120_000);
+    try testText(&db, "SELECT title FROM tasks WHERE id=1", "yes");
 }
 
 test "removing captured text preserves plain notes and intervals" {
