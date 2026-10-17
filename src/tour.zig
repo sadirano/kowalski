@@ -86,8 +86,8 @@ pub const Tour = struct {
 /// and hidden chart, which would hide what the flows point at.
 pub const copied_settings = [_][]const u8{
     "reporting_zone",    "day_start", "daily_work_minutes", "lunch_minutes",     "paid_breaks",
-    "ui_day_order",      "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",
-    "ui_show_add_entry", "ui_chart_days",      "ui_summary_format", "ui_autofill_obs",
+    "ui_day_order",      "ui_sidebar_days",    "ui_show_weekends",  "ui_show_keys",
+    "ui_show_add_entry", "ui_chart_days",      "ui_summary_format", "post_daily_notes",
     "ui_links",          "ui_time_format",     "ui_chart_view",      "ui_single_keys",
     "ui_task_order",     "ui_report_layout",
 };

@@ -12,7 +12,7 @@ function buildSummaryWrap(content, isSaved, day) {
     + totals.map(row => `<div class="summary-project-row"><span>${esc(row.project_id == null ? t('project_unassigned') : projectName(row.project_id))}</span><b>${esc(fmtMs(row.focus_ms))}</b></div>`).join('')
     + `</aside>`;
   return `<div class="summary-layout"><div class="summary-wrap">`
-    + `<button class="summary-regen" onclick="regenerateSummary()" title="${t('summary_regen')}" aria-label="${t('summary_regen')}">${icon('refresh')}</button>`
+    + `<div class="summary-tools">${prefButton('summary')}<button class="summary-regen" onclick="regenerateSummary()" title="${t('summary_regen')}" aria-label="${t('summary_regen')}">${icon('refresh')}</button></div>`
     + `<textarea class="summary-area" id="summary-text" oninput="onSummaryInput()">${content}</textarea>`
     + `<span class="summary-status${isSaved ? '' : ' hidden'}" id="summary-status">${statusText}</span>`
     + `</div>${projectsHtml}</div>`;

@@ -213,6 +213,7 @@ test {
     _ = @import("paths.zig");
     _ = @import("query.zig");
     _ = @import("api.zig");
+    _ = @import("settings.zig");
     _ = @import("cli.zig");
     _ = @import("daemon.zig");
     _ = @import("provider_loader.zig");

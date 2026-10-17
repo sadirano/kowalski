@@ -67,6 +67,24 @@ fn fromUtcMs(ms: i64) !SystemTime {
     return result;
 }
 
+/// Every Windows time zone id, in the system's order; the ones a reporting
+/// zone may name.
+pub fn names(a: std.mem.Allocator) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var index: u32 = 0;
+    while (true) : (index += 1) {
+        var info: DynamicTimeZoneInformation = undefined;
+        const result = EnumDynamicTimeZoneInformation(index, &info);
+        if (result == 259) break;
+        if (result != 0) return error.ZoneApi;
+        const len = std.mem.indexOfScalar(u16, &info.key_name, 0) orelse info.key_name.len;
+        const name = try a.alloc(u8, len);
+        for (info.key_name[0..len], name) |wide, *narrow| narrow.* = if (wide < 128) @intCast(wide) else '?';
+        try list.append(a, name);
+    }
+    return list.toOwnedSlice(a);
+}
+
 pub const Zone = struct {
     info: DynamicTimeZoneInformation,
     day_start_min: u16 = 0,
@@ -257,4 +275,12 @@ test "with a late day start, every moment of a DST night lies inside its own day
         const b = try z.dayBounds(d.year, d.month, d.day);
         try std.testing.expect(b.start_ms <= ms and ms < b.end_ms);
     }
+}
+
+test "zone names include the zones Zone.load accepts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const list = try names(arena.allocator());
+    try std.testing.expect(list.len > 50);
+    for (list[0..3]) |name| _ = try Zone.load(name);
 }

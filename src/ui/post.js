@@ -207,7 +207,7 @@ async function openObsPopup(idx) {
   _obsEntry = e;
   const tok = ++_obsTok;
   let val = e.observation || '';
-  if (!val && pref('ui_autofill_obs', '0') === '1') {
+  if (!val && pref('post_daily_notes', '0') === '1') {
     try {
       const day = D && D.date === _horasDate ? D : await apiJSON('GET', '/api/day?date=' + encodeURIComponent(_horasDate));
       const lines = [];

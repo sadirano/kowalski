@@ -62,7 +62,8 @@ function renderReport(rep) {
   // was, one full-width card per task listing its intervals.
   const grid = _reportLayout === 'grid';
   const allFolded = ordered.every(entry => _foldedTasks.has(entry.task.id));
-  const toolbar = grid ? `<div class="report-bar"><button class="link-btn" onclick="foldAllTasks(${!allFolded})">${esc(t(allFolded ? 'expand_all' : 'collapse_all'))}</button></div>` : '';
+  const fold = grid ? `<button class="link-btn" onclick="foldAllTasks(${!allFolded})">${esc(t(allFolded ? 'expand_all' : 'collapse_all'))}</button>` : '';
+  const toolbar = `<div class="report-bar">${fold}${prefButton('report')}</div>`;
   area.classList.toggle('grid-report', grid);
   const cards = ordered.map(entry => {
     const task = entry.task;

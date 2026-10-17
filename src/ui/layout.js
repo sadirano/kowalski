@@ -69,7 +69,7 @@ function onResizeMove(e) {
 function endResize(e) {
   if (!_resize) return;
   id('left-panel').classList.remove('resizing');
-  saveLS('leftWidth', _leftWidth);
+  setPref('ui_left_width', String(Math.round(_leftWidth))).catch(err => showError(err.message));
   _resize = null;
   const h = e.currentTarget;
   h.classList.remove('dragging');
@@ -113,7 +113,7 @@ function onRdResizeMove(e) {
 }
 function endRdResize(e) {
   if (!_rdResize) return;
-  if (_rdWorkWidth !== null) saveLS('rdWorkW', _rdWorkWidth);
+  if (_rdWorkWidth !== null) setPref('ui_reader_width', String(Math.round(_rdWorkWidth))).catch(err => showError(err.message));
   _rdResize = null;
   const h = e.currentTarget;
   h.classList.remove('dragging');
@@ -125,7 +125,7 @@ function endRdResize(e) {
 }
 function resetRdWorkWidth() {
   _rdWorkWidth = null;
-  saveLS('rdWorkW', null);
+  setPref('ui_reader_width', null).catch(err => showError(err.message));
   applyRdWorkWidth();
   requestAnimationFrame(readerRefitMap);
 }
@@ -153,8 +153,16 @@ function toggleChartVisible() {
 }
 
 function initLayout() {
-  _leftWidth     = sanitizeW(loadLS('leftWidth', 220));
-  const rdWidth  = loadLS('rdWorkW', null);
+  // Widths live in the daemon; one kept by an older dashboard in the browser
+  // moves there once.
+  const oldLeft = loadLS('leftWidth', null), oldReader = loadLS('rdWorkW', null);
+  const forget = key => { try { localStorage.removeItem('kw.' + key); } catch { /* private mode */ } };
+  if (oldLeft != null) (pref('ui_left_width', null) == null && Number.isFinite(oldLeft)
+    ? setPref('ui_left_width', String(Math.round(sanitizeW(oldLeft)))) : Promise.resolve()).then(() => forget('leftWidth'), () => {});
+  if (oldReader != null) (pref('ui_reader_width', null) == null && Number.isFinite(oldReader)
+    ? setPref('ui_reader_width', String(Math.max(360, Math.round(oldReader)))) : Promise.resolve()).then(() => forget('rdWorkW'), () => {});
+  _leftWidth     = sanitizeW(Number(pref('ui_left_width', Number.isFinite(oldLeft) ? oldLeft : 220)));
+  const rdWidth  = Number(pref('ui_reader_width', Number.isFinite(oldReader) ? oldReader : NaN));
   _rdWorkWidth   = Number.isFinite(rdWidth) ? Math.max(360, Math.round(rdWidth)) : null;
   _leftCollapsed = pref('ui_left_collapsed', '0') === '1';
   _chartVisible  = pref('ui_chart_visible', '1') === '1';

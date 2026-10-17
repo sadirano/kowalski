@@ -1,7 +1,7 @@
 'use strict';
 // ── Settings ──────────────────────────────────────────────────────────────────
 function applyPrefs() {
-  _hideWeekends = pref('ui_hide_weekends', '0') === '1';
+  _hideWeekends = pref('ui_show_weekends', '1') !== '1';
   _sidebarDays = parseInt(pref('ui_sidebar_days', '7'), 10);
   if (!Number.isFinite(_sidebarDays) || _sidebarDays < 1 || _sidebarDays > 90) _sidebarDays = 7;
   _refLinks = pref('ui_links', '0') === '1';
@@ -101,26 +101,18 @@ async function showSettings() {
     id('set-lock-on').checked = _lockDraft.length > 0;
     id('set-lang').value = _lang;
     id('set-time-format').value = pref('ui_time_format', 'system');
-    id('set-sidebar-days').value = pref('ui_sidebar_days', '7');
-    id('set-day-order').value = pref('ui_day_order', 'oldest');
-    id('set-show-weekends').checked = pref('ui_hide_weekends', '0') !== '1';
-    id('set-summary-format').value = pref('ui_summary_format', 'grouped');
-    id('set-task-order').value = pref('ui_task_order', 'time');
-    id('set-report-layout').value = _reportLayout;
     id('set-links').checked = pref('ui_links', '0') === '1';
     id('set-show-add-entry').checked = pref('ui_show_add_entry', '0') === '1';
     id('set-show-keys').checked = pref('ui_show_keys', '1') === '1';
     id('set-single-keys').checked = pref('ui_single_keys', '1') === '1';
-    id('set-open-launch').checked = pref('ui_open_on_launch', '1') === '1';
-    id('set-autofill').checked = pref('ui_autofill_obs', '0') === '1';
+    id('set-open-launch').checked = pref('open_on_launch', '1') === '1';
+    id('set-post-notes').checked = pref('post_daily_notes', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
     id('set-capture-text').value = pref('capture_text', 'keep');
     invalidateCapturedPreview();
     renderProviderControls();
-    await loadProjectSettings();
+    await renderPickers();
     loadSourceStatus().catch(e => { id('set-source-error').textContent = e.message; });
-    id('set-zone').value = pref('reporting_zone', '');
-    id('set-day-start').value = pref('day_start', '00:00');
     id('set-port').textContent = pref('http_port', location.port || '47100');
     apiJSON('GET', '/api/version').then(data => {
       id('set-version').textContent = data.version;
@@ -151,14 +143,60 @@ function renderProviderControls() {
   id('set-account-row').style.display = provider ? '' : 'none';
   renderProviderStatus();
   renderProviderSettings();
+}
+
+// The zone, day start and holding sources are chosen from lists, never typed.
+let _zones = null;
+async function renderPickers() {
+  if (!_zones) _zones = (await apiJSON('GET', '/api/zones')).zones;
+  const zone = pref('reporting_zone', '');
+  const zones = zone && !_zones.includes(zone) ? [zone, ..._zones] : _zones;
+  id('set-zone').innerHTML = zones.map(z => `<option value="${escAttr(z)}"${z === zone ? ' selected' : ''}>${esc(z)}</option>`).join('');
+  const start = pref('day_start', '00:00');
+  const starts = [];
+  for (let m = 0; m <= 12 * 60; m += 30) starts.push(minClock(m));
+  if (!starts.includes(start)) starts.push(start);
+  starts.sort();
+  // Labelled in the chosen time format; a minute after midnight stands in for the clock.
+  id('set-day-start').innerHTML = starts.map(v => {
+    const [h, mm] = v.split(':').map(Number);
+    const at = new Date(2000, 0, 1, h, mm).getTime();
+    return `<option value="${v}"${v === start ? ' selected' : ''}>${esc(fmtTime(at))}</option>`;
+  }).join('');
+  const held = (pref('capture_hold_sources', '') || '').split(',').map(x => x.trim()).filter(Boolean);
+  const keys = (await apiJSON('GET', '/api/project-keys')).keys;
+  const sources = [...new Set([...keys.map(k => k.source), ...held])].sort();
+  id('set-hold-sources').innerHTML = sources.map(src => `<label class="set-sw"><input type="checkbox" class="sw" data-source="${escAttr(src)}"${held.includes(src) ? ' checked' : ''}><span>${esc(src)}</span></label>`).join('')
+    || `<small>${esc(t('set_hold_none'))}</small>`;
+}
+
+// ── Projects ──────────────────────────────────────────────────────────────────
+async function showProjects() {
+  try {
+    await loadSettings();
+    renderProjectField();
+    await loadProjectSettings();
+  } catch (e) { showError(e.message); }
+  id('settings-overlay').classList.add('show');
+  id('projects-popup').classList.add('show');
+}
+
+function hideProjects() {
+  id('projects-popup').classList.remove('show');
+  id('settings-overlay').classList.remove('show');
+}
+
+function renderProjectField() {
   const fields = (provider?.fields || []).slice().sort((a, b) => a.order - b.order);
-  const hiddenTabs = chartHiddenGroups();
-  id('set-chart-tabs-row').style.display = fields.length ? '' : 'none';
-  id('set-chart-tabs').innerHTML = fields.map(f => `<label class="set-sw"><input type="checkbox" class="sw" data-group="${escAttr(f.name)}"${hiddenTabs.includes(f.name) ? '' : ' checked'}><span>${esc(providerLabel(f))}</span></label>`).join('');
   const projectField = id('set-project-field');
   projectField.innerHTML = `<option value="">${esc(t('project_off'))}</option>` + fields.map(f =>
     `<option value="${escAttr(f.name)}">${esc(providerLabel(f))}</option>`).join('');
   projectField.value = pref('project_provider_field', '');
+}
+
+async function saveProjectField(value) {
+  try { await setPref('project_provider_field', value || null); showToast(t('settings_saved')); }
+  catch (e) { showError(e.message); renderProjectField(); }
 }
 
 async function loadProjectSettings() {
@@ -803,9 +841,6 @@ async function applySettings() {
     if (!ok) return settingsError('lock-rows', 'win_bad');
     lockPause = joinWindows(_lockDraft, false);
   }
-  let sidebarDays = parseInt(id('set-sidebar-days').value, 10);
-  if (isNaN(sidebarDays)) sidebarDays = 7;
-  sidebarDays = Math.min(90, Math.max(1, sidebarDays));
   const lang = id('set-lang').value;
   const changes = {
     daily_work_minutes: String(daily),
@@ -814,28 +849,21 @@ async function applySettings() {
     lock_pause: lockPause,
     ui_lang: lang,
     ui_time_format: id('set-time-format').value,
-    ui_sidebar_days: String(sidebarDays),
-    ui_day_order: id('set-day-order').value,
-    ui_hide_weekends: id('set-show-weekends').checked ? '0' : '1',
-    ui_summary_format: id('set-summary-format').value,
-    ui_task_order: id('set-task-order').value,
-    ui_report_layout: id('set-report-layout').value,
     ui_links: id('set-links').checked ? '1' : '0',
     ui_show_add_entry: id('set-show-add-entry').checked ? '1' : '0',
     ui_show_keys: id('set-show-keys').checked ? '1' : '0',
     ui_single_keys: id('set-single-keys').checked ? '1' : '0',
-    ui_open_on_launch: id('set-open-launch').checked ? '1' : '0',
-    ui_autofill_obs: id('set-autofill').checked ? '1' : '0',
+    open_on_launch: id('set-open-launch').checked ? '1' : '0',
+    post_daily_notes: id('set-post-notes').checked ? '1' : '0',
     post_sessions: id('set-post-sessions').checked ? '1' : '0',
-    project_provider_field: id('set-project-field').value || null,
     update_channel: id('set-update-channel').value,
     capture_text: id('set-capture-text').value,
+    capture_hold_sources: [...id('set-hold-sources').querySelectorAll('input[data-source]:checked')].map(el => el.dataset.source).join(','),
     // An emptied text goes back to the provider's default.
     ...Object.fromEntries([...document.querySelectorAll('#set-provider-rows [data-key]')]
       .map(el => [el.dataset.key, el.value.trim() || null])),
-    ui_chart_hidden: JSON.stringify([...id('set-chart-tabs').querySelectorAll('input:not(:checked)')].map(el => el.dataset.group)),
   };
-  const zoneName = id('set-zone').value.trim();
+  const zoneName = id('set-zone').value;
   if (zoneName && zoneName !== pref('reporting_zone', '')) changes.reporting_zone = zoneName;
   changes.day_start = id('set-day-start').value;
 
@@ -846,7 +874,6 @@ async function applySettings() {
     hideSettings();
     showToast(t('settings_saved'));
     applyFeatureToggles();
-    renderChartGroups();
     if (lang !== _lang) { setLangFrom(settings); relabel(); return; }
     loadCurrent(); // the header picks up the link and time-format choices
     loadSchedule();

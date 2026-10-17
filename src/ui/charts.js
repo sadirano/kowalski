@@ -149,6 +149,8 @@ function renderChartGroups() {
   if (!groups.some(group => group.name === chartGroupBy)) { chartGroupBy = 'task'; _chartHidden.clear(); }
   // Task alone needs no tabs.
   id('chart-groups').style.display = groups.length > 1 ? '' : 'none';
+  // Provider fields can be taken off the tabs; without any there is nothing to choose.
+  id('chart-pref-btn').style.display = (provider?.fields || []).length ? '' : 'none';
   id('chart-groups').innerHTML = groups.map(group => {
     const name = escAttr(JSON.stringify(group.name));
     return `<button class="chart-gtab${group.name === chartGroupBy ? ' active' : ''}"`

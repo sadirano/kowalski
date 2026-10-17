@@ -32,12 +32,12 @@ pub fn open(io: std.Io, a: std.mem.Allocator, db_path: []const u8, db_flag: ?[]c
     try launch.openUrl(a, url);
 }
 
-/// The `ui_open_on_launch` setting; on unless it says "0".
+/// The `open_on_launch` setting; on unless it says "0".
 fn wanted(db_path: []const u8) bool {
     var db: sqlite.Db = .{};
     db.openReadOnly(db_path) catch return true;
     defer db.close();
-    var stmt = db.prepare("SELECT value FROM settings WHERE key='ui_open_on_launch'") catch return true;
+    var stmt = db.prepare("SELECT value FROM settings WHERE key='open_on_launch'") catch return true;
     defer stmt.finalize();
     if ((stmt.step() catch return true) == .done) return true;
     return !std.mem.eql(u8, stmt.columnText(0) orelse "1", "0");

@@ -5,6 +5,7 @@
 //! caller runs that provider call without the database lock, then passes the
 //! outcome to `proceed`, which may ask for another call.
 const std = @import("std");
+const settings_decl = @import("settings.zig");
 const store_mod = @import("store.zig");
 const days = @import("days.zig");
 const zone = @import("zone.zig");
@@ -17,23 +18,6 @@ const Store = store_mod.Store;
 
 pub const default_port: u16 = 47100;
 
-/// Settings the API may change; anything else is refused.
-pub const setting_keys = [_][]const u8{
-    "reporting_zone",  "day_start", "daily_work_minutes", "lunch_minutes",     "http_port",
-    "post_sessions", "update_channel", "capture_text",
-    "project_provider_field",
-    // Dashboard preferences.
-    "ui_day_order",    "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",      "ui_show_add_entry", "ui_chart_visible", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch",
-    "ui_chart_days",   "ui_left_collapsed",  "ui_lang",           "ui_summary_format", "ui_autofill_obs",   "ui_links",
-    "ui_time_format",  "ui_chart_view",      "ui_chart_hidden",   "ui_task_order",     "ui_report_layout",
-    // Paid break windows, overriding the provider's: "08:00-12:00=15,13:00-18:00=15"; empty is none.
-    "paid_breaks",
-    // Windows where a screen lock pauses: "17:00-23:59"; empty is none.
-    "lock_pause",
-    // Capture sources whose working run keeps the focus against other runs'
-    // prompts, such as a game the user plays: "src1,src2"; empty is none.
-    "capture_hold_sources",
-};
 
 pub const App = struct {
     store: *Store,
@@ -492,6 +476,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         try app.store.setDaySummary(date.text, std.mem.trim(u8, body.text, " \t\r\n"), app.clock());
         return send(a, .ok, .{ .date = date.text, .text = try summaryOf(app, a, date.text) });
     }
+    if (is(req, .GET, path, "/api/zones")) return send(a, .ok, .{ .zones = try zone.names(a) });
     if (is(req, .GET, path, "/api/settings")) return send(a, .ok, .{ .settings = try query.settings(app.store, a) });
     if (is(req, .PATCH, path, "/api/settings")) {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req.body, .{}) catch return badRequest(a, "body");
@@ -572,8 +557,9 @@ fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8
     return null;
 }
 
+/// Declared in settings.zig, or a setting the loaded provider declares.
 fn knownSetting(app: *const App, key: []const u8) bool {
-    for (setting_keys) |k| if (std.mem.eql(u8, k, key)) return true;
+    if (settings_decl.find(key) != null) return true;
     return providerSetting(app, key) != null;
 }
 
@@ -1481,9 +1467,8 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
     return null;
 }
 
-const ui_flags = [_][]const u8{ "ui_hide_weekends", "ui_show_keys", "ui_show_add_entry", "ui_chart_visible", "ui_left_collapsed", "ui_autofill_obs", "ui_links", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch", "post_sessions" };
-
-/// Dashboard preferences: checked here, since the store does not know them.
+/// A value's own rule from settings.zig, then the checks that need the
+/// provider or a parser; the store checks the rest.
 fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
     const v = value orelse return true;
     if (std.mem.eql(u8, key, "project_provider_field")) {
@@ -1493,39 +1478,11 @@ fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
         return false;
     }
     if (providerSetting(app, key)) |s| return validProviderValue(s, v);
-    for (ui_flags) |f| if (std.mem.eql(u8, key, f)) return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "1");
-    const Choice = struct { key: []const u8, values: []const []const u8 };
-    const choices = [_]Choice{
-        .{ .key = "ui_day_order", .values = &.{ "oldest", "newest" } },
-        .{ .key = "ui_lang", .values = &.{ "en", "pt", "ja" } },
-        .{ .key = "ui_summary_format", .values = &.{ "grouped", "chronological" } },
-        .{ .key = "ui_time_format", .values = &.{ "system", "24", "12" } },
-        .{ .key = "ui_chart_view", .values = &.{ "bars", "lanes" } },
-        .{ .key = "ui_task_order", .values = &.{ "time", "ref", "added" } },
-        .{ .key = "ui_report_layout", .values = &.{ "classic", "grid", "reader" } },
-        .{ .key = "update_channel", .values = &.{ "stable", "preview" } },
-        .{ .key = "capture_text", .values = &.{ "keep", "time" } },
-    };
-    for (choices) |c| if (std.mem.eql(u8, key, c.key)) {
-        for (c.values) |allowed| if (std.mem.eql(u8, v, allowed)) return true;
-        return false;
-    };
+    if (settings_decl.find(key)) |d| if (!settings_decl.valid(d, v)) return false;
     if (std.mem.eql(u8, key, "paid_breaks")) {
         var buffer: [2048]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buffer);
         return (parsePaidBreaks(fba.allocator(), v) catch return false) != null;
-    }
-    // Provider fields kept off the chart tabs, as a JSON list of names.
-    if (std.mem.eql(u8, key, "ui_chart_hidden")) {
-        if (v.len > 1024) return false;
-        var buffer: [4096]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buffer);
-        _ = std.json.parseFromSliceLeaky([]const []const u8, fba.allocator(), v, .{}) catch return false;
-        return true;
-    }
-    if (std.mem.eql(u8, key, "ui_sidebar_days") or std.mem.eql(u8, key, "ui_chart_days")) {
-        const n = std.fmt.parseInt(u16, v, 10) catch return false;
-        return n >= 1 and n <= 90;
     }
     return true;
 }
