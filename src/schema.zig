@@ -107,14 +107,20 @@ pub fn ensure(db: *sqlite.Db) !void {
             "INSERT OR REPLACE INTO settings(key,value) SELECT 'ui_show_weekends', CASE value WHEN '1' THEN '0' ELSE '1' END FROM settings WHERE key='ui_hide_weekends';" ++
             "DELETE FROM settings WHERE key IN ('ui_hide_weekends','ui_chart_engine','ui_poll_seconds');",
     );
-    try db.exec("PRAGMA user_version=11");
+    // 12: a day's notes and a task's intervals are found by index, not by
+    // scanning every note and every interval before the day.
+    if (version < 12) try db.exec(
+        "CREATE INDEX IF NOT EXISTS notes_interval ON notes(interval_id);" ++
+            "CREATE INDEX IF NOT EXISTS intervals_task_start ON intervals(task_id,start_ms);",
+    );
+    try db.exec("PRAGMA user_version=12");
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
     if (try check.step() != .done) return error.ForeignKeyViolation;
     try tx.commit();
 }
 
-pub const current: i64 = 11;
+pub const current: i64 = 12;
 
 const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
@@ -198,7 +204,7 @@ test "schema constraints and version" {
     defer db.close();
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 11), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 12), try scalar(&db, "PRAGMA user_version"));
     try db.exec("INSERT INTO projects(label) VALUES('fresh')");
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('FRESH')"));
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('')"));
@@ -217,7 +223,7 @@ test "schema constraints and version" {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO lunches(out_ms) VALUES(2)"));
     try db.exec("UPDATE lunches SET back_ms=3");
     try db.exec("INSERT INTO lunches(out_ms) VALUES(4)");
-    try db.exec("PRAGMA user_version=12");
+    try db.exec("PRAGMA user_version=13");
     try std.testing.expectError(error.SchemaVersion, ensure(&db));
 }
 
@@ -238,7 +244,7 @@ fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
 }
 
 fn assertV10(db: *sqlite.Db) !void {
-    try std.testing.expectEqual(@as(i64, 11), try scalar(db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 12), try scalar(db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM pragma_table_info('capture_runs') WHERE name='provisional_title' AND \"notnull\"=1 AND dflt_value='0'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
     try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
@@ -284,6 +290,15 @@ test "fresh v10 has no import provenance" {
     inline for (.{ "tasks", "intervals", "notes", "day_summaries", "postings" }) |table| {
         try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT count(*) FROM pragma_table_info('" ++ table ++ "') WHERE name='import_id'"));
     }
+}
+
+test "the day indexes exist after an upgrade" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    try ensure(&db);
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='notes_interval'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='intervals_task_start'"));
 }
 
 test "file upgrade makes a v4 backup, current file does not" {
@@ -386,7 +401,7 @@ test "populated v8 upgrades to v10 in place with one v8 backup" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 11), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 12), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND start_ms=100 AND end_ms=200 AND text='work' AND captured=1 AND project_id IS NULL AND posting_span_id IS NULL"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND project_id IS NULL AND project_choice_explicit=0 AND project_fallback_eligible=0"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=19 AND interval_id=18 AND at_ms=150 AND text='note' AND source='prompt'"));
@@ -436,7 +451,7 @@ test "populated v9 gains a cleared provisional flag and keeps history" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 11), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 12), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='run'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND title='Session'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND captured=1"));
@@ -458,7 +473,7 @@ test "v10 settings take their kind's names and keep their values" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 11), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 12), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM settings WHERE key='post_daily_notes' AND value='1'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM settings WHERE key='open_on_launch' AND value='0'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM settings WHERE key='ui_show_weekends' AND value='0'"));

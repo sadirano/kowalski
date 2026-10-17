@@ -2603,7 +2603,7 @@ test "store refuses a future schema version" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
-    try db.exec("PRAGMA user_version=12");
+    try db.exec("PRAGMA user_version=13");
     try std.testing.expectError(error.SchemaVersion, Store.init(&db, std.testing.allocator));
 }
 

@@ -316,6 +316,18 @@ pub fn openIntervals(store: *Store, a: std.mem.Allocator) ![]Interval {
 }
 
 /// Intervals of any role that overlap [start, end), plus zero-length ones inside it.
+/// The start and end of each interval overlapping [start, end), as
+/// intervalsBetween orders them, without tasks or notes.
+pub fn spansBetween(store: *Store, a: std.mem.Allocator, start_ms: i64, end_ms: i64) ![]OpenSpan {
+    var stmt = try store.db.prepare("SELECT i.start_ms,i.end_ms FROM intervals i WHERE i.start_ms<?1 AND (i.end_ms IS NULL OR i.end_ms>?2 OR i.start_ms>=?2) ORDER BY i.start_ms, i.id");
+    defer stmt.finalize();
+    try stmt.bindI64(1, end_ms);
+    try stmt.bindI64(2, start_ms);
+    var rows: std.ArrayList(OpenSpan) = .empty;
+    while (try stmt.step() == .row) try rows.append(a, .{ .start_ms = stmt.columnI64(0), .end_ms = if (stmt.columnIsNull(1)) null else stmt.columnI64(1) });
+    return rows.items;
+}
+
 pub fn intervalsBetween(store: *Store, a: std.mem.Allocator, start_ms: i64, end_ms: i64) ![]Interval {
     var stmt = try store.db.prepare(interval_select ++ "WHERE i.start_ms<?1 AND (i.end_ms IS NULL OR i.end_ms>?2 OR i.start_ms>=?2) ORDER BY i.start_ms, i.id");
     defer stmt.finalize();

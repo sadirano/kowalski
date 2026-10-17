@@ -706,7 +706,7 @@ fn lunchesOf(app: *App, a: std.mem.Allocator, bounds: zone.Zone.Bounds) ![]query
     const least: i64 = @as(i64, @max(10, (try app.store.lunchMinutes()) / 2)) * 60_000;
     var best: ?query.Span = null;
     var reach: ?i64 = null;
-    for (try query.intervalsBetween(app.store, a, bounds.start_ms, bounds.end_ms)) |i| {
+    for (try query.spansBetween(app.store, a, bounds.start_ms, bounds.end_ms)) |i| {
         const end = i.end_ms orelse now;
         if (reach) |r| {
             if (i.start_ms - r >= least) {
@@ -2024,6 +2024,146 @@ const Fixture = struct {
         return std.json.parseFromSliceLeaky(T, f.arena.allocator(), r.body, .{ .ignore_unknown_fields = true });
     }
 };
+
+const DayListTimes = struct {
+    bounds: i96 = 0,
+    schedule: i96 = 0,
+    numbers: i96 = 0,
+    changed: i96 = 0,
+    binding: i96 = 0,
+    posted: i96 = 0,
+    remaining: i96 = 0,
+    task_open: i96 = 0,
+    blocked: i96 = 0,
+};
+
+fn benchNow() i96 {
+    return std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+}
+
+fn benchMs(ns: i96) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000;
+}
+
+test "day list synthetic 60 day timing" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const day_ms: i64 = 86_400_000;
+    const today_start: i64 = 1_773_100_800_000; // 2026-03-10T00:00Z
+    test_now = today_start + 23 * 3_600_000;
+    f.app.provider = "fake";
+    f.app.traits.sessions = true;
+    try f.store.setSetting("post_sessions", "1", test_now);
+    var task_ids: [50]i64 = undefined;
+    for (&task_ids, 0..) |*id, i| {
+        const title = try std.fmt.allocPrint(a, "Synthetic task {d}", .{i});
+        id.* = try f.store.createTask(title, test_now);
+        if (i < 25) {
+            const ref = try std.fmt.allocPrint(a, "ref-{d}", .{id.*});
+            try f.store.bind(id.*, "fake", ref, test_now);
+        }
+        if (i % 3 == 0) try f.store.setField(id.*, "category", "synthetic", test_now);
+    }
+    var interval = try f.db.prepare("INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by) VALUES(?1,?2,'focus',?3,?4,'switch','stop')");
+    defer interval.finalize();
+    var note = try f.db.prepare("INSERT INTO notes(interval_id,at_ms,text) VALUES(?1,?2,'synthetic note')");
+    defer note.finalize();
+    var edit = try f.db.prepare("INSERT INTO day_edits(day,edited_ms) VALUES(?1,?2)");
+    defer edit.finalize();
+    var posting = try f.db.prepare("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms,covered_start_ms,covered_end_ms) VALUES(?1,?2,'fake',?3,'confirmed','0.25',250000,?4,?4,?5,?6)");
+    defer posting.finalize();
+    const today_index = dayIndex(try dateParam(&f.app, a, null));
+    var tx = try f.db.transaction();
+    defer tx.deinit();
+    for (0..60) |d| {
+        const start = today_start - @as(i64, @intCast(59 - d)) * day_ms;
+        const date = try fromCivilDays(a, today_index - @as(i64, @intCast(59 - d)));
+        for (0..30) |i| {
+            const id: i64 = @intCast(d * 30 + i + 1);
+            const at = start + 8 * 3_600_000 + @as(i64, @intCast(i)) * 20 * 60_000;
+            try interval.bindI64(1, id);
+            try interval.bindI64(2, task_ids[(d * 7 + i * 11) % task_ids.len]);
+            try interval.bindI64(3, at);
+            try interval.bindI64(4, at + 18 * 60_000);
+            try std.testing.expectEqual(sqlite.Statement.Step.done, try interval.step());
+            try interval.reset();
+            for (0..(if (i < 10) @as(usize, 2) else 1)) |n| {
+                try note.bindI64(1, id);
+                try note.bindI64(2, at + @as(i64, @intCast(n + 1)) * 60_000);
+                try std.testing.expectEqual(sqlite.Statement.Step.done, try note.step());
+                try note.reset();
+            }
+        }
+        try edit.bindText(1, date.text);
+        try edit.bindI64(2, start + 20 * 3_600_000);
+        try std.testing.expectEqual(sqlite.Statement.Step.done, try edit.step());
+        try edit.reset();
+        if (d % 3 == 0) {
+            const task = task_ids[d % 25];
+            const ref = try std.fmt.allocPrint(a, "ref-{d}", .{task});
+            try posting.bindText(1, date.text);
+            try posting.bindI64(2, task);
+            try posting.bindText(3, ref);
+            try posting.bindI64(4, start + 19 * 3_600_000);
+            try posting.bindI64(5, start + 8 * 3_600_000);
+            try posting.bindI64(6, start + 8 * 3_600_000 + 15 * 60_000);
+            try std.testing.expectEqual(sqlite.Statement.Step.done, try posting.step());
+            try posting.reset();
+        }
+    }
+    try tx.commit();
+
+    const started = benchNow();
+    const response = try dayList(&f.app, a, "count=8&weekends=1");
+    const elapsed = benchNow() - started;
+    try std.testing.expectEqual(std.http.Status.ok, response.status);
+    try std.testing.expect(response.followup != null and response.followup.? == .status);
+
+    var times: DayListTimes = .{};
+    const z = try loadZone(&f.app, a);
+    for (0..8) |offset| {
+        const date = try fromCivilDays(a, today_index - @as(i64, @intCast(7 - offset)));
+        var mark = benchNow();
+        const bounds = try z.dayBounds(date.year, date.month, date.day);
+        times.bounds += benchNow() - mark;
+        mark = benchNow();
+        const schedule = try scheduleFor(&f.app, a, bounds);
+        times.schedule += benchNow() - mark;
+        mark = benchNow();
+        const numbers = try days.dayNumbers(&f.store, a, bounds.start_ms, bounds.end_ms, test_now, schedule);
+        times.numbers += benchNow() - mark;
+        mark = benchNow();
+        _ = try query.changedAfterPosting(&f.store, date.text);
+        times.changed += benchNow() - mark;
+        for (numbers.tasks) |t| {
+            if (t.focus_ms <= 0) continue;
+            mark = benchNow();
+            const b = try query.binding(&f.store, a, t.task_id) orelse {
+                times.binding += benchNow() - mark;
+                continue;
+            };
+            times.binding += benchNow() - mark;
+            if (!std.mem.eql(u8, b.instance, f.app.provider.?)) continue;
+            mark = benchNow();
+            _ = try query.postedOn(&f.store, a, date.text, b.instance, b.ref);
+            times.posted += benchNow() - mark;
+            mark = benchNow();
+            _ = try remainingFor(&f.app, a, date, t.task_id, b.instance, b.ref);
+            times.remaining += benchNow() - mark;
+            mark = benchNow();
+            _ = try query.taskOpen(&f.store, t.task_id);
+            times.task_open += benchNow() - mark;
+            mark = benchNow();
+            _ = try f.store.isBlocked(date.text, b.instance, b.ref);
+            times.blocked += benchNow() - mark;
+        }
+    }
+    std.debug.print("dayList 8 days: {d:.3} ms; bounds {d:.3}, scheduleFor {d:.3}, dayNumbers {d:.3}, changedAfterPosting {d:.3}, binding {d:.3}, postedOn {d:.3}, remainingFor {d:.3}, taskOpen {d:.3}, isBlocked {d:.3} ms\n", .{
+        benchMs(elapsed), benchMs(times.bounds), benchMs(times.schedule), benchMs(times.numbers), benchMs(times.changed), benchMs(times.binding), benchMs(times.posted), benchMs(times.remaining), benchMs(times.task_open), benchMs(times.blocked),
+    });
+}
 
 test "requests need loopback host, marker and same origin" {
     var f: Fixture = .{};
