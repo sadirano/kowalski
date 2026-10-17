@@ -5,6 +5,8 @@ without anyone pressing start and stop. Each source sends events for its
 runs to `POST /api/capture` (or `kowalski capture`), and kowalski opens and
 closes intervals from them.
 
+Settings > Captured text chooses whether to keep prompts and outcomes (the default) or record time only; time only also gives unnamed runs the title "Session". Settings > Remove captured text previews and removes prompt and outcome notes for selected reporting days. Time and plain notes are kept.
+
 ```json
 {"source":"agent","run":"<session id>","event":"<unique id>","kind":"prompt","project_key":"<stable source key>","project_hint":"my-repo","first_prompt":"Investigate startup failure","attended":true}
 ```

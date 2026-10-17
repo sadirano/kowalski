@@ -27,6 +27,50 @@ let _settingsLoaded = false;
 let _captureKeys = [];
 let _assignmentPreview = null;
 let _assignmentEpoch = 0, _assignmentBusy = false;
+let _capturedPreview = null, _capturedEpoch = 0, _capturedBusy = false;
+
+function invalidateCapturedPreview() {
+  _capturedEpoch++;
+  _capturedPreview = null;
+  id('capture-remove').disabled = true;
+  id('capture-result').textContent = '';
+}
+
+async function previewCapturedText() {
+  if (_capturedBusy) return;
+  const from = id('capture-from').value, to = id('capture-to').value;
+  invalidateCapturedPreview();
+  if (!from || !to || from > to) { showError(t('capture_bad_range')); return; }
+  const epoch = _capturedEpoch;
+  _capturedBusy = true;
+  id('capture-preview').disabled = true;
+  try {
+    const data = await apiJSON('POST', '/api/notes/captured', { from, to, apply: false });
+    if (epoch !== _capturedEpoch) return;
+    _capturedPreview = { from, to };
+    id('capture-result').textContent = t('capture_preview_count', { n: data.count });
+    id('capture-remove').disabled = false;
+  } catch (e) { if (epoch === _capturedEpoch) showError(e.message); }
+  finally { _capturedBusy = false; id('capture-preview').disabled = false; }
+}
+
+async function removeCapturedText() {
+  if (_capturedBusy || !_capturedPreview) return;
+  const { from, to } = _capturedPreview;
+  if (id('capture-from').value !== from || id('capture-to').value !== to) { invalidateCapturedPreview(); return; }
+  _capturedBusy = true;
+  id('capture-remove').disabled = true;
+  id('capture-preview').disabled = true;
+  id('capture-from').disabled = true;
+  id('capture-to').disabled = true;
+  try {
+    const data = await apiJSON('POST', '/api/notes/captured', { from, to, apply: true });
+    _capturedPreview = null;
+    id('capture-result').textContent = t('capture_removed_count', { n: data.deleted });
+    loadDay(selectedDate);
+  } catch (e) { showError(e.message); }
+  finally { _capturedBusy = false; id('capture-preview').disabled = false; id('capture-from').disabled = false; id('capture-to').disabled = false; }
+}
 // Window rows being edited; switching a mode off keeps them for this visit.
 let _paidDraft = [];
 let _lockDraft = [];
@@ -70,6 +114,8 @@ async function showSettings() {
     id('set-open-launch').checked = pref('ui_open_on_launch', '1') === '1';
     id('set-autofill').checked = pref('ui_autofill_obs', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
+    id('set-capture-text').value = pref('capture_text', 'keep');
+    invalidateCapturedPreview();
     renderProviderControls();
     await loadProjectSettings();
     loadSourceStatus().catch(e => { id('set-source-error').textContent = e.message; });
@@ -79,6 +125,7 @@ async function showSettings() {
     apiJSON('GET', '/api/version').then(data => {
       id('set-version').textContent = data.version;
       id('set-update-channel').value = pref('update_channel', String(data.version).includes('-preview.') ? 'preview' : 'stable');
+      id('update-stable-note').style.display = String(data.version).includes('-preview.') ? '' : 'none';
       id('update-row').style.display = data.update_repo || _lastUpdateOutcome ? '' : 'none';
       if (!data.update_repo && !_lastUpdateOutcome) id('update-result').style.display = 'none';
       else if (_lastUpdateOutcome) {
@@ -782,6 +829,7 @@ async function applySettings() {
     post_sessions: id('set-post-sessions').checked ? '1' : '0',
     project_provider_field: id('set-project-field').value || null,
     update_channel: id('set-update-channel').value,
+    capture_text: id('set-capture-text').value,
     // An emptied text goes back to the provider's default.
     ...Object.fromEntries([...document.querySelectorAll('#set-provider-rows [data-key]')]
       .map(el => [el.dataset.key, el.value.trim() || null])),

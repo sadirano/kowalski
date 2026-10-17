@@ -9,6 +9,8 @@ Use a Windows machine with Zig 0.17, the release signing key, and `gh`.
 
 ## Preview releases
 
+On a preview build, selecting Stable waits for the next stable release: the upgraded database cannot be opened by an older version, and only a `backup-vN-*.db` made before the upgrade beside the database can take it back.
+
 Keep the coming stable version in `build.zig.zon` and build with `zig build -Dpreview=N`. Name the directory and ZIP `kowalski-vX.Y.Z-preview.N-windows-x86_64` and `kowalski-vX.Y.Z-preview.N-windows-x86_64.zip`. Sign the ZIP as usual, then publish with `gh release create vX.Y.Z-preview.N <zip> <sig> --prerelease`. Stable builds never see these releases; users opt in under Settings > Updates.
 
 For an offline install, put the ZIP and matching `.sig` together and run

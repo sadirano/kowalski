@@ -841,6 +841,9 @@ pub const Store = struct {
     pub fn captureDetailed(s: *Store, c: Capture, now_ms: i64) Error!CaptureResult {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        const capture_text = try s.getSetting("capture_text");
+        defer if (capture_text) |value| s.allocator.free(value);
+        const time_only = if (capture_text) |value| std.mem.eql(u8, value, "time") else false;
         const at = try s.intervalTime(now_ms);
         if (c.event) |event| {
             var stmt = try s.db.prepare("INSERT OR IGNORE INTO capture_events(source,event,run,kind,at_ms) VALUES(?1,?2,?3,?4,?5)");
@@ -892,7 +895,7 @@ pub const Store = struct {
                 try s.setRun(c, task, run.working, run.role, run.lease_until);
                 run.task = task;
             } else if (c.kind == .prompt and c.default_task == null) {
-                const title = try s.sessionTitle(c.first_prompt);
+                const title = try s.sessionTitle(if (time_only) null else c.first_prompt);
                 defer s.allocator.free(title);
                 const task = try s.insertTask(title, .{ .selected = lookup_project }, at);
                 try s.setRun(c, task, run.working, run.role, run.lease_until);
@@ -945,7 +948,7 @@ pub const Store = struct {
                 }
             },
         }
-        if (c.note) |text| if (c.kind != .start and c.kind != .end) try s.captureNote(c, at, text);
+        if (!time_only) if (c.note) |text| if (c.kind != .start and c.kind != .end) try s.captureNote(c, at, text);
         try s.heartbeat(at);
         const final = try s.captureRun(c.source, c.run);
         try tx.commit();
@@ -1904,6 +1907,27 @@ pub const Store = struct {
         try tx.commit();
     }
 
+    pub fn removeCapturedText(s: *Store, from_ms: i64, to_ms: i64, apply: bool, now_ms: i64) Error!i64 {
+        if (apply) {
+            var tx = try s.begin(now_ms, false);
+            defer tx.deinit();
+            var stmt = try s.db.prepare("DELETE FROM notes WHERE source IN ('prompt','outcome') AND at_ms>=?1 AND at_ms<?2");
+            defer stmt.finalize();
+            try stmt.bindI64(1, from_ms);
+            try stmt.bindI64(2, to_ms);
+            _ = try stmt.step();
+            const count = s.db.changes();
+            try tx.commit();
+            return count;
+        }
+        var stmt = try s.db.prepare("SELECT count(*) FROM notes WHERE source IN ('prompt','outcome') AND at_ms>=?1 AND at_ms<?2");
+        defer stmt.finalize();
+        try stmt.bindI64(1, from_ms);
+        try stmt.bindI64(2, to_ms);
+        _ = try stmt.step();
+        return stmt.columnI64(0);
+    }
+
     pub fn getSetting(s: *Store, key: []const u8) Error!?[]u8 {
         var stmt = try s.db.prepare("SELECT value FROM settings WHERE key=?1");
         defer stmt.finalize();
@@ -2856,6 +2880,47 @@ test "captured prompts and outcomes become notes; manual focus outranks capture"
     _ = try s.capture(A, 4 * min);
     try std.testing.expectEqual(manual, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
     try std.testing.expectEqual(a, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+}
+
+test "time-only capture keeps intervals and uses a generic task title" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    try s.setSetting("capture_text", "time", 1);
+    var c: Capture = .{ .source = "agent", .run = "r", .kind = .prompt, .first_prompt = "private text", .note = "prompt" };
+    _ = try s.capture(c, 60_000);
+    c.kind = .busy;
+    c.note = "report";
+    _ = try s.capture(c, 90_000);
+    c.kind = .stop;
+    c.note = "outcome";
+    _ = try s.capture(c, 120_000);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM tasks WHERE title='Session'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE captured=1"));
+}
+
+test "removing captured text preserves plain notes and intervals" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("work", 1);
+    var c: Capture = .{ .source = "agent", .run = "r", .kind = .prompt, .default_task = task, .note = "prompt" };
+    _ = try s.capture(c, 60_000);
+    c.kind = .busy;
+    c.note = "plain";
+    _ = try s.capture(c, 90_000);
+    c.kind = .stop;
+    c.note = "outcome";
+    _ = try s.capture(c, 120_000);
+    try std.testing.expectEqual(@as(i64, 1), try s.removeCapturedText(0, 120_000, false, 130_000));
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT count(*) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 1), try s.removeCapturedText(0, 120_000, true, 130_000));
+    try std.testing.expectEqual(@as(i64, 1), try s.removeCapturedText(120_000, 180_000, true, 140_000));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM notes WHERE source IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE captured=1"));
 }
 
 

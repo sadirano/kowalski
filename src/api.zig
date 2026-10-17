@@ -20,7 +20,7 @@ pub const default_port: u16 = 47100;
 /// Settings the API may change; anything else is refused.
 pub const setting_keys = [_][]const u8{
     "reporting_zone",  "day_start", "daily_work_minutes", "lunch_minutes",     "http_port",
-    "post_sessions", "update_channel",
+    "post_sessions", "update_channel", "capture_text",
     "project_provider_field",
     // Dashboard preferences.
     "ui_day_order",    "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",      "ui_show_add_entry", "ui_chart_visible", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch",
@@ -440,6 +440,17 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         const text = std.mem.trim(u8, body.text, " \t\r\n");
         const note = try app.store.addNote(target, text, app.clock());
         return send(a, .created, .{ .note = note });
+    }
+    if (is(req, .POST, path, "/api/notes/captured")) {
+        const body = try parseBody(struct { from: []const u8, to: []const u8, apply: bool }, a, req.body) orelse return badRequest(a, "body");
+        const from = parseDate(a, body.from) catch return badRequest(a, "from");
+        const to = parseDate(a, body.to) catch return badRequest(a, "to");
+        if (dayIndex(from) > dayIndex(to)) return badRequest(a, "range");
+        const z = try loadZone(app, a);
+        const first = try z.dayBounds(from.year, from.month, from.day);
+        const last = try z.dayBounds(to.year, to.month, to.day);
+        const count = try app.store.removeCapturedText(first.start_ms, last.end_ms, body.apply, app.clock());
+        return if (body.apply) send(a, .ok, .{ .deleted = count }) else send(a, .ok, .{ .count = count });
     }
     if (is(req, .GET, path, "/api/day")) return day(app, a, try param(a, params, "date"));
     if (is(req, .GET, path, "/api/summary")) {
@@ -1422,6 +1433,7 @@ fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
         .{ .key = "ui_task_order", .values = &.{ "time", "ref", "added" } },
         .{ .key = "ui_report_layout", .values = &.{ "classic", "grid", "reader" } },
         .{ .key = "update_channel", .values = &.{ "stable", "preview" } },
+        .{ .key = "capture_text", .values = &.{ "keep", "time" } },
     };
     for (choices) |c| if (std.mem.eql(u8, key, c.key)) {
         for (c.values) |allowed| if (std.mem.eql(u8, v, allowed)) return true;
@@ -2119,10 +2131,32 @@ test "settings accept known keys only and validate" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"stable\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"preview\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"nightly\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_text\":\"keep\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_text\":\"time\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"capture_text\":\"none\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"nope\":\"1\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"daily_work_minutes\":\"0\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"http_port\":\"80\"}").status);
     try std.testing.expectEqual(@as(u16, 480), try f.store.dailyWorkMinutes());
+}
+
+test "captured text removal validates dates and keeps time" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const prompt = "{\"source\":\"agent\",\"run\":\"r\",\"kind\":\"prompt\",\"first_prompt\":\"work\",\"note\":\"asked\"}";
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", prompt).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-02-30\",\"to\":\"2026-03-09\",\"apply\":false}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-03-10\",\"to\":\"2026-03-09\",\"apply\":false}").status);
+    const dry = f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-03-09\",\"to\":\"2026-03-09\",\"apply\":false}");
+    try std.testing.expectEqual(std.http.Status.ok, dry.status);
+    try std.testing.expect(contains(dry.body, "\"count\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes"));
+    const applied = f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-03-09\",\"to\":\"2026-03-09\",\"apply\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, applied.status);
+    try std.testing.expect(contains(applied.body, "\"deleted\":1"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE captured=1"));
 }
 
 test "settings change together or not at all" {
