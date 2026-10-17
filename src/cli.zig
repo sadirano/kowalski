@@ -13,6 +13,15 @@ extern "kernel32" fn GetConsoleMode(handle: windows.HANDLE, mode: *u32) callconv
 extern "kernel32" fn SetConsoleMode(handle: windows.HANDLE, mode: u32) callconv(.winapi) i32;
 extern "kernel32" fn ReadConsoleW(handle: windows.HANDLE, buffer: [*]u16, len: u32, read: *u32, control: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn ReadFile(handle: windows.HANDLE, data: [*]u8, len: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "winhttp" fn WinHttpOpen([*:0]const u16, u32, ?[*:0]const u16, ?[*:0]const u16, u32) callconv(.winapi) ?*anyopaque;
+extern "winhttp" fn WinHttpConnect(*anyopaque, [*:0]const u16, u16, u32) callconv(.winapi) ?*anyopaque;
+extern "winhttp" fn WinHttpOpenRequest(*anyopaque, [*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, ?*anyopaque, u32) callconv(.winapi) ?*anyopaque;
+extern "winhttp" fn WinHttpSetTimeouts(*anyopaque, i32, i32, i32, i32) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpSendRequest(*anyopaque, ?[*:0]const u16, u32, ?*const anyopaque, u32, u32, usize) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpReceiveResponse(*anyopaque, ?*anyopaque) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpQueryHeaders(*anyopaque, u32, ?[*:0]const u16, ?*anyopaque, *u32, ?*u32) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpCloseHandle(*anyopaque) callconv(.winapi) i32;
 
 pub const usage =
     \\usage: kowalski [--db <path>] [--json] <command> [args]
@@ -21,6 +30,7 @@ pub const usage =
     \\  serve                        run the daemon in this console (one per user)
     \\  start                        start the daemon without a console window
     \\  open                         start the daemon if needed and open the dashboard
+    \\  doctor [--fix] [--json]      diagnose launch; repair only with --fix
     \\  autostart [on|off]           start the daemon at logon, or show the setting
     \\  status                       focus, parallel work and today's numbers
     \\  switch|track [--project <#id|unassigned>] <task> [-m <text>]
@@ -204,8 +214,31 @@ fn clockTime(w: *Io.Writer, z: *const zone.Zone, ms: i64) !void {
 
 /// Whether a daemon answers on this database's port.
 pub fn ping(ctx: *Context) bool {
-    const reply = call(ctx, "GET", "/api/health", null) catch return false;
-    return reply.status == 200;
+    if (ctx.call_override != null) {
+        const reply = call(ctx, "GET", "/api/health", null) catch return false;
+        return reply.status == 200;
+    }
+    return timedHealth(readPort(ctx) catch return false);
+}
+
+/// Bounded liveness check for launch paths; a hung socket cannot hold launch.
+fn timedHealth(port: u16) bool {
+    const deadline = GetTickCount64() + 2000;
+    const agent = WinHttpOpen(std.unicode.utf8ToUtf16LeStringLiteral("kowalski-ping"), 0, null, null, 0) orelse return false;
+    defer _ = WinHttpCloseHandle(agent);
+    const connection = WinHttpConnect(agent, std.unicode.utf8ToUtf16LeStringLiteral("127.0.0.1"), port, 0) orelse return false;
+    defer _ = WinHttpCloseHandle(connection);
+    const request = WinHttpOpenRequest(connection, std.unicode.utf8ToUtf16LeStringLiteral("GET"), std.unicode.utf8ToUtf16LeStringLiteral("/api/health"), null, null, null, 0) orelse return false;
+    defer _ = WinHttpCloseHandle(request);
+    if (WinHttpSetTimeouts(request, 2000, 2000, 2000, 2000) == 0) return false;
+    if (WinHttpSendRequest(request, null, 0, null, 0, 0, 0) == 0) return false;
+    if (GetTickCount64() >= deadline) return false;
+    const left: i32 = @intCast(@max(1, deadline -| GetTickCount64()));
+    if (WinHttpSetTimeouts(request, left, left, left, left) == 0) return false;
+    if (WinHttpReceiveResponse(request, null) == 0) return false;
+    var response_status: u32 = 0;
+    var size: u32 = @sizeOf(u32);
+    return WinHttpQueryHeaders(request, 19 | 0x20000000, null, &response_status, &size, null) != 0 and response_status == 200;
 }
 
 /// Runs one command. Output goes to ctx.out / ctx.err; the caller flushes.

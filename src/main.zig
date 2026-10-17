@@ -11,6 +11,7 @@ const demo = @import("demo.zig");
 const tour_mod = @import("tour.zig");
 const zone_mod = @import("zone.zig");
 const update_guard = @import("update_guard.zig");
+const doctor = @import("doctor.zig");
 
 test { _ = @import("kowalskiw.zig"); }
 test { _ = @import("update.zig"); }
@@ -18,6 +19,7 @@ test { _ = @import("update_journal.zig"); }
 test { _ = @import("update_lock.zig"); }
 test { _ = @import("update_snapshot.zig"); }
 test { _ = @import("update_guard.zig"); }
+test { _ = @import("doctor.zig"); }
 
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
 pub fn main(init: std.process.Init) void {
@@ -87,11 +89,28 @@ fn run(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, command, "open")) {
         if (args.len != 0) return usageError();
-        opener.open(init.io, a, db, db_path, true) catch |err| {
-            std.debug.print("kowalski: could not open the dashboard: {s} (see daemon.log next to the database)\n", .{@errorName(err)});
+        const problem = opener.open(init.io, a, db, db_path, true) catch |err| {
+            std.debug.print("kowalski: could not open the dashboard: {s}\n", .{@errorName(err)});
             return 1;
         };
+        if (problem) |message| {
+            try std.Io.File.stderr().writeStreamingAll(init.io, message);
+            return 1;
+        }
         return 0;
+    }
+    if (std.mem.eql(u8, command, "doctor")) {
+        var fix = false;
+        for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--fix")) fix = true else return usageError();
+        }
+        const report = try doctor.run(init.io, a, db, db_path, fix);
+        const text = if (json)
+            try doctor.ascii(a, try std.json.Stringify.valueAlloc(a, .{ .findings = report.findings, .actions = report.actions, .ok = report.healthy }, .{}))
+        else try report.format(a);
+        try std.Io.File.stdout().writeStreamingAll(init.io, text);
+        if (json) try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        return if (report.healthy) 0 else 1;
     }
     if (std.mem.eql(u8, command, "autostart")) return autostart(init, db_path, args);
     const exit = try cli.run(&ctx, command, args);

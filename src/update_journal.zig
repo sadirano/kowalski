@@ -4,7 +4,7 @@ const windows = std.os.windows;
 
 extern "kernel32" fn MoveFileExW([*:0]const u16, [*:0]const u16, u32) callconv(.winapi) i32;
 
-pub const Phase = enum { swapped, trial, committed, rolling_back, rolled_back };
+pub const Phase = enum { swapped, trial, committed, rolling_back, rolled_back, abandoned };
 pub const Journal = struct {
     id: []const u8,
     from: []const u8,
@@ -79,6 +79,23 @@ pub fn write(a: std.mem.Allocator, io: Io, db_path: []const u8, journal: Journal
     if (MoveFileExW(from, to, 1 | 8) == 0) return error.JournalRename;
 }
 
+/// Preserve the failed journal for diagnosis before clearing a launch blocker.
+/// The snapshot named in the journal is deliberately left untouched.
+pub fn abandon(a: std.mem.Allocator, io: Io, db_path: []const u8, value: ?Journal, reason: []const u8, timestamp: i64) ![]const u8 {
+    const source = try path(a, db_path, "update.json");
+    const backup = try path(a, db_path, try std.fmt.allocPrint(a, "update.json.failed-{d}", .{timestamp}));
+    const cwd = Io.Dir.cwd();
+    try Io.Dir.copyFile(cwd, source, cwd, backup, io, .{ .replace = false });
+    if (value) |saved| {
+        var finished = saved;
+        finished.phase = .abandoned;
+        finished.reason = reason;
+        finished.ack = false;
+        try write(a, io, db_path, finished);
+    } else try cwd.deleteFile(io, source);
+    return backup;
+}
+
 test "journal round trip and atomic replacement" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -116,5 +133,27 @@ test "malformed journal and recovery phases" {
     try std.testing.expectError(error.MalformedJournal, read(a, io, db));
     var j: Journal = .{ .id = "", .from = "", .to = "", .phase = .swapped, .nonce = "", .snapshot = "", .exe_dir = "", .started_ms = 0 };
     for ([_]Phase{ .swapped, .trial, .rolling_back }) |phase| { j.phase = phase; try std.testing.expect(needsRecovery(j)); }
-    for ([_]Phase{ .committed, .rolled_back }) |phase| { j.phase = phase; try std.testing.expect(!needsRecovery(j)); }
+    for ([_]Phase{ .committed, .rolled_back, .abandoned }) |phase| { j.phase = phase; try std.testing.expect(!needsRecovery(j)); }
+}
+
+test "abandon corrupt and failed rollback journals without touching snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const db = try std.fs.path.join(a, &.{ root, "work.db" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "snapshot.db", .data = "history" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "update.json", .data = "broken" });
+    _ = try abandon(a, io, db, null, "malformed journal", 10);
+    try std.testing.expect((try read(a, io, db)) == null);
+    try std.testing.expectEqualStrings("broken", try tmp.dir.readFileAlloc(io, "update.json.failed-10", a, .limited(100)));
+    const journal: Journal = .{ .id = "0123456789abcdef0123456789abcdef", .from = "1", .to = "2", .phase = .trial, .nonce = "abcdef0123456789abcdef0123456789", .snapshot = "snapshot.db", .exe_dir = ".", .started_ms = 1 };
+    try write(a, io, db, journal);
+    _ = try abandon(a, io, db, journal, "rollback failed", 11);
+    try std.testing.expectEqual(Phase.abandoned, (try read(a, io, db)).?.phase);
+    try std.testing.expectEqualStrings("history", try tmp.dir.readFileAlloc(io, "snapshot.db", a, .limited(100)));
 }

@@ -6,30 +6,20 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const launch = @import("launch.zig");
 const sqlite = @import("sqlite.zig");
-
-pub const Error = error{NoDaemon};
+const doctor = @import("doctor.zig");
 
 /// `force` opens the browser whatever the setting says (`kowalski open`).
 /// `db_flag` is the `--db` the user gave, passed on to the daemon.
-pub fn open(io: std.Io, a: std.mem.Allocator, db_path: []const u8, db_flag: ?[]const u8, force: bool) !void {
+pub fn open(io: std.Io, a: std.mem.Allocator, db_path: []const u8, db_flag: ?[]const u8, force: bool) !?[]const u8 {
+    const report = try doctor.run(io, a, db_path, db_flag, true);
+    if (!report.healthy) return try report.format(a);
+    if (!force and !wanted(db_path)) return null;
     var out: std.Io.Writer.Allocating = .init(a);
     var err: std.Io.Writer.Allocating = .init(a);
     var ctx: cli.Context = .{ .io = io, .a = a, .db_path = db_path, .json = false, .out = &out.writer, .err = &err.writer };
-    if (!cli.ping(&ctx)) {
-        try launch.spawn(a, try launch.backgroundCommand(a, db_flag, null));
-        var up = false;
-        for (0..50) |_| {
-            try io.sleep(.fromMilliseconds(100), .awake);
-            if (cli.ping(&ctx)) {
-                up = true;
-                break;
-            }
-        }
-        if (!up) return error.NoDaemon;
-    }
-    if (!force and !wanted(db_path)) return;
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/", .{try cli.readPort(&ctx)});
-    try launch.openUrl(a, url);
+    launch.openUrl(a, url) catch return try std.fmt.allocPrint(a, "The dashboard is answering, but the browser could not be opened. Open {s}\nLog: {s}\n", .{ url, report.log_path });
+    return null;
 }
 
 /// The `open_on_launch` setting; on unless it says "0".
@@ -45,12 +35,9 @@ fn wanted(db_path: []const u8) bool {
 
 /// For a double-click: no console to report to, so a failure is a message box.
 pub fn openOrAlert(io: std.Io, a: std.mem.Allocator, db_path: []const u8, db_flag: ?[]const u8) void {
-    open(io, a, db_path, db_flag, false) catch |err| {
-        const text = switch (err) {
-            error.NoDaemon => "kowalski did not start within 5 seconds. See daemon.log in %APPDATA%\\sadirano\\kowalski.",
-            error.OpenUrl => "kowalski is running, but the browser could not be opened. The dashboard is at http://127.0.0.1:47100/.",
-            else => "kowalski could not start.",
-        };
-        launch.alert(a, text);
+    const problem = open(io, a, db_path, db_flag, false) catch |err| blk: {
+        const log_path = std.fs.path.join(a, &.{ std.fs.path.dirname(db_path) orelse ".", "daemon.log" }) catch "daemon.log";
+        break :blk std.fmt.allocPrint(a, "kowalski could not open the dashboard: {s}\nLog: {s}", .{ @errorName(err), log_path }) catch "kowalski could not open the dashboard";
     };
+    if (problem) |message| launch.alert(a, message);
 }

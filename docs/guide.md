@@ -11,6 +11,11 @@ in Settings turns the browser part off); `kowalski open` does the same from
 a terminal. `kowalski start` and `kowalski autostart on` (start at logon)
 run it quietly. The dashboard can be installed as an app from the browser.
 
+If the dashboard does not open, run `kowalski doctor` to see the database,
+update, port, process and log checks. Run `kowalski doctor --fix` to try a safe
+restart; `--json` prints the findings for scripts. The doctor never changes
+the dashboard port automatically.
+
 Every screenshot here shows made-up data (see
 [Making these screenshots](#making-these-screenshots)).
 
