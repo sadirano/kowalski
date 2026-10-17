@@ -167,6 +167,9 @@ fn sqlText(value: anytype) []const u8 {
 pub const Store = struct {
     db: *sqlite.Db,
     allocator: std.mem.Allocator,
+    // Finding a named Windows zone walks the registry; every request needs
+    // the zone, so the last one found is kept.
+    zone_cache: ?struct { id: [128]u8, len: usize, zone: zone.Zone } = null,
 
     fn validProjectLabel(label: []const u8) bool {
         return label.len > 0 and label.len <= 200 and
@@ -2480,7 +2483,17 @@ pub const Store = struct {
     pub fn loadZone(s: *Store) !zone.Zone {
         const id = try s.reportingZone();
         defer if (id) |v| s.allocator.free(v);
-        var z = try zone.Zone.load(id orelse "UTC");
+        const name = id orelse "UTC";
+        var cached: ?zone.Zone = if (s.zone_cache) |c| (if (std.mem.eql(u8, c.id[0..c.len], name)) c.zone else null) else null;
+        if (cached == null) {
+            const found = try zone.Zone.load(name);
+            if (name.len <= 128) {
+                s.zone_cache = .{ .id = undefined, .len = name.len, .zone = found };
+                @memcpy(s.zone_cache.?.id[0..name.len], name);
+            }
+            cached = found;
+        }
+        var z = cached.?;
         const setting = try s.getSetting("day_start");
         defer if (setting) |v| s.allocator.free(v);
         if (setting) |v| z.day_start_min = try parseDayStart(v);

@@ -41,10 +41,8 @@ self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin) return;
 
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/tour/api/')) {
-    e.respondWith(fetch(e.request));
-    return;
-  }
+  // Data goes straight to the daemon; passing it through the worker only adds a hop.
+  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/tour/api/')) return;
 
   // The shell comes from this build's cache, so a reload paints at once. A new
   // build ships a new worker; the page reloads once when it takes over.
