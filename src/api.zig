@@ -381,7 +381,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         if (body.project_key) |key| if (key.len == 0 or key.len > 2048) return badRequest(a, "project_key");
         if (body.project_hint) |hint| if (hint.len > 200) return badRequest(a, "project_hint");
         if (body.first_prompt) |seed| if (seed.len > 2000) return badRequest(a, "first_prompt");
-        const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = body.note,
+        const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = if (body.note) |n| try noteText(a, n) else null,
             .subject = body.subject, .default_subject = body.default_subject, .project_key = body.project_key, .project_hint = body.project_hint, .first_prompt = body.first_prompt };
         const result = try app.store.captureDetailed(c, app.clock());
         return send(a, .ok, result);
@@ -401,7 +401,10 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
                 break :blk try app.store.createTaskWithProject(title, if (choice == .omitted and scope == null) .omitted else .{ .selected = scope }, app.clock());
             },
         };
-        const text = if (body.text) |t| if (std.mem.trim(u8, t, " \t").len == 0) null else t else null;
+        const text = if (body.text) |t| blk: {
+            if (t.len > 2000) return badRequest(a, "text");
+            break :blk if (std.mem.trim(u8, t, " \t\r\n").len == 0) null else try noteText(a, t);
+        } else null;
         const interval = if (std.mem.eql(u8, path, "/api/switch"))
             try app.store.switchToProject(id, text, choice, app.clock())
         else
@@ -427,9 +430,11 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
     }
     if (is(req, .POST, path, "/api/notes")) {
         const body = try parseBody(struct { task: ?[]const u8 = null, text: []const u8, interval: ?i64 = null, at_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        if (body.text.len > 2000) return badRequest(a, "text");
+        const text = if (std.mem.trim(u8, body.text, " \t\r\n").len == 0) "" else try noteText(a, body.text);
         if (body.interval) |interval| {
             const at = body.at_ms orelse return badRequest(a, "at_ms");
-            const note = try app.store.addNoteAt(interval, at, std.mem.trim(u8, body.text, " \t\r\n"), app.clock());
+            const note = try app.store.addNoteAt(interval, at, text, app.clock());
             return send(a, .created, .{ .note = note });
         }
         var target: ?i64 = null;
@@ -437,7 +442,6 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             .id => |id| target = id,
             .response => |r| return r,
         };
-        const text = std.mem.trim(u8, body.text, " \t\r\n");
         const note = try app.store.addNote(target, text, app.clock());
         return send(a, .created, .{ .note = note });
     }
@@ -1351,6 +1355,19 @@ fn idBetween(path: []const u8, prefix: []const u8, suffix: []const u8) ?i64 {
     return std.fmt.parseInt(i64, path[prefix.len .. path.len - suffix.len], 10) catch null;
 }
 
+fn noteText(a: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, input, "\r\n") == null) return input;
+    const output = try a.alloc(u8, input.len);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == '\r' and i + 1 < input.len and input[i + 1] == '\n') continue;
+        output[j] = input[i];
+        j += 1;
+    }
+    return output[0..j];
+}
+
 fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Response {
     if (is(req, .POST, path, "/api/intervals")) {
         const body = try parseBody(struct { task: []const u8, role: []const u8 = "focus", start_ms: i64, end_ms: i64, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
@@ -1415,7 +1432,9 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
     };
     if (req.method == .PATCH) if (idBetween(path, "/api/notes/", "")) |id| {
         const body = try parseBody(struct { text: []const u8, at_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
-        try app.store.editNote(id, std.mem.trim(u8, body.text, " \t\r\n"), body.at_ms, app.clock());
+        if (body.text.len > 2000) return badRequest(a, "text");
+        const text = if (std.mem.trim(u8, body.text, " \t\r\n").len == 0) "" else try noteText(a, body.text);
+        try app.store.editNote(id, text, body.at_ms, app.clock());
         return send(a, .ok, .{ .note = id });
     };
     return null;
@@ -3097,6 +3116,64 @@ test "timed notes can be added moved edited and deleted" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, try std.fmt.allocPrint(a, "/api/notes/{d}/delete", .{note}), "").status);
     const after = try f.get(Day, "/api/day?date=2026-03-10");
     try std.testing.expectEqual(@as(usize, 0), after.intervals[0].notes.len);
+}
+
+test "manual notes preserve lines and enforce the byte limit on every path" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"A\"}").status);
+    const opened = f.call(.POST, "/api/switch", "{\"task\":\"#1\"}");
+    try std.testing.expectEqual(std.http.Status.ok, opened.status);
+    const interval = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, opened.body, .{ .ignore_unknown_fields = true })).interval;
+    const long = try a.alloc(u8, 2000);
+    @memset(long, 'x');
+    long[1000] = '\n';
+    const too_long = try a.alloc(u8, 2001);
+    @memset(too_long, 'x');
+    const focus_body = try std.json.Stringify.valueAlloc(a, .{ .text = long }, .{});
+    const focus_over = try std.json.Stringify.valueAlloc(a, .{ .text = too_long }, .{});
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/notes", focus_body).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes", focus_over).status);
+    const timed_body = try std.json.Stringify.valueAlloc(a, .{ .interval = interval, .at_ms = test_now, .text = long }, .{});
+    const timed_over = try std.json.Stringify.valueAlloc(a, .{ .interval = interval, .at_ms = test_now, .text = too_long }, .{});
+    const added = f.call(.POST, "/api/notes", timed_body);
+    try std.testing.expectEqual(std.http.Status.created, added.status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes", timed_over).status);
+    const note = (try std.json.parseFromSliceLeaky(struct { note: i64 }, a, added.body, .{})).note;
+    const target = try std.fmt.allocPrint(a, "/api/notes/{d}", .{note});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, focus_body).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, target, focus_over).status);
+    const crlf = "\nfirst\r\nsecond\r\nthird\n";
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, try std.json.Stringify.valueAlloc(a, .{ .text = crlf }, .{})).status);
+    const Day = struct { intervals: []struct { notes: []query.Note } };
+    const viewed = try f.get(Day, "/api/day?date=2026-03-09");
+    try std.testing.expectEqual(@as(usize, 2), viewed.intervals[0].notes.len);
+    try std.testing.expectEqualStrings(long, viewed.intervals[0].notes[0].text);
+    try std.testing.expectEqualStrings("\nfirst\nsecond\nthird\n", viewed.intervals[0].notes[1].text);
+}
+
+test "session note text accepts 2000 bytes and normalizes CRLF" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"A\"}").status);
+    const long = try a.alloc(u8, 2000);
+    @memset(long, 'x');
+    long[1000] = '\n';
+    const too_long = try a.alloc(u8, 2001);
+    @memset(too_long, 'x');
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/switch", try std.json.Stringify.valueAlloc(a, .{ .task = "#1", .text = too_long }, .{})).status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", try std.json.Stringify.valueAlloc(a, .{ .task = "#1", .text = long }, .{})).status);
+    const Day = struct { intervals: []struct { text: ?[]const u8 } };
+    const viewed = try f.get(Day, "/api/day?date=2026-03-09");
+    try std.testing.expectEqualStrings(long, viewed.intervals[0].text.?);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"B\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"#2\",\"text\":\"first\\r\\nsecond\"}").status);
+    const normalized = try f.get(Day, "/api/day?date=2026-03-09");
+    try std.testing.expectEqualStrings("first\nsecond", normalized.intervals[normalized.intervals.len - 1].text.?);
 }
 
 test "the provider login runs through the API" {

@@ -1307,13 +1307,32 @@ fn renderDay(ctx: *Context, body: []const u8) !void {
         if (i.end_ms) |end| try clockTime(w, &z, end) else try w.writeAll("now  ");
         try w.writeAll(if (std.mem.eql(u8, i.role, "focus")) "  " else "  + ");
         try writeTask(w, i.task);
-        if (i.text) |text| try w.print("  \"{s}\"", .{text});
+        if (i.text) |value| {
+            const first = std.mem.sliceTo(value, '\n');
+            try w.print("  \"{s}{s}\"", .{ std.mem.trimEnd(u8, first, "\r"), if (first.len < value.len) "..." else "" });
+        }
         try w.writeAll("\n");
         for (i.notes) |note| {
             try w.writeAll("        ");
             try clockTime(w, &z, note.at_ms);
-            try w.print("  {s}\n", .{note.text});
+            const first = std.mem.sliceTo(note.text, '\n');
+            try w.print("  {s}{s}\n", .{ std.mem.trimEnd(u8, first, "\r"), if (first.len < note.text.len) "..." else "" });
         }
     }
     if (d.summary) |text| try w.print("\nsummary: {s}\n", .{text});
+}
+
+test "day listing keeps each multiline note on one row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false,
+        .out = &out.writer, .err = &err.writer };
+    const body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"numbers\":{\"total_ms\":0,\"hops\":0,\"working\":false,\"remaining_ms\":0},\"tasks\":[],\"intervals\":[{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773100800000,\"end_ms\":1773100801000,\"notes\":[{\"at_ms\":1773100800000,\"text\":\"first\\nsecond\"}]}]}";
+    try renderDay(&ctx, body);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "first...\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "second") == null);
 }

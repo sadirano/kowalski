@@ -249,7 +249,12 @@ function episodeNoteHtml(n) {
   const who = n.source === 'prompt' ? `<span class="ep-who you">${esc(t('ep_you'))}</span>`
     : n.source === 'outcome' ? `<span class="ep-who agent">${esc(t('ep_agent'))}</span>` : '';
   const text = n.source === 'outcome' ? n.text.replace(/^->\s*/, '') : n.text;
-  return `<div class="ep-note"><span class="ep-at">${fmtTime(n.at_ms)}</span>${who}<span class="ep-text">${esc(text)}</span></div>`;
+  return `<div class="ep-note"><span class="ep-at">${fmtTime(n.at_ms)}</span>${who}<span class="ep-text" title="${escAttr(text)}">${notePreview(text)}</span></div>`;
+}
+
+function notePreview(text) {
+  const first = text.split(/\r?\n/, 1)[0];
+  return esc(first) + (first.length < text.length ? '<small>...</small>' : '');
 }
 
 function episodeHtml(ep, rep, renderBlocks, label) {
@@ -320,9 +325,9 @@ function buildSlotRows(s, bi) {
   const { first, count } = slotsOf(s);
   const bySlot = Array.from({ length: count }, () => []);
   const place = at => Math.min(count - 1, Math.max(0, Math.floor((at - first) / SLOT_MS)));
-  if (s.text) bySlot[place(s.start_ms)].push(`<span class="slot-note">${esc(s.text)}</span>`);
+  if (s.text) bySlot[place(s.start_ms)].push(`<span class="slot-note" title="${escAttr(s.text)}">${notePreview(s.text)}</span>`);
   for (const n of s.notes) {
-    bySlot[place(n.at_ms)].push(`<span class="slot-note" id="sn-${n.id}" onclick="editNote(${bi},${n.id})">${esc(n.text)}</span>`);
+    bySlot[place(n.at_ms)].push(`<span class="slot-note" id="sn-${n.id}" title="${escAttr(n.text)}" onclick="editNote(${bi},${n.id})">${notePreview(n.text)}</span>`);
   }
   const closed = s.end_ms != null;
   const hint = closed ? escAttr(t('slot_hint')) : '';
@@ -411,7 +416,7 @@ async function closeNoteEditor(saved) {
 }
 
 // Swaps `span` for a textarea editor. Ctrl+Enter or the button saves, Escape
-// cancels, leaving the box saves; `commit` gets the trimmed text.
+// cancels, leaving the box saves; blank input clears the note.
 function openNoteEditor(span, value, placeholder, commit) {
   const inp = document.createElement('textarea');
   inp.className   = 'slot-inp';
@@ -424,7 +429,7 @@ function openNoteEditor(span, value, placeholder, commit) {
     if (done) return;
     done = true;
     try {
-      if (!await commit(inp.value.trim())) { await closeNoteEditor(false); return; }
+      if (!await commit(inp.value.trim() ? inp.value : '')) { await closeNoteEditor(false); return; }
     } catch (e) {
       showError(e.message);
       done = false; // keep the editor and the text to fix or retry
