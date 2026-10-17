@@ -517,13 +517,18 @@ fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8
     }
     if (is(req, .GET, path, "/api/project-keys")) return send(a, .ok, .{ .keys = try query.captureProjectKeys(app.store, a) });
     if (is(req, .PATCH, path, "/api/project-keys")) {
-        const body = try parseBody(struct { source: []const u8, project_key: []const u8, project_id: i64 }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { source: ?[]const u8 = null, project_key: []const u8, project_id: i64 }, a, req.body) orelse return badRequest(a, "body");
         if (body.project_id <= 0) return badRequest(a, "project_id");
+        // Without a source, every source's mapping of the key moves together.
+        const source = body.source orelse {
+            try app.store.setKeyProject(body.project_key, body.project_id, app.clock());
+            return send(a, .ok, .{ .keys = try query.captureProjectKeys(app.store, a) });
+        };
         var hint: ?[]const u8 = null;
-        for (try query.captureProjectKeys(app.store, a)) |key| if (std.mem.eql(u8, key.source, body.source) and std.mem.eql(u8, key.project_key, body.project_key)) { hint = key.project_hint; break; };
+        for (try query.captureProjectKeys(app.store, a)) |key| if (std.mem.eql(u8, key.source, source) and std.mem.eql(u8, key.project_key, body.project_key)) { hint = key.project_hint; break; };
         if (hint == null) return error.UnknownProject;
-        try app.store.setCaptureProjectKey(body.source, body.project_key, hint.?, body.project_id, app.clock());
-        return send(a, .ok, .{ .mapping = query.CaptureProjectKey{ .source = body.source, .project_key = body.project_key, .project_hint = hint.?, .project_id = body.project_id } });
+        try app.store.setCaptureProjectKey(source, body.project_key, hint.?, body.project_id, app.clock());
+        return send(a, .ok, .{ .mapping = query.CaptureProjectKey{ .source = source, .project_key = body.project_key, .project_hint = hint.?, .project_id = body.project_id } });
     }
     if (is(req, .POST, path, "/api/projects/assign/preview")) {
         const Scope = struct { task_id: ?i64 = null, interval_ids: ?[]const i64 = null, unassigned_suggestions: bool = false };
@@ -553,6 +558,12 @@ fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8
         if ((body.label == null) == (body.archived == null)) return badRequest(a, "body");
         if (body.label) |label| try app.store.renameProject(id, label, app.clock()) else try app.store.archiveProject(id, body.archived.?, app.clock());
         return send(a, .ok, .{ .project = (try query.project(app.store, a, id)).? });
+    };
+    if (req.method == .DELETE) if (idBetween(path, "/api/projects/", "")) |id| {
+        if (id <= 0) return badRequest(a, "id");
+        const body = try parseBody(struct { into: ?i64 }, a, req.body) orelse return badRequest(a, "body");
+        try app.store.deleteProject(id, body.into, app.clock());
+        return send(a, .ok, .{ .deleted = id });
     };
     return null;
 }
@@ -2504,6 +2515,47 @@ test "a new capture key joins the user's project of the same name" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"c\",\"event\":\"c0\",\"kind\":\"start\",\"project_key\":\"git:fork/kowalski\",\"project_hint\":\"kowalski\"}").status);
     try std.testing.expectEqual(@as(i64, 4), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:fork/kowalski'"));
     try std.testing.expectEqual(@as(i64, 4), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+}
+
+test "the same capture key from another source joins its project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agy\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys WHERE project_id=1"));
+    // Sources that disagree leave a third without a side.
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"other\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"source\":\"agy\",\"project_key\":\"git:h/kowalski\",\"project_id\":2}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"codex\",\"run\":\"c\",\"event\":\"c0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys WHERE source='codex' AND project_id IN (1,2)"));
+    // Without a source, the key moves for every source at once.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"project_key\":\"git:h/kowalski\",\"project_id\":1}").status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys WHERE project_key='git:h/kowalski' AND project_id=1"));
+}
+
+test "deleting a project moves its work into another, or unassigns it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"kowalski\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"subject\":\"work\",\"project_key\":\"k\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='k'"));
+    try f.db.exec("INSERT INTO projects(id,label) VALUES(2,'kowalski-45904b93')");
+    try f.db.exec("UPDATE capture_project_keys SET project_id=2; UPDATE intervals SET project_id=2; UPDATE tasks SET project_id=2");
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.DELETE, "/api/projects/2", "").status);
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.DELETE, "/api/projects/2", "{\"into\":2}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/2", "{\"into\":1}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id IS NOT 1"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id IS NOT 1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='k'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/1", "{\"into\":null}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id IS NOT NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
 }
 
 test "explicit Unassigned blocks first provider fallback and invalid labels are ignored" {

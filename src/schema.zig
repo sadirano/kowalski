@@ -99,11 +99,12 @@ pub fn ensure(db: *sqlite.Db) !void {
         "ALTER TABLE capture_runs ADD COLUMN provisional_title INTEGER NOT NULL DEFAULT 0 CHECK(provisional_title IN (0,1));",
     );
     // 11: settings named by kind (docs/settings.md); a renamed key keeps its
-    // value, and weekends flip from hidden to shown.
+    // value, and weekends flip from hidden to shown. If both names exist, the
+    // old one wins: it is the value the running version used.
     if (version < 11) try db.exec(
-        "UPDATE settings SET key='post_daily_notes' WHERE key='ui_autofill_obs';" ++
-            "UPDATE settings SET key='open_on_launch' WHERE key='ui_open_on_launch';" ++
-            "INSERT INTO settings(key,value) SELECT 'ui_show_weekends', CASE value WHEN '1' THEN '0' ELSE '1' END FROM settings WHERE key='ui_hide_weekends';" ++
+        "UPDATE OR REPLACE settings SET key='post_daily_notes' WHERE key='ui_autofill_obs';" ++
+            "UPDATE OR REPLACE settings SET key='open_on_launch' WHERE key='ui_open_on_launch';" ++
+            "INSERT OR REPLACE INTO settings(key,value) SELECT 'ui_show_weekends', CASE value WHEN '1' THEN '0' ELSE '1' END FROM settings WHERE key='ui_hide_weekends';" ++
             "DELETE FROM settings WHERE key IN ('ui_hide_weekends','ui_chart_engine','ui_poll_seconds');",
     );
     try db.exec("PRAGMA user_version=11");
@@ -453,7 +454,7 @@ test "v10 settings take their kind's names and keep their values" {
     try db.exec("PRAGMA user_version=10");
     try db.exec(
         "INSERT INTO settings(key,value) VALUES('ui_autofill_obs','1'),('ui_open_on_launch','0'),('ui_hide_weekends','1')," ++
-            "('ui_chart_engine','compare'),('ui_poll_seconds','5'),('daily_work_minutes','480');",
+            "('ui_chart_engine','compare'),('ui_poll_seconds','5'),('daily_work_minutes','480'),('post_daily_notes','0'),('ui_show_weekends','1');",
     );
     try ensure(&db);
     try ensure(&db);

@@ -234,6 +234,42 @@ pub const Store = struct {
         try tx.commit();
     }
 
+    /// Removes a project. Its tasks, time and capture keys move to `into`;
+    /// with no target the time becomes unassigned and the keys are dropped,
+    /// so the next capture from them finds a project again.
+    pub fn deleteProject(s: *Store, id: i64, into: ?i64, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (!try s.projectExists(id)) return error.UnknownProject;
+        if (into) |target| if (target == id or !try s.projectExists(target)) return error.UnknownProject;
+        var spans = try s.db.prepare("SELECT start_ms,coalesce(end_ms,start_ms) FROM intervals WHERE project_id=?1");
+        defer spans.finalize();
+        try spans.bindI64(1, id);
+        while (try spans.step() == .row) try s.markEdited(spans.columnI64(0), spans.columnI64(1), now_ms);
+        for ([_][]const u8{
+            "UPDATE tasks SET project_id=?2 WHERE project_id=?1",
+            "UPDATE intervals SET project_id=?2 WHERE project_id=?1",
+            "UPDATE saved_set SET project_id=?2 WHERE project_id=?1",
+            "UPDATE capture_runs SET project_id=?2 WHERE project_id=?1",
+        }) |sql| {
+            var stmt = try s.db.prepare(sql);
+            defer stmt.finalize();
+            try stmt.bindI64(1, id);
+            if (into) |target| try stmt.bindI64(2, target) else try stmt.bindNull(2);
+            _ = try stmt.step();
+        }
+        var keys = try s.db.prepare(if (into == null) "DELETE FROM capture_project_keys WHERE project_id=?1" else "UPDATE capture_project_keys SET project_id=?2 WHERE project_id=?1");
+        defer keys.finalize();
+        try keys.bindI64(1, id);
+        if (into) |target| try keys.bindI64(2, target);
+        _ = try keys.step();
+        var drop = try s.db.prepare("DELETE FROM projects WHERE id=?1");
+        defer drop.finalize();
+        try drop.bindI64(1, id);
+        _ = try drop.step();
+        try tx.commit();
+    }
+
     pub fn setTaskProject(s: *Store, task: i64, project: ?i64, now_ms: i64) Error!void {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
@@ -351,6 +387,29 @@ pub const Store = struct {
 
     /// A project the user made with this label: unarchived and claimed by no
     /// capture key, so a new key lands there instead of beside it.
+    /// The project every source already maps this key to; none when the
+    /// sources disagree, so a new source does not pick a side.
+    fn keyProject(s: *Store, key: []const u8) !?i64 {
+        var stmt = try s.db.prepare("SELECT min(project_id) FROM capture_project_keys WHERE project_key=?1 HAVING count(DISTINCT project_id)=1");
+        defer stmt.finalize();
+        try stmt.bindText(1, key);
+        return if (try stmt.step() == .row) stmt.columnI64(0) else null;
+    }
+
+    /// Points every source's mapping of a key at one project.
+    pub fn setKeyProject(s: *Store, key: []const u8, project: i64, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (!try s.projectExists(project)) return error.UnknownProject;
+        var stmt = try s.db.prepare("UPDATE capture_project_keys SET project_id=?2 WHERE project_key=?1");
+        defer stmt.finalize();
+        try stmt.bindText(1, key);
+        try stmt.bindI64(2, project);
+        _ = try stmt.step();
+        if (s.db.changes() == 0) return error.UnknownProject;
+        try tx.commit();
+    }
+
     fn unclaimedProject(s: *Store, label: []const u8) !?i64 {
         var stmt = try s.db.prepare("SELECT id FROM projects p WHERE label=?1 COLLATE NOCASE AND archived=0 AND NOT EXISTS (SELECT 1 FROM capture_project_keys k WHERE k.project_id=p.id)");
         defer stmt.finalize();
@@ -397,7 +456,8 @@ pub const Store = struct {
             if (try s.mappedProject(source, k)) |id| return id;
             const raw = hint orelse return error.InvalidProjectLabel;
             if (raw.len > 200) return error.InvalidProjectLabel;
-            const id = if (try s.unclaimedProject(std.mem.trim(u8, raw, " \t\r\n"))) |own| own else blk: {
+            // The same key from another source is the same work.
+            const id = if (try s.keyProject(k)) |shared| shared else if (try s.unclaimedProject(std.mem.trim(u8, raw, " \t\r\n"))) |own| own else blk: {
                 const label = try s.uniqueCaptureLabel(source, k, raw);
                 defer s.allocator.free(label);
                 break :blk try s.insertProject(label);
