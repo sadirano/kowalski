@@ -137,6 +137,19 @@ pub const Capture = struct {
     first_prompt: ?[]const u8 = null,
 };
 pub const CaptureResult = struct { applied: bool, project_id: ?i64, task_id: ?i64 };
+pub const HistoryNote = struct { event: []const u8, at_ms: i64, text: []const u8 };
+pub const HistoryInterval = struct {
+    event: []const u8,
+    subject: []const u8,
+    start_ms: i64,
+    end_ms: i64,
+    notes: []const HistoryNote,
+};
+pub const HistoryResult = union(enum) {
+    applied: struct { applied: usize, skipped: usize, notes: usize },
+    conflict: struct { index: usize, reason: []const u8 },
+    invalid_subject: usize,
+};
 /// A working run that sends nothing for this long is taken as gone.
 pub const capture_lease_ms: i64 = 20 * 60_000;
 /// A run's task stays open this long after its turn ends, so the next
@@ -1036,6 +1049,102 @@ pub const Store = struct {
         const final = try s.captureRun(c.source, c.run);
         try tx.commit();
         return .{ .applied = true, .project_id = final.project, .task_id = final.task };
+    }
+
+    /// Called by the history subject resolver while the batch transaction is open.
+    pub fn createHistoryTask(s: *Store, title: []const u8, now_ms: i64) !i64 {
+        var stmt = try s.db.prepare("INSERT INTO tasks(title,created_ms) VALUES(?1,?2) RETURNING id");
+        defer stmt.finalize();
+        try stmt.bindText(1, title);
+        try stmt.bindI64(2, now_ms);
+        if (try stmt.step() != .row) return error.Sqlite;
+        const id = stmt.columnI64(0);
+        if (try stmt.step() != .done) return error.Sqlite;
+        return id;
+    }
+
+    pub fn captureHistory(s: *Store, allocator: std.mem.Allocator, source: []const u8, run: []const u8, attended: bool, intervals: []const HistoryInterval, now_ms: i64, resolve: *const fn (*Store, std.mem.Allocator, []const u8, i64) anyerror!?i64) !HistoryResult {
+        if (now_ms < 0 or now_ms >= max_time_ms) return error.InvalidTime;
+        var tx = try s.db.transaction();
+        defer tx.deinit();
+        var result: HistoryResult = .{ .applied = .{ .applied = 0, .skipped = 0, .notes = 0 } };
+        const capture_text = try s.getSetting("capture_text");
+        defer if (capture_text) |value| s.allocator.free(value);
+        const time_only = if (capture_text) |value| std.mem.eql(u8, value, "time") else false;
+        for (intervals, 0..) |item, index| {
+            if (try s.captureEventSeen(source, item.event)) {
+                result.applied.skipped += 1;
+                continue;
+            }
+            const task = (try resolve(s, allocator, item.subject, now_ms)) orelse return .{ .invalid_subject = index };
+            const role: Role = if (attended) .focus else .parallel;
+            s.checkFree(&.{}, task, role, item.start_ms, item.end_ms) catch |err| switch (err) {
+                error.Overlap => return .{ .conflict = .{ .index = index, .reason = "overlap" } },
+                else => return err,
+            };
+            if (try s.historyPosted(task, item.start_ms, item.end_ms)) return .{ .conflict = .{ .index = index, .reason = "posted" } };
+            // Backfilled spans take the task's project, like live capture.
+            var inserted = try s.db.prepare("INSERT INTO intervals(task_id,role,start_ms,end_ms,opened_by,closed_by,project_id) VALUES(?1,?2,?3,?4,?5,'stop',?6) RETURNING id");
+            defer inserted.finalize();
+            try inserted.bindI64(1, task);
+            try inserted.bindText(2, sqlText(role));
+            try inserted.bindI64(3, item.start_ms);
+            try inserted.bindI64(4, item.end_ms);
+            try inserted.bindText(5, if (attended) "switch" else "parallel");
+            if (try s.taskProject(task)) |project| try inserted.bindI64(6, project) else try inserted.bindNull(6);
+            if (try inserted.step() != .row) return error.Sqlite;
+            const interval_id = inserted.columnI64(0);
+            if (try inserted.step() != .done) return error.Sqlite;
+            result.applied.applied += 1;
+            try s.historyEvent(source, run, item.event, item.start_ms);
+            for (item.notes) |note| {
+                if (time_only) continue;
+                if (try s.captureEventSeen(source, note.event)) continue;
+                var stmt = try s.db.prepare("INSERT INTO notes(interval_id,at_ms,text) VALUES(?1,?2,?3)");
+                defer stmt.finalize();
+                try stmt.bindI64(1, interval_id);
+                try stmt.bindI64(2, note.at_ms);
+                try stmt.bindText(3, note.text);
+                _ = try stmt.step();
+                try s.historyEvent(source, run, note.event, note.at_ms);
+                result.applied.notes += 1;
+            }
+            try s.markEdited(item.start_ms, item.end_ms, now_ms);
+        }
+        try tx.commit();
+        return result;
+    }
+
+    fn historyEvent(s: *Store, source: []const u8, run: []const u8, event: []const u8, at_ms: i64) !void {
+        var stmt = try s.db.prepare("INSERT INTO capture_events(source,event,run,kind,at_ms) VALUES(?1,?2,?3,'history',?4)");
+        defer stmt.finalize();
+        try stmt.bindText(1, source);
+        try stmt.bindText(2, event);
+        try stmt.bindText(3, run);
+        try stmt.bindI64(4, at_ms);
+        _ = try stmt.step();
+    }
+
+    fn historyPosted(s: *Store, task: i64, start: i64, end: i64) !bool {
+        const id = try s.reportingZone();
+        defer if (id) |v| s.allocator.free(v);
+        const z = try zone.Zone.load(id orelse "UTC");
+        var at = start;
+        var days: u32 = 0;
+        while (days < 400) : (days += 1) {
+            const d = z.dateOf(at) catch return error.InvalidTime;
+            var buffer: [10]u8 = undefined;
+            const day = try std.fmt.bufPrint(&buffer, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+            var stmt = try s.db.prepare("SELECT 1 FROM postings WHERE task_id=?1 AND day=?2 AND state IN ('confirmed','sending','unknown') LIMIT 1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, task);
+            try stmt.bindText(2, day);
+            if (try stmt.step() == .row) return true;
+            const bounds = z.dayBounds(d.year, d.month, d.day) catch return error.InvalidTime;
+            if (bounds.end_ms > end) break;
+            at = bounds.end_ms;
+        }
+        return false;
     }
 
     fn captureNote(s: *Store, c: Capture, at: i64, text: []const u8) !void {

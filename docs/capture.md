@@ -71,3 +71,34 @@ A changed effective project while working splits its interval at that
 event's timestamp; the earlier portion keeps its prior project. Terminal
 events do not reopen time. An archived mapped project continues to receive
 capture. Event retries do not create projects, tasks or duplicate intervals.
+
+## History
+
+A source can send closed intervals it missed to `POST /api/capture/history`,
+using the same `X-Kowalski` header as `/api/capture`:
+
+```json
+{"source":"agent","run":"session-1","attended":true,
+ "intervals":[{"event":"span-1","subject":"Project notes",
+   "start_ms":1000,"end_ms":2000,
+   "notes":[{"event":"note-1","at_ms":1500,"text":"Reviewed the outline"}]}]}
+```
+
+`subject` resolves or creates a task as it does for capture. Attended spans
+are focus intervals; unattended spans are parallel. Times are Unix
+milliseconds. Each interval must end after it starts and no later than now;
+each note time must lie within its interval, including either endpoint.
+Source, run, event and subject are 1–200 characters; note text is 1–2000
+characters. A batch holds at most 500 intervals and 5000 notes.
+
+The batch is atomic. A focus span cannot overlap another focus span, and
+spans of the same task cannot overlap, including open intervals and other
+spans in the batch. A posting in `confirmed`, `sending` or `unknown` state
+for that task on any reporting day the span touches also rejects the batch.
+A conflict returns HTTP 409 with the first failing interval index and reason.
+
+Interval and note event ids are unique per source. Sending a known interval
+again skips it and its notes; a known note is skipped. Successful requests
+return HTTP 200 with `applied` (intervals inserted), `skipped` (known
+intervals) and `notes` (notes inserted). History leaves the current focus
+and live capture runs as they were.

@@ -387,6 +387,30 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         const result = try app.store.captureDetailed(c, app.clock());
         return send(a, .ok, result);
     }
+    if (is(req, .POST, path, "/api/capture/history")) {
+        const Interval = store_mod.HistoryInterval;
+        const Body = struct { source: []const u8, run: []const u8, attended: bool = true, intervals: []const Interval };
+        const body = try parseBody(Body, a, req.body) orelse return badRequest(a, "body");
+        if (!historyLength(body.source, 200) or !historyLength(body.run, 200) or body.intervals.len > 500) return badRequest(a, "length");
+        const now_ms = app.clock();
+        var note_count: usize = 0;
+        for (body.intervals) |interval| {
+            if (!historyLength(interval.event, 200) or !historyLength(interval.subject, 200)) return badRequest(a, "length");
+            if (interval.start_ms < 0 or interval.start_ms >= interval.end_ms or interval.end_ms > now_ms) return badRequest(a, "range");
+            note_count += interval.notes.len;
+            if (note_count > 5000) return badRequest(a, "notes");
+            for (interval.notes) |note| {
+                if (!historyLength(note.event, 200) or !historyLength(note.text, 2000)) return badRequest(a, "length");
+                if (note.at_ms < interval.start_ms or note.at_ms > interval.end_ms) return badRequest(a, "note time");
+            }
+        }
+        const result = try app.store.captureHistory(a, body.source, body.run, body.attended, body.intervals, now_ms, resolveHistorySubject);
+        return switch (result) {
+            .applied => |counts| send(a, .ok, counts),
+            .conflict => |c| send(a, .conflict, .{ .@"error" = "HistoryConflict", .interval = c.index, .reason = c.reason }),
+            .invalid_subject => badRequest(a, "subject"),
+        };
+    }
     if (is(req, .POST, path, "/api/switch") or is(req, .POST, path, "/api/parallel")) {
         const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
         const choice = try projectChoice(a, req.body);
@@ -575,6 +599,22 @@ fn captureTask(app: *App, a: std.mem.Allocator, text: []const u8, scope: ?i64) !
         .found => |id| id,
         .ambiguous => null,
         .none => null,
+    };
+}
+
+fn historyLength(text: []const u8, max: usize) bool {
+    return text.len > 0 and text.len <= max;
+}
+
+fn resolveHistorySubject(s: *Store, a: std.mem.Allocator, text: []const u8, now_ms: i64) anyerror!?i64 {
+    return switch (try query.resolve(s, a, text, null)) {
+        .found => |id| id,
+        .ambiguous => null,
+        .none => blk: {
+            const title = std.mem.trim(u8, text, " \t");
+            if (title.len == 0 or title[0] == '#') break :blk null;
+            break :blk try s.createHistoryTask(title, now_ms);
+        },
     };
 }
 
@@ -3484,4 +3524,105 @@ test "capture applies an event once and names tasks like switch" {
     defer count.finalize();
     _ = try count.step();
     try std.testing.expectEqual(@as(i64, 0), count.columnI64(0));
+}
+
+fn historyScalar(db: *sqlite.Db, sql: []const u8) !i64 {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    if (try stmt.step() != .row) return error.Sqlite;
+    return stmt.columnI64(0);
+}
+
+test "capture history keeps original times, focus and runs; retries and partial retries" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Current\"}").status);
+    const start = test_now - 3_600_000;
+    const body = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r1\",\"attended\":true,\"intervals\":[{{\"event\":\"i1\",\"subject\":\"Past\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[{{\"event\":\"n1\",\"at_ms\":{d},\"text\":\"first\"}}]}},{{\"event\":\"i2\",\"subject\":\"Past\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[{{\"event\":\"n2\",\"at_ms\":{d},\"text\":\"second\"}}]}}]}}", .{ start, start + 1000, start, start + 2000, start + 3000, start + 3000 });
+    const first = f.call(.POST, "/api/capture/history", body);
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    try std.testing.expect(contains(first.body, "\"applied\":2"));
+    try std.testing.expect(contains(first.body, "\"notes\":2"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NOT NULL AND captured=0"));
+    try std.testing.expectEqual(start, try historyScalar(&f.db, "SELECT min(start_ms) FROM intervals WHERE end_ms IS NOT NULL"));
+    try std.testing.expectEqual(start + 3000, try historyScalar(&f.db, "SELECT max(at_ms) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals WHERE opened_by='switch' AND closed_by='stop' AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM notes WHERE source IS NULL"));
+    try std.testing.expectEqual(@as(i64, 4), try historyScalar(&f.db, "SELECT count(*) FROM capture_events WHERE kind='history'"));
+    try std.testing.expectEqual(start, try historyScalar(&f.db, "SELECT at_ms FROM capture_events WHERE event='i1'"));
+    try std.testing.expectEqual(start + 3000, try historyScalar(&f.db, "SELECT at_ms FROM capture_events WHERE event='n2'"));
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM day_edits WHERE day='2026-03-10'"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_runs"));
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='focus' AND task_id=(SELECT id FROM tasks WHERE title='Current')"));
+    const again = f.call(.POST, "/api/capture/history", body);
+    try std.testing.expectEqual(std.http.Status.ok, again.status);
+    try std.testing.expect(contains(again.body, "\"applied\":0"));
+    try std.testing.expect(contains(again.body, "\"skipped\":2"));
+    try std.testing.expectEqual(@as(i64, 3), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    const partial = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r1\",\"intervals\":[{{\"event\":\"i1\",\"subject\":\"Renamed\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}},{{\"event\":\"i3\",\"subject\":\"Past\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start, start + 1000, start + 4000, start + 5000 });
+    const mixed = f.call(.POST, "/api/capture/history", partial);
+    try std.testing.expectEqual(std.http.Status.ok, mixed.status);
+    try std.testing.expect(contains(mixed.body, "\"applied\":1"));
+    try std.testing.expect(contains(mixed.body, "\"skipped\":1"));
+    try std.testing.expectEqual(@as(i64, 4), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='Renamed'"));
+}
+
+test "capture history rejects overlap atomically and validates times" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    test_now = 1_773_129_600_000;
+    _ = try f.store.createTask("Manual", test_now);
+    const start = test_now - 3_600_000;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 1000 })).status);
+    const existing = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"ok\",\"subject\":\"New\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}},{{\"event\":\"bad\",\"subject\":\"#1\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start + 2000, start + 3000, start + 500, start + 1500 });
+    const conflict = f.call(.POST, "/api/capture/history", existing);
+    try std.testing.expectEqual(std.http.Status.conflict, conflict.status);
+    try std.testing.expect(contains(conflict.body, "\"interval\":1"));
+    try std.testing.expect(contains(conflict.body, "overlap"));
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='New'"));
+    const within = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"a\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}},{{\"event\":\"b\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start + 2000, start + 4000, start + 3000, start + 5000 });
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/capture/history", within).status);
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Open\"}").status);
+    const open = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"c\",\"subject\":\"Open\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ test_now, test_now + 1 });
+    test_now += 1000;
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/capture/history", open).status);
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    const future = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"d\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ test_now - 1, test_now + 1 });
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture/history", future).status);
+    const outside = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"e\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[{{\"event\":\"ne\",\"at_ms\":{d},\"text\":\"outside\"}}]}}]}}", .{ start + 2000, start + 3000, start + 3001 });
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture/history", outside).status);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    const empty = f.call(.POST, "/api/capture/history", "{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[]}");
+    try std.testing.expectEqual(std.http.Status.ok, empty.status);
+    try std.testing.expect(contains(empty.body, "\"applied\":0"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+}
+
+test "capture history blocks posted reporting days only for that task" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    test_now = 1_773_129_600_000;
+    _ = try f.store.createTask("Posted", test_now);
+    const start = test_now - 3_600_000;
+    try f.db.exec("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms) VALUES('2026-03-10',1,'test','one','confirmed','1',1000000,1)");
+    const posted = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"p\",\"subject\":\"#1\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start, start + 1000 });
+    const rejected = f.call(.POST, "/api/capture/history", posted);
+    try std.testing.expectEqual(std.http.Status.conflict, rejected.status);
+    try std.testing.expect(contains(rejected.body, "posted"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    const other = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"q\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start, start + 1000 });
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture/history", other).status);
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
 }
