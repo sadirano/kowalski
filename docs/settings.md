@@ -23,8 +23,14 @@ values it takes. The API refuses an undeclared key.
   label reads the same way (`ui_show_weekends` labelled "Show weekends").
 - **No implementation knobs** as settings (poll rates, renderers, cache
   sizes). Pick a value in code. If it truly needs tuning, it is a dev key.
-- **Times and zones use pickers** that follow the time-format preference; no
-  free-text zone names.
+- **One time field everywhere:** a time of day is typed in the field the
+  work windows use, read and shown in the time-format preference. Zones are
+  picked from a list, never typed, and an unset zone stays unset until the
+  user picks one.
+- **No form asks for internal ids** (task, interval or project numbers). A
+  correction starts from the thing on screen.
+- **Every control uses the dialog's own styling** (`.sel` selects, `.sw`
+  switches, dark date fields); no native white control.
 - **Renaming a key** is a schema step that moves the stored value, so an
   existing database keeps the user's choice.
 
@@ -37,5 +43,15 @@ change in behaviour; nothing in it is a choice the user made.
 ## The dialog
 
 Sections, in order: Workday, Day and time zone, Capture, Provider and
-posting, Display (choices that change every view), Updates and service. Lists that grow with use (projects, capture sources) never live in
+posting, Display (choices that change every view), Updates and service.
+Each section names its help topic in `data-help`; nothing depends on the
+order. Lists that grow with use (projects, capture sources) never live in
 the dialog; they belong to their own view.
+
+## Projects view
+
+One line per project: the name edits in place, archive and delete appear on
+hover, archived projects fold away. Deleting asks where the project's time
+goes. Capture sources show one line per repository key with its sources;
+choosing a project moves every source of that key together, and a key whose
+sources disagree says so instead of picking one.

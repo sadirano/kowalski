@@ -16,6 +16,7 @@
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 20 3M16 7l3 3M13.5 9.5l2 2"/></symbol>
   <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19.5 8.5a2.1 2.1 0 0 0-4-4L4 16z"/><path d="m14 6 4 4"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4"/></symbol>
   <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></symbol>
   <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20h16M7 17v-5M12 17V6M17 17V9"/></symbol>
@@ -126,7 +127,7 @@
   <div class="set-head"><h3 id="set-title" data-i18n="set_title">Settings</h3>
     <button type="button" class="set-x" onclick="hideSettings()" aria-label="Close"><svg class="ico" aria-hidden="true"><use href="#i-x"/></svg></button></div>
   <div class="set-body">
-    <section class="set-sec">
+    <section class="set-sec" data-help="s_daily">
       <h4><svg class="ico" aria-hidden="true"><use href="#i-clock"/></svg><span data-i18n="sec_workday">Workday</span></h4>
       <div class="set-row"><label class="set-lbl" for="set-daily-h"><span data-i18n="set_daily">Daily target</span></label>
         <div class="set-ctl"><span class="fld"><input id="set-daily-h" class="n" inputmode="numeric" maxlength="2" autocomplete="off"><i>h</i></span><span class="fld"><input id="set-daily-m" class="n" inputmode="numeric" maxlength="2" autocomplete="off"><i>min</i></span></div></div>
@@ -143,23 +144,23 @@
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-lock-on" onchange="renderLockRows(true)"></div></div>
       <div class="win-list" id="lock-rows"></div>
     </section>
-    <section class="set-sec">
+    <section class="set-sec" data-help="s_zone">
       <h4><svg class="ico" aria-hidden="true"><use href="#i-calendar"/></svg><span data-i18n="sec_day">Day and time zone</span></h4>
       <div class="set-row"><label class="set-lbl" for="set-zone"><span data-i18n="set_zone">Reporting time zone</span><small data-i18n="set_zone_hint">Days are counted in this zone.</small></label>
         <div class="set-ctl"><span class="sel"><select id="set-zone"></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
       <div class="set-row"><label class="set-lbl" for="set-day-start"><span data-i18n="set_day_start">Day starts at</span><small data-i18n="set_day_start_hint">Work before this time belongs to the previous day.</small></label>
-        <div class="set-ctl"><span class="sel"><select id="set-day-start"></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+        <div class="set-ctl"><input class="t" id="set-day-start" spellcheck="false" autocomplete="off" onchange="tidyDayStart(this)"></div></div>
     </section>
     <section class="set-sec">
       <h4><svg class="ico" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="sec_capture">Capture</span></h4>
-      <div class="set-row"><label class="set-lbl" for="set-capture-text" data-i18n="capture_text">Captured text</label>
-        <div class="set-ctl"><select id="set-capture-text"><option value="keep" data-i18n="capture_keep">Keep prompts and outcomes</option><option value="time" data-i18n="capture_time">Time only</option></select></div></div>
-      <div class="set-row"><div class="set-lbl" data-i18n="capture_remove">Remove captured text</div>
-        <div class="set-ctl"><input type="date" id="capture-from" aria-label="From" data-i18n-aria-label="project_from" oninput="invalidateCapturedPreview()"><input type="date" id="capture-to" aria-label="To" data-i18n-aria-label="project_to" oninput="invalidateCapturedPreview()"><button type="button" class="set-btn" id="capture-preview" onclick="previewCapturedText()" data-i18n="capture_preview">Preview</button><button type="button" class="set-btn" id="capture-remove" onclick="removeCapturedText()" data-i18n="capture_remove_button" disabled>Remove</button><small id="capture-result" role="status" aria-live="polite"></small></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-capture-keep"><span data-i18n="capture_keep_text">Keep captured text</span><small data-i18n="capture_keep_hint">Save agent prompts and outcomes as notes. Off keeps the time only.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-capture-keep"></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="capture_remove">Delete captured text</span><small id="capture-result" role="status" aria-live="polite"></small></div>
+        <div class="set-ctl"><input type="date" class="d" id="capture-from" aria-label="From" data-i18n-aria-label="project_from" oninput="invalidateCapturedPreview()"><i>&ndash;</i><input type="date" class="d" id="capture-to" aria-label="To" data-i18n-aria-label="project_to" oninput="invalidateCapturedPreview()"><button type="button" class="set-btn" id="capture-preview" onclick="previewCapturedText()" data-i18n="capture_preview">Preview</button><button type="button" class="set-btn" id="capture-remove" onclick="removeCapturedText()" data-i18n="capture_remove_button" disabled>Delete</button></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="set_hold_sources">Sources that keep the focus</span><small data-i18n="set_hold_sources_hint">While one of these runs, prompts from other sources count in parallel, such as a game you play.</small></div>
         <div class="set-ctl set-checks" id="set-hold-sources"></div></div>
     </section>
-    <section class="set-sec">
+    <section class="set-sec" data-help="s_autofill">
       <h4><svg class="ico" aria-hidden="true"><use href="#i-send"/></svg><span data-i18n="sec_posting">Provider and posting</span></h4>
       <div class="set-row"><label class="set-lbl" for="set-post-notes"><span data-i18n="set_post_notes">Post the day's notes</span><small data-i18n="set_post_notes_hint">Fill each posting's text with the task's notes for that day.</small></label>
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-post-notes"></div></div>
@@ -183,7 +184,7 @@
       <div class="set-row" id="set-account-row"><div class="set-lbl"><span data-i18n="set_account">Provider account</span></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="showLogin()"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span data-i18n="login_submit">Sign in</span></button></div></div>
     </section>
-    <section class="set-sec">
+    <section class="set-sec" data-help="s_lang">
       <h4><svg class="ico" aria-hidden="true"><use href="#i-display"/></svg><span data-i18n="sec_display">Display</span></h4>
       <div class="set-row"><label class="set-lbl" for="set-lang"><span data-i18n="set_lang">Language</span></label>
         <div class="set-ctl"><span class="sel"><select id="set-lang">
@@ -206,8 +207,8 @@
     </section>
     <details class="set-sec set-adv">
       <summary><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="sec_service">Updates and service</span><svg class="ico chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
-      <div class="set-row" id="update-row" style="display:none"><div class="set-lbl"><span data-i18n="update_check">Check for updates</span><small><span data-i18n="update_version">Current version</span>: <span id="set-version">...</span></small></div>
-        <div class="set-ctl"><label for="set-update-channel" data-i18n="update_channel">Updates</label><div style="display:flex;flex-direction:column;gap:4px;max-width:360px"><select id="set-update-channel"><option value="stable" data-i18n="update_stable">Stable</option><option value="preview" data-i18n="update_preview">Preview</option></select><small id="update-stable-note" data-i18n="update_stable_note" style="display:none">Stable waits for the next stable release. Your database is already upgraded, so an older version cannot open it; only a backup made before an upgrade (backup-vN-*.db next to the database) goes back.</small></div><button type="button" class="set-btn" id="update-check" onclick="checkKowalskiUpdate()" data-i18n="update_check">Check for updates</button></div></div>
+      <div class="set-row" id="update-row" style="display:none"><label class="set-lbl" for="set-update-channel"><span data-i18n="update_channel">Updates</span><small><span data-i18n="update_version">Current version</span>: <span id="set-version">...</span></small><small id="update-stable-note" data-i18n="update_stable_note" style="display:none">Stable waits for the next stable release. Only a backup made before an upgrade goes back to an older version.</small></label>
+        <div class="set-ctl"><span class="sel"><select id="set-update-channel"><option value="stable" data-i18n="update_stable">Stable</option><option value="preview" data-i18n="update_preview">Preview</option></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span><button type="button" class="set-btn" id="update-check" onclick="checkKowalskiUpdate()" data-i18n="update_check">Check for updates</button></div></div>
       <div class="update-result" id="update-result" style="display:none"><span id="update-message"></span>
         <a id="update-notes" target="_blank" rel="noopener noreferrer" data-i18n="update_notes" style="display:none">Release notes</a>
         <button type="button" class="set-btn" id="update-install" onclick="installKowalskiUpdate()" data-i18n="update_install" style="display:none">Update and restart</button></div>
@@ -229,15 +230,16 @@
     <button type="button" class="set-x" onclick="hideProjects()" aria-label="Close"><svg class="ico" aria-hidden="true"><use href="#i-x"/></svg></button></div>
   <div class="set-body">
     <section class="set-sec">
-      <div id="set-project-list" class="project-settings-list"></div>
-      <div class="project-inline"><input id="set-project-new" type="text" maxlength="200" data-i18n-ph="project_name" placeholder="Project name"><button type="button" class="set-btn" onclick="addProject()" data-i18n="project_add">Add project</button></div>
-      <div class="set-row"><label class="set-lbl" for="set-project-field"><span data-i18n="project_provider_field">Provider field for new tasks</span><small data-i18n="project_provider_field_hint">A new provider task joins the project its field names.</small></label><div class="set-ctl"><span class="sel"><select id="set-project-field" onchange="saveProjectField(this.value)"></select></span></div></div>
-      <div class="set-row"><div class="set-lbl"><span data-i18n="project_capture_source">Capture source</span></div></div>
-      <div id="set-project-keys" class="project-settings-list"></div>
-      <div class="set-row"><div class="set-lbl"><span data-i18n="project_assignment">Project assignment</span></div></div>
-      <div class="project-inline"><select id="set-assign-scope" onchange="invalidateAssignmentPreview()"><option value="task" data-i18n="project_task_scope">Task ID</option><option value="intervals" data-i18n="project_interval_ids">Interval IDs</option><option value="suggestions" data-i18n="project_suggestions">Unassigned suggestions</option></select><input id="set-assign-task" type="number" min="1" placeholder="Task ID" data-i18n-ph="project_task_scope" oninput="invalidateAssignmentPreview()"><input id="set-assign-intervals" type="text" placeholder="Interval IDs, comma separated" data-i18n-ph="project_interval_ids_hint" oninput="invalidateAssignmentPreview()" style="display:none"><select id="set-assign-target" onchange="invalidateAssignmentPreview()"></select><button type="button" class="set-btn" onclick="previewProjectAssignment()" data-i18n="project_preview">Preview assignment</button></div>
-      <div id="set-assign-result"></div>
-      <div class="project-inline"><button type="button" class="set-btn" id="set-assign-apply" onclick="applyProjectAssignment()" data-i18n="project_apply" disabled>Apply assignment</button></div>
+      <div id="set-project-list" class="proj-list"></div>
+      <details class="proj-archived" id="set-project-archived"><summary></summary><div id="set-project-archived-list" class="proj-list"></div></details>
+      <div class="proj-add"><input id="set-project-new" type="text" maxlength="200" data-i18n-ph="project_name" placeholder="Project name" spellcheck="false" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();addProject()}"><button type="button" class="set-btn" onclick="addProject()"><svg class="ico" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="project_add">Add project</span></button></div>
+      <div class="set-row" id="set-project-field-row"><label class="set-lbl" for="set-project-field"><span data-i18n="project_provider_field">Project from a provider field</span><small data-i18n="project_provider_field_hint">A new task joins the project named in this field.</small></label>
+        <div class="set-ctl"><span class="sel"><select id="set-project-field" onchange="saveProjectField(this.value)"></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+    </section>
+    <section class="set-sec">
+      <h4><svg class="ico" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="project_capture_sources">Capture sources</span></h4>
+      <div class="proj-hint" data-i18n="project_capture_sources_hint">Each repository your agents work in, and the project its time goes to.</div>
+      <div id="set-project-keys" class="proj-list"></div>
     </section>
   </div>
   <div class="set-foot"><button type="button" class="set-save" onclick="hideProjects()" data-i18n="close">Close</button></div>
@@ -393,7 +395,7 @@
     <div class="shead shead-row">
       <button type="button" class="panel-collapse icon-btn" onclick="toggleLeftPanel()" title="Collapse sidebar" aria-label="Collapse sidebar" data-i18n-title="collapse_sidebar" data-i18n-aria="collapse_sidebar">«</button>
       <span id="sidebar-head-label" style="flex:1">Last 7 days</span>
-      <button type="button" class="icon-btn pref-btn" onclick="togglePrefMenu(this,'sidebar')" title="View options" aria-label="View options" data-i18n-title="view_options" data-i18n-aria="view_options"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button>
+      <button type="button" class="icon-btn pref-btn" data-view="sidebar" onclick="togglePrefMenu(this,'sidebar')" title="View options" aria-label="View options" data-i18n-title="view_options" data-i18n-aria="view_options"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button>
       <button type="button" class="cal-open icon-btn" onclick="showCalendar()" title="Open calendar" aria-label="Open calendar" data-i18n-title="open_calendar" data-i18n-aria="open_calendar"><svg class="ico" aria-hidden="true"><use href="#i-calendar"/></svg></button>
     </div>
     <div id="week-nav"></div>
@@ -430,7 +432,7 @@
             <button type="button" data-view="lanes" onclick="setChartView('lanes')" title="Task lanes" aria-label="Task lanes" data-i18n-title="chart_lanes" data-i18n-aria="chart_lanes"><svg class="ico" aria-hidden="true"><use href="#i-lanes"/></svg></button>
           </div>
         </div>
-        <div style="display:flex;align-items:center;gap:6px"><div id="chart-groups" style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--brd);border-radius:5px;padding:2px"></div><button type="button" class="icon-btn pref-btn" id="chart-pref-btn" onclick="togglePrefMenu(this,'chart')" title="Chart tabs" aria-label="Chart tabs" data-i18n-title="set_chart_tabs" data-i18n-aria="set_chart_tabs"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button></div>
+        <div style="display:flex;align-items:center;gap:6px"><div id="chart-groups" style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--brd);border-radius:5px;padding:2px"></div><button type="button" class="icon-btn pref-btn" id="chart-pref-btn" data-view="chart" onclick="togglePrefMenu(this,'chart')" title="Chart tabs" aria-label="Chart tabs" data-i18n-title="set_chart_tabs" data-i18n-aria="set_chart_tabs"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button></div>
       </div>
       <div class="chart-main">
         <div class="chart-canvas-wrap" id="chart-canvas-wrap"><canvas id="chart"></canvas></div>

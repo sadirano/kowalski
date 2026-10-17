@@ -100,6 +100,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && id('newtask-popup').classList.contains('show')) hideNewTask();
   if (e.key === 'Enter'  && id('newtask-popup').classList.contains('show')) applyNewTask();
   if (e.key === 'Escape' && id('settings-popup').classList.contains('show')) hideSettings();
+  if (e.key === 'Escape' && id('projects-popup').classList.contains('show')) { if (_deletingProject != null) cancelDeleteProject(); else hideProjects(); }
   if (e.key === 'Enter'  && id('settings-popup').classList.contains('show') && e.target.tagName !== 'BUTTON') applySettings();
   // Notes opens over Post hours: Escape closes Notes alone.
   if (e.key === 'Escape' && id('obs-popup').classList.contains('show')) { closeObsPopup(); return; }

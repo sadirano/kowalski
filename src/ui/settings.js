@@ -25,8 +25,7 @@ async function loadSettings() {
 
 let _settingsLoaded = false;
 let _captureKeys = [];
-let _assignmentPreview = null;
-let _assignmentEpoch = 0, _assignmentBusy = false;
+let _deletingProject = null; // id whose delete row is open
 let _capturedPreview = null, _capturedEpoch = 0, _capturedBusy = false;
 
 function invalidateCapturedPreview() {
@@ -108,7 +107,7 @@ async function showSettings() {
     id('set-open-launch').checked = pref('open_on_launch', '1') === '1';
     id('set-post-notes').checked = pref('post_daily_notes', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
-    id('set-capture-text').value = pref('capture_text', 'keep');
+    id('set-capture-keep').checked = pref('capture_text', 'keep') === 'keep';
     invalidateCapturedPreview();
     renderProviderControls();
     await renderPickers();
@@ -145,24 +144,18 @@ function renderProviderControls() {
   renderProviderSettings();
 }
 
-// The zone, day start and holding sources are chosen from lists, never typed.
+// The zone and holding sources are chosen from lists; the day start is the
+// app's time field, in the chosen 12/24-hour format.
 let _zones = null;
 async function renderPickers() {
   if (!_zones) _zones = (await apiJSON('GET', '/api/zones')).zones;
   const zone = pref('reporting_zone', '');
   const zones = zone && !_zones.includes(zone) ? [zone, ..._zones] : _zones;
-  id('set-zone').innerHTML = zones.map(z => `<option value="${escAttr(z)}"${z === zone ? ' selected' : ''}>${esc(z)}</option>`).join('');
-  const start = pref('day_start', '00:00');
-  const starts = [];
-  for (let m = 0; m <= 12 * 60; m += 30) starts.push(minClock(m));
-  if (!starts.includes(start)) starts.push(start);
-  starts.sort();
-  // Labelled in the chosen time format; a minute after midnight stands in for the clock.
-  id('set-day-start').innerHTML = starts.map(v => {
-    const [h, mm] = v.split(':').map(Number);
-    const at = new Date(2000, 0, 1, h, mm).getTime();
-    return `<option value="${v}"${v === start ? ' selected' : ''}>${esc(fmtTime(at))}</option>`;
-  }).join('');
+  // Unset stays unset: saving another setting must not pick a zone.
+  id('set-zone').innerHTML = (zone ? '' : `<option value="" selected>${esc(t('zone_default'))}</option>`) +
+    zones.map(z => `<option value="${escAttr(z)}"${z === zone ? ' selected' : ''}>${esc(z)}</option>`).join('');
+  id('set-day-start').value = fmtClock(pref('day_start', '00:00'));
+  id('set-day-start').classList.remove('bad');
   const held = (pref('capture_hold_sources', '') || '').split(',').map(x => x.trim()).filter(Boolean);
   const keys = (await apiJSON('GET', '/api/project-keys')).keys;
   const sources = [...new Set([...keys.map(k => k.source), ...held])].sort();
@@ -188,6 +181,7 @@ function hideProjects() {
 
 function renderProjectField() {
   const fields = (provider?.fields || []).slice().sort((a, b) => a.order - b.order);
+  id('set-project-field-row').style.display = fields.length ? '' : 'none';
   const projectField = id('set-project-field');
   projectField.innerHTML = `<option value="">${esc(t('project_off'))}</option>` + fields.map(f =>
     `<option value="${escAttr(f.name)}">${esc(providerLabel(f))}</option>`).join('');
@@ -205,33 +199,64 @@ async function loadProjectSettings() {
   renderProjectSettings();
 }
 
-function renderProjectSettings() {
-  id('set-project-list').innerHTML = projects.map(p => `<div class="project-settings-item">
-    <input id="set-project-name-${p.id}" value="${escAttr(p.label)}" maxlength="200" aria-label="${escAttr(t('project_name'))}">
-    <button type="button" class="set-btn" onclick="renameProject(${p.id})">${esc(t('project_rename'))}</button>
-    <button type="button" class="set-btn" onclick="toggleProjectArchive(${p.id},${!p.archived})">${esc(t(p.archived ? 'project_restore' : 'project_archive'))}</button>
-    ${p.archived ? `<small>${esc(t('project_archived'))}</small>` : ''}</div>`).join('');
-  id('set-project-keys').innerHTML = _captureKeys.map((k, i) => `<div class="project-settings-item">
-    <span>${esc(k.source)} · ${esc(k.project_hint)} <small>(${esc(k.project_key)})</small></span>
-    <select aria-label="${escAttr(t('project_capture_source'))}" onchange="changeCaptureKey(${i},this.value)">${projects.map(p =>
-      `<option value="${p.id}"${p.id === k.project_id ? ' selected' : ''}>${esc(p.label)}${p.archived ? ' (' + esc(t('project_archived')) + ')' : ''}</option>`).join('')}</select></div>`).join('') || `<div class="project-message">${esc(t('project_no_keys'))}</div>`;
-  const target = id('set-assign-target');
-  const value = target.value;
-  target.innerHTML = projectOptions(value);
-  if ([...target.options].some(o => o.value === value)) target.value = value;
-  _assignmentPreview = null;
-  id('set-assign-apply').disabled = true;
-  id('set-assign-result').innerHTML = '';
-  invalidateAssignmentPreview();
+// A capture duplicate is named "<name>-<8 hex>"; deleting it offers <name>.
+function deleteTargetFor(p) {
+  const base = p.label.replace(/-[0-9a-f]{8}$/, '');
+  const match = base !== p.label && projects.find(o => o.id !== p.id && !o.archived && o.label.toLowerCase() === base.toLowerCase());
+  return match ? String(match.id) : 'unassigned';
 }
 
-function invalidateAssignmentPreview() {
-  ++_assignmentEpoch;
-  _assignmentPreview = null;
-  id('set-assign-apply').disabled = true;
-  id('set-assign-result').innerHTML = '';
-  id('set-assign-task').style.display = id('set-assign-scope').value === 'task' ? '' : 'none';
-  id('set-assign-intervals').style.display = id('set-assign-scope').value === 'intervals' ? '' : 'none';
+function projectRow(p) {
+  if (_deletingProject === p.id) {
+    const options = `<option value="unassigned">${esc(t('project_unassigned'))}</option>` + projects.filter(o => o.id !== p.id && !o.archived)
+      .map(o => `<option value="${o.id}">${esc(o.label)}</option>`).join('');
+    return `<div class="proj-row deleting"><span class="proj-label">${esc(p.label)}</span>
+      <span class="proj-move"><i>${esc(t('project_move_to'))}</i><span class="sel"><select id="set-project-into">${options}</select>${icon('chev')}</span></span>
+      <button type="button" class="set-btn danger" onclick="deleteProject(${p.id})">${esc(t('project_delete'))}</button>
+      <button type="button" class="set-btn" onclick="cancelDeleteProject()">${esc(t('cancel'))}</button></div>`;
+  }
+  const archive = p.archived ? t('project_restore') : t('project_archive');
+  return `<div class="proj-row"><input class="proj-name" id="set-project-name-${p.id}" value="${escAttr(p.label)}" maxlength="200" spellcheck="false" autocomplete="off" aria-label="${escAttr(t('project_name'))}" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}else if(event.key==='Escape'){event.stopPropagation();this.value=this.defaultValue;this.blur()}" onblur="renameProject(${p.id})">
+    <button type="button" class="btn-icon" title="${escAttr(archive)}" aria-label="${escAttr(archive)}" onclick="toggleProjectArchive(${p.id},${!p.archived})">${icon(p.archived ? 'refresh' : 'archive')}</button>
+    <button type="button" class="btn-icon" title="${escAttr(t('project_delete'))}" aria-label="${escAttr(t('project_delete'))}" onclick="askDeleteProject(${p.id})">${icon('trash')}</button></div>`;
+}
+
+// One row per repository key; its sources share one project.
+function keyRows() {
+  const byKey = new Map();
+  for (const k of _captureKeys) {
+    if (!byKey.has(k.project_key)) byKey.set(k.project_key, []);
+    byKey.get(k.project_key).push(k);
+  }
+  return [...byKey.entries()].map(([key, rows]) => {
+    const ids = [...new Set(rows.map(r => r.project_id))];
+    const mixed = ids.length > 1;
+    const options = (mixed ? `<option value="" selected>${esc(t('project_keys_mixed'))}</option>` : '') + projects.map(p =>
+      `<option value="${p.id}"${!mixed && p.id === ids[0] ? ' selected' : ''}>${esc(p.label)}${p.archived ? ' (' + esc(t('project_archived')) + ')' : ''}</option>`).join('');
+    const sources = rows.map(r => mixed ? `${r.source}: ${projectName(r.project_id)}` : r.source).join(', ');
+    return `<div class="proj-row proj-key"><span class="proj-label" title="${escAttr(key)}">${esc(rows[0].project_hint)}<small>${esc(sources)}</small></span>
+      <span class="sel"><select aria-label="${escAttr(t('project_capture_sources'))}" data-key="${escAttr(key)}" onchange="changeKeyProject(this)">${options}</select>${icon('chev')}</span></div>`;
+  }).join('') || `<div class="project-message">${esc(t('project_no_keys'))}</div>`;
+}
+
+function renderProjectSettings() {
+  const active = projects.filter(p => !p.archived), archived = projects.filter(p => p.archived);
+  id('set-project-list').innerHTML = active.map(projectRow).join('') || `<div class="project-message">${esc(t('project_none'))}</div>`;
+  const box = id('set-project-archived');
+  box.style.display = archived.length ? '' : 'none';
+  box.querySelector('summary').textContent = t('project_archived_count', { n: archived.length });
+  id('set-project-archived-list').innerHTML = archived.map(projectRow).join('');
+  if (_deletingProject != null) {
+    const p = projects.find(p => p.id === _deletingProject);
+    if (p) id('set-project-into').value = deleteTargetFor(p);
+  }
+  id('set-project-keys').innerHTML = keyRows();
+}
+
+async function refreshProjects() {
+  await _projectsLoading?.catch(() => {});
+  await loadProjectSettings();
+  loadDay(selectedDate, { chart: true });
 }
 
 async function addProject() {
@@ -241,92 +266,56 @@ async function addProject() {
   try {
     await apiJSON('POST', '/api/projects', { label });
     field.value = '';
-    await _projectsLoading?.catch(() => {});
-    await loadProjects();
-    renderProjectSettings();
+    await refreshProjects();
   } catch (e) { showError(e.message); }
 }
 
 async function renameProject(projectId) {
   const field = id('set-project-name-' + projectId);
-  const label = field.value.trim();
-  if (!label) { field.focus(); return; }
+  const p = projects.find(p => p.id === projectId);
+  const label = field?.value.trim();
+  if (!field || !p || label === p.label) return;
+  if (!label) { field.value = p.label; return; }
   try {
     await apiJSON('PATCH', '/api/projects/' + projectId, { label });
-    await _projectsLoading?.catch(() => {});
-    await loadProjects();
-    renderProjectSettings();
-    loadDay(selectedDate, { chart: true });
-  } catch (e) { showError(e.message); }
+    await refreshProjects();
+  } catch (e) { field.value = p.label; showError(e.message); }
 }
 
 async function toggleProjectArchive(projectId, archived) {
   try {
     await apiJSON('PATCH', '/api/projects/' + projectId, { archived });
-    await _projectsLoading?.catch(() => {});
-    await loadProjects();
-    renderProjectSettings();
-    loadDay(selectedDate, { chart: true });
+    await refreshProjects();
   } catch (e) { showError(e.message); }
 }
 
-async function changeCaptureKey(index, value) {
-  const k = _captureKeys[index];
+function askDeleteProject(projectId) {
+  _deletingProject = projectId;
+  if (projects.find(p => p.id === projectId)?.archived) id('set-project-archived').open = true;
+  renderProjectSettings();
+  id('set-project-into')?.focus();
+}
+
+function cancelDeleteProject() {
+  _deletingProject = null;
+  renderProjectSettings();
+}
+
+async function deleteProject(projectId) {
+  const value = id('set-project-into').value;
   try {
-    await apiJSON('PATCH', '/api/project-keys', { source: k.source, project_key: k.project_key, project_id: Number(value) });
-    _captureKeys = (await apiJSON('GET', '/api/project-keys')).keys;
-    renderProjectSettings();
+    await apiJSON('DELETE', '/api/projects/' + projectId + '?into=' + (value === 'unassigned' ? 'none' : encodeURIComponent(value)));
+    _deletingProject = null;
+    await refreshProjects();
+  } catch (e) { showError(e.message); }
+}
+
+async function changeKeyProject(select) {
+  if (!select.value) return;
+  try {
+    await apiJSON('PATCH', '/api/project-keys', { project_key: select.dataset.key, project_id: Number(select.value) });
+    await loadProjectSettings();
   } catch (e) { showError(e.message); renderProjectSettings(); }
-}
-
-async function previewProjectAssignment() {
-  if (_assignmentBusy) return;
-  const mode = id('set-assign-scope').value;
-  const scope = mode === 'suggestions' ? { unassigned_suggestions: true }
-    : mode === 'intervals' ? { interval_ids: id('set-assign-intervals').value.split(',').map(x => Number(x.trim())) }
-    : { task_id: Number(id('set-assign-task').value) };
-  if (scope.task_id != null && (!Number.isInteger(scope.task_id) || scope.task_id < 1)) {
-    id('set-assign-task').focus(); return;
-  }
-  if (scope.interval_ids && (!scope.interval_ids.length || scope.interval_ids.some(x => !Number.isSafeInteger(x) || x < 1))) {
-    id('set-assign-intervals').focus(); return;
-  }
-  const value = id('set-assign-target').value;
-  const project_id = value === 'unassigned' ? null : Number(value);
-  invalidateAssignmentPreview();
-  const epoch = _assignmentEpoch;
-  try {
-    const preview = await apiJSON('POST', '/api/projects/assign/preview', { scope, project_id });
-    if (epoch !== _assignmentEpoch) return;
-    _assignmentPreview = preview.snapshot;
-    const rows = preview.snapshot.intervals;
-    const skipped = preview.skipped;
-    const fmtRow = r => `<tr><td>${r.id}</td><td>${r.task_id}</td><td>${esc(r.role)}</td><td>${esc(projectName(r.project_id))}</td><td>${esc(projectName(project_id))}</td><td>${r.focus_ms ? esc(fmtMs(r.focus_ms)) : '—'}</td></tr>`;
-    id('set-assign-result').innerHTML = `<div class="project-message">${esc(t('project_preview_count', { n: rows.length }))}</div>`
-      + (rows.length ? `<table class="project-table"><thead><tr><th>${esc(t('project_interval'))}</th><th>${esc(t('project_task_scope'))}</th><th>${esc(t('project_role'))}</th><th>${esc(t('project_from'))}</th><th>${esc(t('project_to'))}</th><th>${esc(t('project_focus_time'))}</th></tr></thead><tbody>${rows.map(fmtRow).join('')}</tbody></table>` : '')
-      + (skipped.length ? `<div class="project-message warn">${esc(t('project_skipped', { n: skipped.length }))}</div><table class="project-table"><tbody>${skipped.map(fmtRow).join('')}</tbody></table>` : '');
-    id('set-assign-apply').disabled = rows.length === 0;
-  } catch (e) {
-    if (epoch !== _assignmentEpoch) return;
-    id('set-assign-result').innerHTML = `<div class="project-message warn">${esc(e.message)}</div>`;
-  }
-}
-
-async function applyProjectAssignment() {
-  if (_assignmentBusy || !_assignmentPreview) return;
-  const snapshot = _assignmentPreview;
-  _assignmentBusy = true;
-  invalidateAssignmentPreview();
-  const epoch = _assignmentEpoch;
-  try {
-    const result = await apiJSON('POST', '/api/projects/assign/apply', { snapshot });
-    if (epoch === _assignmentEpoch) id('set-assign-result').innerHTML = `<div class="project-message">${esc(t('project_applied', { n: result.changed }))}</div>`;
-    loadDay(selectedDate, { chart: true });
-  } catch (e) {
-    if (epoch === _assignmentEpoch) id('set-assign-result').innerHTML = `<div class="project-message warn">${esc(e.status === 409 ? t('project_stale') : e.message)}</div>`;
-  } finally {
-    _assignmentBusy = false;
-  }
 }
 
 function renderProviderStatus() {
@@ -787,6 +776,12 @@ function renderLockRows(changed) {
   id('lock-rows').innerHTML = id('set-lock-on').checked ? windowRows('lock', _lockDraft, false) : '';
 }
 
+function tidyDayStart(el) {
+  const v = parseClock(el.value);
+  el.classList.toggle('bad', !v || v > '12:00');
+  if (v) el.value = fmtClock(v);
+}
+
 function minClock(m) { return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; }
 
 function readWindows(kind) {
@@ -857,7 +852,7 @@ async function applySettings() {
     post_daily_notes: id('set-post-notes').checked ? '1' : '0',
     post_sessions: id('set-post-sessions').checked ? '1' : '0',
     update_channel: id('set-update-channel').value,
-    capture_text: id('set-capture-text').value,
+    capture_text: id('set-capture-keep').checked ? 'keep' : 'time',
     capture_hold_sources: [...id('set-hold-sources').querySelectorAll('input[data-source]:checked')].map(el => el.dataset.source).join(','),
     // An emptied text goes back to the provider's default.
     ...Object.fromEntries([...document.querySelectorAll('#set-provider-rows [data-key]')]
@@ -865,7 +860,9 @@ async function applySettings() {
   };
   const zoneName = id('set-zone').value;
   if (zoneName && zoneName !== pref('reporting_zone', '')) changes.reporting_zone = zoneName;
-  changes.day_start = id('set-day-start').value;
+  const dayStart = parseClock(id('set-day-start').value);
+  if (!dayStart || dayStart > '12:00') return settingsError('set-day-start', 'set_bad_day_start');
+  changes.day_start = dayStart;
 
   try {
     const data = await apiJSON('PATCH', '/api/settings', changes);

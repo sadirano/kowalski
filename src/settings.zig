@@ -69,7 +69,7 @@ const all = [_]Decl{
     .{ .key = "ui_sidebar_days", .kind = .preference, .rule = .days },
     .{ .key = "ui_show_weekends", .kind = .preference, .rule = .flag },
     // Report.
-    .{ .key = "ui_report_layout", .kind = .preference, .rule = .{ .choice = &.{ "classic", "grid", "reader" } } },
+    .{ .key = "ui_report_layout", .kind = .preference, .rule = .{ .choice = &.{ "classic", "grid" } } },
     .{ .key = "ui_task_order", .kind = .preference, .rule = .{ .choice = &.{ "time", "ref", "added" } } },
     // Chart.
     .{ .key = "ui_chart_view", .kind = .preference, .rule = .{ .choice = &.{ "bars", "lanes" } } },

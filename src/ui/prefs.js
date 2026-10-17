@@ -32,7 +32,7 @@ const PREF_VIEWS = {
 function hasPrefs(view) { return PREF_VIEWS[view]().length > 0; }
 
 function prefButton(view) {
-  return `<button type="button" class="icon-btn pref-btn" onclick="togglePrefMenu(this,'${view}')"`
+  return `<button type="button" class="icon-btn pref-btn" data-view="${view}" onclick="togglePrefMenu(this,'${view}')"`
     + ` title="${escAttr(t('view_options'))}" aria-label="${escAttr(t('view_options'))}" aria-haspopup="true">${icon('gear')}</button>`;
 }
 
@@ -50,6 +50,19 @@ function togglePrefMenu(btn, view) {
   menu.style.top = (r.bottom + 4) + 'px';
 }
 
+// Opens a view's options for help: the button may appear only after a tab
+// switch renders it.
+async function openPrefMenu(view) {
+  for (let i = 0; i < 20; i++) {
+    const btn = document.querySelector(`.pref-btn[data-view="${view}"]`);
+    if (btn && btn.getClientRects().length) {
+      if (_prefView !== view) togglePrefMenu(btn, view);
+      return;
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
+
 function hidePrefMenu() {
   id('pref-menu').classList.remove('show');
   _prefView = null;
@@ -57,7 +70,7 @@ function hidePrefMenu() {
 
 function renderPrefMenu() {
   const rows = PREF_VIEWS[_prefView]().map((p, i) => {
-    if (p.kind === 'tab') return `<label class="pref-row"><span>${esc(p.text)}</span>`
+    if (p.kind === 'tab') return `<label class="pref-row" data-key="ui_chart_hidden"><span>${esc(p.text)}</span>`
       + `<input type="checkbox" class="sw" data-group="${escAttr(p.group)}"${p.checked ? ' checked' : ''} onchange="saveChartTabs()"></label>`;
     const value = pref(p.key, p.fallback);
     const ctl = p.kind === 'flag'
@@ -66,7 +79,7 @@ function renderPrefMenu() {
         ? `<input type="number" class="n" id="pref-${i}" min="1" max="90" value="${escAttr(value)}" onchange="savePref(${i},this.value)">`
         : `<select id="pref-${i}" onchange="savePref(${i},this.value)">${p.options.map(([v, k]) =>
           `<option value="${v}"${v === value ? ' selected' : ''}>${esc(t(k))}</option>`).join('')}</select>`;
-    return `<label class="pref-row" for="pref-${i}"><span>${esc(t(p.label))}</span>${ctl}</label>`;
+    return `<label class="pref-row" for="pref-${i}" data-key="${p.key}"><span>${esc(t(p.label))}</span>${ctl}</label>`;
   }).join('');
   const hint = _prefView === 'chart' ? `<small class="pref-hint">${esc(t('set_chart_tabs_hint'))}</small>` : '';
   id('pref-menu').innerHTML = `<div class="pref-title">${esc(t(_prefView === 'chart' ? 'set_chart_tabs' : 'view_options'))}</div>${rows}${hint}`;

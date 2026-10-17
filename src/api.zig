@@ -561,8 +561,11 @@ fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8
     };
     if (req.method == .DELETE) if (idBetween(path, "/api/projects/", "")) |id| {
         if (id <= 0) return badRequest(a, "id");
-        const body = try parseBody(struct { into: ?i64 }, a, req.body) orelse return badRequest(a, "body");
-        try app.store.deleteProject(id, body.into, app.clock());
+        // The target rides in the query: the HTTP server reads no DELETE body.
+        const raw = try param(a, params, "into") orelse return badRequest(a, "into");
+        const into: ?i64 = if (std.mem.eql(u8, raw, "none")) null else std.fmt.parseInt(i64, raw, 10) catch return badRequest(a, "into");
+        if (into) |target| if (target <= 0) return badRequest(a, "into");
+        try app.store.deleteProject(id, into, app.clock());
         return send(a, .ok, .{ .deleted = id });
     };
     return null;
@@ -2544,14 +2547,15 @@ test "deleting a project moves its work into another, or unassigns it" {
     try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='k'"));
     try f.db.exec("INSERT INTO projects(id,label) VALUES(2,'kowalski-45904b93')");
     try f.db.exec("UPDATE capture_project_keys SET project_id=2; UPDATE intervals SET project_id=2; UPDATE tasks SET project_id=2");
-    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.DELETE, "/api/projects/2", "").status);
-    try std.testing.expectEqual(std.http.Status.not_found, f.call(.DELETE, "/api/projects/2", "{\"into\":2}").status);
-    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/2", "{\"into\":1}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.DELETE, "/api/projects/2", "{\"into\":1}").status);
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.DELETE, "/api/projects/2?into=2", "").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.DELETE, "/api/projects/2?into=x", "").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/2?into=1", "").status);
     try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
     try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id IS NOT 1"));
     try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id IS NOT 1"));
     try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='k'"));
-    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/1", "{\"into\":null}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/1?into=none", "").status);
     try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
     try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys"));
     try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id IS NOT NULL"));
@@ -3486,7 +3490,7 @@ test "settings validate preferences and paid breaks credit only the pause" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"ref\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"id\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"grid\"}").status);
-    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"reader\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"reader\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"cards\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"[\\\"system\\\"]\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"system\"}").status);
