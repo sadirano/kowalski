@@ -1,5 +1,6 @@
-# A version tag (v1.2.3) checks that it matches build.zig.zon, tests and
-# builds. Releases are signed and published by hand (docs/releasing.md).
+# A version tag (v1.2.3, or v1.2.3-preview.N for the version it leads to)
+# checks that it matches build.zig.zon, tests and builds. Releases are
+# signed and published by hand (docs/releasing.md).
 name: release
 
 on:
@@ -22,10 +23,15 @@ jobs:
       - name: The tag matches build.zig.zon
         shell: pwsh
         run: |
-          $want = '${{ github.ref_name }}'.TrimStart('v')
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)(-preview\.(\d+))?$') { throw "tag $tag is not vX.Y.Z or vX.Y.Z-preview.N" }
+          $want = $Matches[1]
           $have = (Select-String -Path build.zig.zon -Pattern '\.version = "([^"]+)"').Matches[0].Groups[1].Value
-          if ($want -ne $have) { throw "tag ${{ github.ref_name }} but build.zig.zon says $have" }
+          if ($want -ne $have) { throw "tag $tag but build.zig.zon says $have" }
+          # A preview keeps the coming stable version and builds with -Dpreview=N.
+          "PREVIEW_FLAG=$(if ($Matches[3]) { '-Dpreview=' + $Matches[3] } else { '' })" | Out-File -Append $env:GITHUB_ENV
 
       - run: zig build test
 
-      - run: zig build -Doptimize=ReleaseSafe
+      - shell: pwsh
+        run: zig build -Doptimize=ReleaseSafe @("$env:PREVIEW_FLAG" -split ' ' | Where-Object { $_ })
