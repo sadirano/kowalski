@@ -32,16 +32,18 @@ Settings > Captured text chooses whether to keep prompts and outcomes (the defau
 |---|---|
 | `start` | registers the run; records no time |
 | `subject` | the run's task from now on; a working run moves its time there |
-| `prompt` | the user handed the run work: it takes the focus (parallel when unattended) |
+| `prompt` | the user handed the run work: it starts in parallel when another task has focus; unattended runs stay parallel |
 | `busy` | the run is still working; a run that was idle starts in parallel |
 | `stop` | the run's turn is over: its task stays open for a 5-minute grace |
 | `end` | the run is gone: its task closes now |
 
 ## Rules
 
-- One focus: the attended run that got the last prompt holds it. A run
-  that loses the focus while it still works goes on in parallel, so only
-  the user's attention counts toward totals and posted hours.
+- One focus: an attended prompt takes it immediately when no task has it.
+  While another task has it, the prompted task works in parallel. If its
+  attended prompts span 10 minutes without an attended prompt to the focus
+  task, it takes the focus from the first prompt in that stretch. The old
+  focus runs in parallel from then. Posted time is never changed.
 - A task several runs work on stays open until the last of them stops,
   and closes at the latest point any of them left it.
 - A `subject` sent with any event names the run's task before the event
@@ -54,10 +56,9 @@ Settings > Captured text chooses whether to keep prompts and outcomes (the defau
   other run held the focus in between.
 - A working run that sends nothing for 20 minutes is taken as gone: its
   task closes where that lease ran out, marked `recovered`.
-- Tracking by hand outranks capture: while a focus you started is open, a
-  `prompt` for another task runs in parallel, and that run does not take
-  the focus later without a new prompt. Capture never closes or carries on
-  an interval you opened by hand.
+- Switching tasks in kowalski takes the focus immediately. Capture prompts
+  for another task begin in parallel and follow the 10-minute rule above.
+  Capture never closes or carries on an interval you opened by hand.
 - When another task takes the focus while a run sits in its grace, that
   task's focus ends where the run's turn ended: the grace counts only when
   the same conversation carries on.
