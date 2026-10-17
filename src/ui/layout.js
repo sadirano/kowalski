@@ -80,6 +80,56 @@ function endResize(e) {
   if (chartInst) chartInst.resize(); // the content column width just changed
 }
 
+// The Timeline preference is a pixel width. Only the rendered width is fitted
+// to the current grid, so a narrower window does not erase the preference.
+let _rdWorkWidth = null;
+let _rdResize = null;
+function applyRdWorkWidth() {
+  const grid = document.querySelector('.rd');
+  if (!grid) return;
+  const room = grid.clientWidth - 280 - 48;
+  const wanted = _rdWorkWidth ?? Math.round(room * 0.4);
+  const width = Math.max(360, Math.min(wanted, room - 480));
+  grid.style.setProperty('--rd-work-w', width + 'px');
+}
+function startRdResize(e) {
+  if (e.button !== 0) return;
+  const grid = e.currentTarget.closest('.rd');
+  e.preventDefault();
+  _rdResize = { startX: e.clientX, startW: grid.querySelector('.rd-work').getBoundingClientRect().width };
+  const h = e.currentTarget;
+  h.classList.add('dragging');
+  h.setPointerCapture?.(e.pointerId);
+  h.addEventListener('pointermove', onRdResizeMove);
+  h.addEventListener('pointerup', endRdResize);
+  h.addEventListener('pointercancel', endRdResize);
+}
+function onRdResizeMove(e) {
+  if (!_rdResize) return;
+  const grid = e.currentTarget.closest('.rd');
+  const room = grid.clientWidth - 280 - 48;
+  _rdWorkWidth = Math.max(360, Math.min(_rdResize.startW - (e.clientX - _rdResize.startX), room - 480));
+  applyRdWorkWidth();
+}
+function endRdResize(e) {
+  if (!_rdResize) return;
+  if (_rdWorkWidth !== null) saveLS('rdWorkW', _rdWorkWidth);
+  _rdResize = null;
+  const h = e.currentTarget;
+  h.classList.remove('dragging');
+  h.releasePointerCapture?.(e.pointerId);
+  h.removeEventListener('pointermove', onRdResizeMove);
+  h.removeEventListener('pointerup', endRdResize);
+  h.removeEventListener('pointercancel', endRdResize);
+  requestAnimationFrame(readerRefitMap);
+}
+function resetRdWorkWidth() {
+  _rdWorkWidth = null;
+  saveLS('rdWorkW', null);
+  applyRdWorkWidth();
+  requestAnimationFrame(readerRefitMap);
+}
+
 // Chart visibility — only meaningful in the report view, so the toggle button
 // hides itself in the summary tab.
 function updateChartToggleBtn() {
@@ -104,6 +154,8 @@ function toggleChartVisible() {
 
 function initLayout() {
   _leftWidth     = sanitizeW(loadLS('leftWidth', 220));
+  const rdWidth  = loadLS('rdWorkW', null);
+  _rdWorkWidth   = Number.isFinite(rdWidth) ? Math.max(360, Math.round(rdWidth)) : null;
   _leftCollapsed = pref('ui_left_collapsed', '0') === '1';
   _chartVisible  = pref('ui_chart_visible', '1') === '1';
   applyLeftWidth();
@@ -111,7 +163,11 @@ function initLayout() {
   updateChartToggleBtn();
   // Re-fit the panels when the window changes: the stored preference stays put,
   // only the rendered width follows.
-  window.addEventListener('resize', applyLeftWidth);
+  window.addEventListener('resize', () => {
+    applyLeftWidth();
+    applyRdWorkWidth();
+    requestAnimationFrame(readerRefitMap);
+  });
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────

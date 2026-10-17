@@ -131,12 +131,14 @@ function renderReader(rep, area) {
         <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}</small></span><span class="rd-t">${fmtMs(e.focus_ms)}</span></button>`).join('')}</nav>
     <div class="rd-main" id="rd-main">${readerMainHtml(rep)}</div>
     <div class="rd-work">
+      <div class="resize-handle" onpointerdown="startRdResize(event)" ondblclick="resetRdWorkWidth()" title="${escAttr(t('rd_resize_hint'))}"></div>
       <div class="rd-workhead"><div class="rd-legend"><span><i class="rd-sw f"></i>${esc(t('rd_legend_you'))}</span><span><i class="rd-sw p"></i>${esc(t('rd_legend_par'))}</span><span><i class="rd-sw o"></i>${esc(t('rd_legend_other'))}</span></div></div>
       <div class="rd-workbody"><div class="rd-map" id="rd-ribbon">${rowsHtml(rep)}</div>
         <aside class="rd-at" id="rd-at">${pinned == null ? `<p class="rd-nil">${esc(t('rd_pick_hint'))}</p>` : atHtml(rep, pinned)}</aside></div>
       <div class="rd-hint">${esc(t('rd_hint'))}</div>
     </div>
   </div>`;
+  applyRdWorkWidth();
   if (pinned != null) markMoment(rep, pinned, false);
   requestAnimationFrame(() => {
     const tab = area.querySelector('.rd-tab:hover');
@@ -144,6 +146,16 @@ function renderReader(rep, area) {
     const strip = area.querySelector('.rd-strip:hover');
     if (strip && _readerPointer) readerHover(_readerPointer, strip);
   });
+}
+
+// Map positions are percentages; refresh the hover marker after its strip moves.
+function readerRefitMap() {
+  const map = id('rd-ribbon');
+  if (!map) return;
+  map.querySelectorAll('.rd-cursor').forEach(cursor => cursor.remove());
+  const strip = map.querySelector('.rd-strip:hover');
+  if (strip && _readerPointer) readerHover(_readerPointer, strip);
+  else readerMark(null);
 }
 
 // Pointing at a task in the list lights its pieces on the map, parallel

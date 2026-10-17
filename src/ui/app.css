@@ -689,11 +689,12 @@
   /* ── Reader layout ── */
   /* One task read top to bottom under a day ribbon; an "At" panel beside it
      lists what else ran at the minute clicked on the ribbon. */
-  .rd{--read:Georgia,'Times New Roman',serif;--rd-col:68ch}
-  .rd{display:grid;grid-template-columns:280px minmax(0,720px) minmax(360px,1fr);gap:24px;align-items:start;--rd-h:calc(100vh - 96px)}
+  .rd{--read:Georgia,'Times New Roman',serif}
+  .rd{display:grid;grid-template-columns:280px minmax(0,1fr) var(--rd-work-w, 40%);gap:24px;align-items:start;min-width:1168px;--rd-h:calc(100vh - 96px)}
   .rd-tabs{grid-column:1;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;max-height:var(--rd-h);overflow-y:auto}
-  .rd-main{grid-column:2;padding-bottom:48px;min-width:0}
+  .rd-main{grid-column:2;padding:0 12px 48px;min-width:0;width:100%;box-sizing:border-box}
   .rd-work{grid-column:3;position:sticky;top:0;height:var(--rd-h);display:flex;flex-direction:column;gap:10px;min-width:0}
+  .rd-work .resize-handle{left:-15px}
   .rd-workhead{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
   .rd-legend{display:flex;gap:14px;font-size:12px;color:var(--muted);flex-wrap:wrap}
   .rd-hint{font-size:12px;color:var(--muted)}
