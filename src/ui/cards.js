@@ -66,12 +66,24 @@ function renderSchedule() {
   }
 
   box.style.display = '';
-  box.innerHTML = `
-    <div class="sched-main">
-      <div class="sched-primary" style="color:${accent}">${primary}</div>
-      <div class="sched-secondary">${secondary}</div>
-      <div class="sched-bar"><div class="sched-bar-fill" style="width:${pct}%;background:${accent}"></div></div>
-    </div>`;
+  let pEl = box.querySelector('.sched-primary');
+  let sEl = box.querySelector('.sched-secondary');
+  let fEl = box.querySelector('.sched-bar-fill');
+  if (!pEl || !sEl || !fEl) {
+    box.innerHTML = `
+      <div class="sched-main">
+        <div class="sched-primary" style="color:${accent}">${primary}</div>
+        <div class="sched-secondary">${secondary}</div>
+        <div class="sched-bar"><div class="sched-bar-fill" style="width:${pct}%;background:${accent}"></div></div>
+      </div>`;
+  } else {
+    if (pEl.textContent !== primary) pEl.textContent = primary;
+    if (pEl.style.color !== accent) pEl.style.color = accent;
+    if (sEl.textContent !== secondary) sEl.textContent = secondary;
+    const widthStyle = pct + '%';
+    if (fEl.style.width !== widthStyle) fEl.style.width = widthStyle;
+    if (fEl.style.background !== accent) fEl.style.background = accent;
+  }
 }
 
 // ── Stat cards ────────────────────────────────────────────────────────────────
@@ -92,7 +104,7 @@ function renderCards(rep) {
       ? `${fmtTime(n.first_start_ms)} – ${fmtTime(lunch.out)} / ${fmtTime(lunch.back)} – ${end}`
       : `${fmtTime(n.first_start_ms)} – ${end}`;
   const lunchSub = lunch ? t('lbl_lunch') + ' ' + fmtMs(lunch.back - lunch.out) : t('no_lunch');
-  el.innerHTML = `
+  patchHTML(el, `
     <div class="card"><div class="lbl">${t('card_total')}</div>
       <div class="val">${fmtMs(n.total_ms)}</div><div class="sub">${esc(rep.date)}</div></div>
     <div class="card"><div class="lbl">${t('card_tasks')}</div>
@@ -101,5 +113,5 @@ function renderCards(rep) {
       <div class="val" style="color:${n.hops>0?'var(--warn)':'var(--grn)'}">${n.hops}</div>
       <div class="sub">${t('card_hops_sub')}</div></div>
     ${scheduleShown() ? '' : `<div class="card card-wide"><div class="lbl">${t('card_periods')}</div>
-      <div class="val">${periods}</div><div class="sub">${lunchSub}</div></div>`}`;
+      <div class="val">${periods}</div><div class="sub">${lunchSub}</div></div>`}`);
 }

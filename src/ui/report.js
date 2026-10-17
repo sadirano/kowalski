@@ -44,11 +44,15 @@ function orderTasks(rep) {
 
 function renderReport(rep) {
   const area = id('table-area');
+  const page = area.closest('section');
+  const pageScroll = page?.scrollTop ?? 0;
+  const restoreScroll = () => { if (page) page.scrollTop = pageScroll; };
   _taskData = []; // reset task registry for switch buttons
   _blockData = []; // reset interval registry for block actions
   _slotSel = null;  // a selection does not survive a re-render
   if (!rep.tasks?.length) {
     area.innerHTML = `<div class="empty">${t('no_sessions')}</div>`;
+    restoreScroll();
     return;
   }
 
@@ -176,7 +180,8 @@ function renderReport(rep) {
     return { html: card, weight };
   });
   if (!grid) {
-    area.innerHTML = cards.map(c => c.html).join('');
+    patchHTML(area, cards.map(c => c.html).join(''));
+    restoreScroll();
     return;
   }
   // Each card goes to the shortest column so far, in task order.
@@ -188,7 +193,8 @@ function renderReport(rep) {
     col.html.push(c.html);
     col.weight += c.weight;
   }
-  area.innerHTML = toolbar + `<div class="card-cols">${cols.map(c => `<div class="card-col">${c.html.join('')}</div>`).join('')}</div>`;
+  patchHTML(area, toolbar + `<div class="card-cols">${cols.map(c => `<div class="card-col">${c.html.join('')}</div>`).join('')}</div>`);
+  restoreScroll();
 }
 
 // The narrowest a grid column gets, in pixels.

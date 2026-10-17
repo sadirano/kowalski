@@ -9,6 +9,22 @@
 <link rel="apple-touch-icon" href="/icon-192.png">
 <meta name="theme-color" content="#0f1117">
 <link rel="stylesheet" href="/ui/app.css">
+<script>
+(function(){
+  try {
+    var s = JSON.parse(localStorage.getItem('kw.settingsCache') || '{}');
+    var tab = JSON.parse(localStorage.getItem('kw.activeTab') || '"report"');
+    document.documentElement.classList.add('init-left-panel');
+    if (s.ui_left_collapsed === '1') document.documentElement.classList.add('init-left-collapsed');
+    if (s.ui_chart_visible === '0' || tab !== 'report') document.documentElement.classList.add('init-chart-hidden');
+    if (s.ui_show_keys === '0') document.documentElement.classList.add('init-keys-hidden');
+    var rawLw = parseInt(s.ui_left_width, 10);
+    var lw = isNaN(rawLw) ? 220 : Math.max(150, Math.min(520, rawLw));
+    var maxW = Math.max(150, Math.min(520, Math.round(window.innerWidth / 3)));
+    document.documentElement.style.setProperty('--left-w', Math.min(lw, maxW) + 'px');
+  } catch(e) {}
+})();
+</script>
 </head>
 <body>
 <!-- Line icons in the text colour; one copy each, used by every button -->
@@ -51,7 +67,7 @@
     <button type="button" class="nav-btn icon-btn" onclick="stepDay(1)" title="Next day" aria-label="Next day" data-i18n-title="next_day" data-i18n-aria="next_day">⟩</button>
   </div>
   <div class="tabs" id="main-tabs">
-    <div class="tab active" data-tab="report" onclick="setTab('report',this)" data-i18n="tab_report">Report</div>
+    <div class="tab" data-tab="report" onclick="setTab('report',this)" data-i18n="tab_report">Report</div>
     <div class="tab" data-tab="timeline" onclick="setTab('timeline',this)" data-i18n="tab_timeline">Timeline</div>
     <div class="tab" data-tab="summary" onclick="setTab('summary',this)" data-i18n="tab_summary">Summary</div>
   </div>
@@ -394,7 +410,7 @@
     <div class="left-inner">
     <div class="shead shead-row">
       <button type="button" class="panel-collapse icon-btn" onclick="toggleLeftPanel()" title="Collapse sidebar" aria-label="Collapse sidebar" data-i18n-title="collapse_sidebar" data-i18n-aria="collapse_sidebar">«</button>
-      <span id="sidebar-head-label" style="flex:1">Last 7 days</span>
+      <span id="sidebar-head-label" style="flex:1"></span>
       <button type="button" class="icon-btn pref-btn" data-view="sidebar" onclick="togglePrefMenu(this,'sidebar')" title="View options" aria-label="View options" data-i18n-title="view_options" data-i18n-aria="view_options"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button>
       <button type="button" class="cal-open icon-btn" onclick="showCalendar()" title="Open calendar" aria-label="Open calendar" data-i18n-title="open_calendar" data-i18n-aria="open_calendar"><svg class="ico" aria-hidden="true"><use href="#i-calendar"/></svg></button>
     </div>
@@ -445,28 +461,6 @@
 
 </main>
 
-<script src="/ui/util.js"></script>
-<script src="/ui/i18n.js"></script>
-<script src="/ui/state.js"></script>
-<script src="/ui/layout.js"></script>
-<script src="/ui/header.js"></script>
-<script src="/ui/cards.js"></script>
-<script src="/ui/settings.js"></script>
-<script src="/ui/prefs.js"></script>
-<script src="/ui/post.js"></script>
-<script src="/ui/switch.js"></script>
-<script src="/ui/search.js"></script>
-<script src="/ui/newtask.js"></script>
-<script src="/ui/keys.js"></script>
-<script src="/ui/day.js"></script>
-<script src="/ui/summary.js"></script>
-<script src="/ui/history.js"></script>
-<script src="/ui/sidebar.js"></script>
-<script src="/ui/report.js"></script>
-<script src="/ui/reader.js"></script>
-<script src="/ui/barchart.js"></script>
-<script src="/ui/charts.js"></script>
-<script src="/ui/tour.js"></script>
-<script src="/ui/boot.js"></script>
+<script src="/ui/bundle.js"></script>
 </body>
 </html>

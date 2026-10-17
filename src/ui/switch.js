@@ -23,6 +23,7 @@ async function switchToTask(task, projectId) {
 // applyFeatureToggles reflects the per-feature visibility settings into the
 // header buttons. Called whenever config is (re)loaded.
 function applyFeatureToggles() {
+  document.documentElement.classList.remove('init-keys-hidden');
   id('add-entry-btn').style.display = _showAddEntry ? '' : 'none';
   id('keys-btn').style.display = _showKeys ? '' : 'none';
   id('login-btn').style.display = provider ? '' : 'none';

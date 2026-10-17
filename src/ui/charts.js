@@ -40,11 +40,39 @@ function rankSeries(series) {
 const _chartHidden = new Set();
 let _chartRanked = [];
 let _chartDates = [];
+let _lastChartData = null;
+let _lastDrawKey = null;
+
+function isSameChartData(a, b) {
+  if (!a || !b || a.dates?.length !== b.dates?.length || a.series?.length !== b.series?.length) return false;
+  if (a.dates.some((d, i) => d !== b.dates[i])) return false;
+  return a.series.every((s1, i) => {
+    const s2 = b.series[i];
+    return s1.label === s2.label && s1.project_id === s2.project_id && s1.ms?.length === s2.ms?.length
+      && s1.ms.every((ms, j) => ms === s2.ms[j]);
+  });
+}
 
 function renderChart(data) {
+  if (!data?.dates?.length) {
+    _lastChartData = null;
+    if (chartInst) { chartInst.destroy(); chartInst = null; }
+    id('chart-legend').innerHTML = '';
+    id('chart-lanes').innerHTML = '';
+    return;
+  }
+  // The same data drawn the same way only moves the selected day.
+  const drawKey = JSON.stringify([chartView, chartGroupBy, _hideWeekends, S?.daily_work_minutes ?? null,
+    (projects || []).map(p => p.label)]);
+  if (_lastChartData && chartInst && drawKey === _lastDrawKey && isSameChartData(data, _lastChartData)) {
+    updateChartSelectedDay(selectedDate);
+    return;
+  }
+  _lastChartData = data;
+  _lastDrawKey = drawKey;
+  if (!TOUR) saveLS('chartCache', { days: chartDays, group: chartGroupBy, data });
   id('chart-legend').innerHTML = '';
   id('chart-lanes').innerHTML = '';
-  if (!data?.dates?.length) return;
 
   let { dates, series } = data;
   // Drop weekend columns when hidden. dates[] and every series' ms[] are
@@ -98,6 +126,17 @@ function renderLanes() {
 // Pointing at a list row keeps that series bright and fades the rest.
 function focusChartSeries(key) {
   if (chartInst) chartInst.focusSeries(key);
+}
+
+// A day was selected in the sidebar or calendar; move the highlight on the
+// visible bars or lanes without refetching the range.
+function updateChartSelectedDay(date) {
+  if (!_chartDates?.length) {
+    if (_lastChartData) renderChart(_lastChartData);
+    return;
+  }
+  if (chartView === 'lanes') { renderLanes(); return; }
+  if (chartInst) chartInst.setSelectedDate(date);
 }
 
 // The list beside the bars: every series in the range, biggest first, with

@@ -112,12 +112,22 @@ function titleOf(rep, taskId) {
 }
 
 function renderReader(rep, area) {
+  const page = area.closest('section');
+  const pageScroll = page?.scrollTop ?? 0;
+  const tabsScroll = area.querySelector('.rd-tabs')?.scrollTop ?? 0;
+  const atScroll = area.querySelector('.rd-at')?.scrollTop ?? 0;
   if (_readerDay !== rep.start_ms) {
     _readerDay = rep.start_ms;
     _readerPin = null;
     _readerSitting = 0;
   }
   const tasks = orderTasks(rep);
+  const savedTask = loadLS('readerTask', null);
+  if (savedTask !== _readerTask && tasks.some(e => e.task.id === savedTask)) {
+    _readerTask = savedTask;
+    _readerSitting = 0;
+    _readerPin = null;
+  }
   if (!tasks.some(e => e.task.id === _readerTask)) {
     _readerSitting = 0;
     _readerTask = tasks.some(e => e.task.id === _currentTaskId) ? _currentTaskId : tasks[0].task.id;
@@ -138,6 +148,9 @@ function renderReader(rep, area) {
     </div>
   </div>`;
   applyRdWorkWidth();
+  if (page) page.scrollTop = pageScroll;
+  area.querySelector('.rd-tabs').scrollTop = tabsScroll;
+  area.querySelector('.rd-at').scrollTop = atScroll;
   if (pinned != null) markMoment(rep, pinned, false);
   requestAnimationFrame(() => {
     const tab = area.querySelector('.rd-tab:hover');
@@ -330,6 +343,7 @@ function markMoment(rep, t0, scroll = true) {
 function openInTimeline(taskId) {
   _readerSitting = 0;
   _readerTask = taskId;
+  saveLS('readerTask', taskId);
   _readerPin = null;
   setTab('timeline');
   const page = id('table-area')?.closest('section');
@@ -339,6 +353,7 @@ function openInTimeline(taskId) {
 function readerPick(taskId, t0 = null) {
   _readerSitting = 0;
   _readerTask = taskId;
+  saveLS('readerTask', taskId);
   _readerPin = t0;
   if (!D) return;
   renderReport(D);

@@ -18,17 +18,25 @@ function setDateTitle(date) {
 
 // Each day load takes a generation; neither response may paint an older day.
 let _dayGen = 0;
+let _dayLoads = 0;
 
-async function loadDay(date, { chart = false } = {}) {
+async function loadDay(date, { chart = false, background = false } = {}) {
+  if (background && _dayLoads > 0) return;
+  ++_dayLoads;
   const gen = ++_dayGen;
   const tab = activeTab;
   try {
-    const [days, day] = await Promise.all([
+    const [days, day, dayProjects] = await Promise.all([
       fetchWeek(),
       apiJSON('GET', '/api/day?date=' + date),
-      loadProjects().catch(() => []),
+      // Background results stay local until the editing check below.
+      background
+        ? apiJSON('GET', '/api/projects?archived=1').then(data => data.projects).catch(() => null)
+        : loadProjects().catch(() => null),
     ]);
     if (gen !== _dayGen || selectedDate !== date || activeTab !== tab) return;
+    if (background && isEditing()) return;
+    if (background && Array.isArray(dayProjects)) projects = dayProjects;
     weekData = days;
     D = day;
     setDateTitle(date);
@@ -39,27 +47,37 @@ async function loadDay(date, { chart = false } = {}) {
     renderCards(D);
     if (tab === 'report') {
       renderReport(D);
-      if (chart) loadChart();
+      if (chart) loadChart({ background });
+      else updateChartSelectedDay(date);
     } else if (tab === 'timeline') {
       id('chart-box').style.display = 'none'; // the timeline has its own day ribbon
       renderReport(D);
     } else {
       loadSummary(D, date);
     }
+    if (!TOUR) {
+      saveLS('lastDayCache', { date, day: D, state: S, week: weekData, projects, chartData: _lastChartData });
+      if (date === todayStr()) saveLS('bootCache', { date, day: D, state: S, week: weekData, projects, chartData: _lastChartData });
+    }
   } catch (e) {
-    if (gen !== _dayGen) return;
+    if (gen !== _dayGen || background) return;
     id('table-area').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  } finally {
+    --_dayLoads;
   }
 }
 
-async function loadChart() {
+let _chartLoadGen = 0;
+async function loadChart({ background = false } = {}) {
+  const gen = ++_chartLoadGen;
   if (!_chartVisible) { id('chart-box').style.display = 'none'; return; }
   id('chart-box').style.display = '';
   try {
     const pts = await apiJSON('GET', '/api/chart?days=' + chartDays + '&group=' + encodeURIComponent(chartGroupBy));
+    if (gen !== _chartLoadGen || !_chartVisible) return;
     renderChart(pts);
   } catch (e) {
-    showError(e.message);
+    if (!background && gen === _chartLoadGen) showError(e.message);
   }
 }
 

@@ -12,57 +12,81 @@ async function fetchWeek() {
 let _trackerActive = false;
 let _skew = 0;
 
+function renderHeader(state) {
+  if (!state) return;
+  const refEl  = id('hdr-ref');
+  const detEl  = id('hdr-detail');
+  const btn    = id('tracker-btn');
+  const working = state.focus || (state.parallel && state.parallel.length);
+  if (working) {
+    _trackerActive = true;
+    if (state.focus) {
+      const task = state.focus.task;
+      _currentTaskId = task.id;
+      refEl.innerHTML = `${task.ref ? refLink(task.ref) : esc('#' + task.id)}  ${esc(task.title)}`;
+      refEl.title = task.title;
+      const elapsed = fmtMs(Date.now() + _skew - state.focus.start_ms);
+      const fieldValues = (state.focus_fields || []).map(f => f.value);
+      detEl.textContent = [elapsed, ...fieldValues].join('  ·  ');
+    } else {
+      _currentTaskId = null;
+      refEl.innerHTML = esc(t('parallel'));
+      detEl.textContent = (state.parallel || []).map(interval => interval.task.title).join(', ');
+    }
+    refEl.classList.remove('idle');
+    btn.classList.add('active');
+  } else {
+    _trackerActive = false;
+    _currentTaskId = null;
+    refEl.textContent = t('no_session');
+    refEl.title = '';
+    refEl.classList.add('idle');
+    detEl.textContent = t(state.saved && state.saved.length ? 'idle_resume' : 'idle_start');
+    btn.classList.remove('active');
+  }
+  btn.innerHTML = icon(working ? 'pause' : 'play');
+  const runs = state.capture?.runs || [];
+  const chip = id('hdr-session');
+  chip.classList.toggle('working', !!working);
+  chip.classList.toggle('capture-quiet', runs.some(run => run.state === 'quiet'));
+  const pop = id('capture-popover');
+  pop.hidden = true;
+  if (runs.length) {
+    const count = document.createElement('button');
+    count.type = 'button';
+    count.className = 'capture-count';
+    count.textContent = t(runs.length === 1 ? 'capture_one_session' : 'capture_many_sessions', { n: runs.length });
+    count.onclick = e => { e.stopPropagation(); pop.hidden = !pop.hidden; };
+    detEl.append(document.createTextNode('  ·  '), count);
+    pop.innerHTML = runs.map(run => `<div class="capture-run"><strong>${esc(run.task?.title || t('no_session'))}</strong><span>${esc(run.source)} · ${esc(t('capture_' + run.state))} · ${esc(t('capture_last_activity'))} ${esc(hhmm24(run.last_ms))}</span></div>`).join('');
+  }
+  btn.title = t(working ? 'btn_pause' : state.saved && state.saved.length ? 'btn_resume' : 'btn_start');
+  btn.setAttribute('aria-label', btn.title);
+}
+
+function tickHeader() {
+  if (!S?.focus) return;
+  const detEl = id('hdr-detail');
+  if (!detEl) return;
+  const elapsed = fmtMs(Date.now() + _skew - S.focus.start_ms);
+  const fieldValues = (S.focus_fields || []).map(f => f.value);
+  const text = [elapsed, ...fieldValues].join('  ·  ');
+  const count = detEl.querySelector('.capture-count');
+  if (count && detEl.firstChild) {
+    detEl.firstChild.textContent = text + '  ·  ';
+  } else if (!count) {
+    detEl.textContent = text;
+  }
+}
+
 async function loadCurrent() {
   try {
     S = await apiJSON('GET', '/api/state');
     _skew = S.now_ms - Date.now();
-    const refEl  = id('hdr-ref');
-    const detEl  = id('hdr-detail');
-    const btn    = id('tracker-btn');
-    const working = S.focus || S.parallel.length;
-    if (working) {
-      _trackerActive = true;
-      if (S.focus) {
-        const task = S.focus.task;
-        _currentTaskId = task.id;
-        refEl.innerHTML = `${task.ref ? refLink(task.ref) : esc('#' + task.id)}  ${esc(task.title)}`;
-        refEl.title = task.title;
-        detEl.textContent = [fmtMs(Date.now() + _skew - S.focus.start_ms), ...S.focus_fields.map(field => field.value)].join('  ·  ');
-      } else {
-        _currentTaskId = null;
-        refEl.innerHTML = esc(t('parallel'));
-        detEl.textContent = S.parallel.map(interval => interval.task.title).join(', ');
-      }
-      refEl.classList.remove('idle');
-      btn.classList.add('active');
-    } else {
-      _trackerActive = false;
-      _currentTaskId = null;
-      refEl.textContent = t('no_session');
-      refEl.title = '';
-      refEl.classList.add('idle');
-      detEl.textContent = t(S.saved.length ? 'idle_resume' : 'idle_start');
-      btn.classList.remove('active');
-    }
-    btn.innerHTML = icon(working ? 'pause' : 'play');
-    const runs = S.capture?.runs || [];
-    const chip = id('hdr-session');
-    chip.classList.toggle('working', !!working);
-    chip.classList.toggle('capture-quiet', runs.some(run => run.state === 'quiet'));
-    const pop = id('capture-popover');
-    pop.hidden = true;
-    if (runs.length) {
-      const count = document.createElement('button');
-      count.type = 'button';
-      count.className = 'capture-count';
-      count.textContent = t(runs.length === 1 ? 'capture_one_session' : 'capture_many_sessions', { n: runs.length });
-      count.onclick = e => { e.stopPropagation(); pop.hidden = !pop.hidden; };
-      detEl.append(document.createTextNode('  ·  '), count);
-      pop.innerHTML = runs.map(run => `<div class="capture-run"><strong>${esc(run.task?.title || t('no_session'))}</strong><span>${esc(run.source)} · ${esc(t('capture_' + run.state))} · ${esc(t('capture_last_activity'))} ${esc(hhmm24(run.last_ms))}</span></div>`).join('');
-    }
-    btn.title = t(working ? 'btn_pause' : S.saved.length ? 'btn_resume' : 'btn_start');
-    btn.setAttribute('aria-label', btn.title);
-  } catch { id('hdr-session').classList.remove('working'); }
+    renderHeader(S);
+  } catch {
+    if (!S) id('hdr-session').classList.remove('working');
+  }
 }
 
 document.addEventListener('click', e => {

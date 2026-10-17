@@ -20,8 +20,11 @@ function applyPrefs() {
 async function loadSettings() {
   const data = await apiJSON('GET', '/api/settings');
   settings = Object.fromEntries(data.settings.map(({ key, value }) => [key, value]));
+  saveLS('settingsCache', settings);
   applyPrefs();
 }
+
+applyPrefs();
 
 let _settingsLoaded = false;
 let _captureKeys = [];
@@ -867,6 +870,7 @@ async function applySettings() {
   try {
     const data = await apiJSON('PATCH', '/api/settings', changes);
     settings = Object.fromEntries(data.settings.map(({ key, value }) => [key, value]));
+    saveLS('settingsCache', settings);
     applyPrefs();
     hideSettings();
     showToast(t('settings_saved'));

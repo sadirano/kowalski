@@ -72,6 +72,31 @@ function dayName(str)   { return new Date(str+'T12:00:00').toLocaleDateString(lo
 function isWeekend(str) { const d = new Date(str+'T12:00:00').getDay(); return d === 0 || d === 6; }
 function calendarDateStr(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
 function todayStr()     { return S?.date ?? calendarDateStr(new Date()); }
+// Writes markup into el by changing only what differs from what is there, so
+// a refresh that repeats the page does not rebuild it (no blink, hover and
+// focus stay). A focused field keeps what is being typed.
+function patchHTML(el, html) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  patchChildren(el, tpl.content);
+}
+
+function patchChildren(from, to) {
+  const want = [...to.childNodes];
+  for (let i = 0; i < want.length; i++) {
+    const have = from.childNodes[i];
+    const next = want[i];
+    if (!have) { from.appendChild(next); continue; }
+    if (have.nodeType !== next.nodeType || have.nodeName !== next.nodeName) { from.replaceChild(next, have); continue; }
+    if (have.nodeType !== 1) { if (have.nodeValue !== next.nodeValue) have.nodeValue = next.nodeValue; continue; }
+    for (const a of [...have.attributes]) if (!next.hasAttribute(a.name)) have.removeAttribute(a.name);
+    for (const a of next.attributes) if (have.getAttribute(a.name) !== a.value) have.setAttribute(a.name, a.value);
+    if (have === document.activeElement && (have.nodeName === 'INPUT' || have.nodeName === 'TEXTAREA')) continue;
+    patchChildren(have, next);
+  }
+  while (from.childNodes.length > want.length) from.removeChild(from.lastChild);
+}
+
 function esc(s)  { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 // escAttr also escapes the quote, for text dropped into an HTML attribute
 // (client names and notes reach title="…" in the search results).
@@ -115,4 +140,12 @@ async function apiJSON(method, path, body) {
     throw error;
   }
   return data;
+}
+
+function loadLS(key, def) {
+  try { const v = localStorage.getItem('kw.' + key); return v === null ? def : JSON.parse(v); }
+  catch { return def; }
+}
+function saveLS(key, val) {
+  try { localStorage.setItem('kw.' + key, JSON.stringify(val)); } catch { /* private mode / quota */ }
 }

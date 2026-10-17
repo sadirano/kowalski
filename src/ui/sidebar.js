@@ -43,7 +43,7 @@ function renderSidebar() {
   if (!days.length) { nav.innerHTML=''; return; }
   const prevScroll = nav.scrollTop;
   const maxMs = Math.max(...days.map(d => d.total_ms), 1);
-  nav.innerHTML = days.map(d => {
+  patchHTML(nav, days.map(d => {
     const active = d.date === (D?.date || selectedDate) ? 'active' : '';
     const pct = Math.round(d.total_ms / maxMs * 100);
     const label = d.date === todayStr() ? t('today') : dayName(d.date);
@@ -59,7 +59,7 @@ function renderSidebar() {
       <div class="dtotal">${d.total_ms ? fmtMs(d.total_ms) : '—'}</div>
       <div class="dbar"><div class="dbar-fill" style="width:${pct}%"></div></div>
     </div>`;
-  }).join('');
+  }).join(''));
   // First paint: scroll the newest day (bottom for oldest-first, top for newest-first)
   // into view. Later re-renders preserve the user's scroll position.
   if (_sidebarFirstRender && !_leftCollapsed) {
@@ -72,6 +72,7 @@ function renderSidebar() {
 
 function selectDate(date) {
   selectedDate = date;
+  saveLS('selectedDate', { date, sessionDate: todayStr(), time: Date.now() });
   loadDay(date);
 }
 
@@ -134,6 +135,7 @@ function stepDay(dir) {
 // a sidebar element — loadDay re-renders the sidebar and highlights the active day.
 function goToDate(date, options) {
   selectedDate = date;
+  saveLS('selectedDate', { date, sessionDate: todayStr(), time: Date.now() });
   hideCalendar();
   loadDay(date, options);
 }
