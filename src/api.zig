@@ -800,6 +800,7 @@ fn state(app: *App, a: std.mem.Allocator) !Response {
         .saved = try query.savedSet(app.store, a),
         .numbers = numbersOf(n),
         .daily_work_minutes = try app.store.dailyWorkMinutes(),
+        .projects_rev = try std.fmt.allocPrint(a, "{d}-{d}-{d}", .{ GetCurrentProcessId(), app.store.incarnation, app.store.projects_rev }),
     });
 }
 
@@ -3612,6 +3613,35 @@ test "day status keeps unknown posting while quoting other days" {
     try std.testing.expectEqualStrings("unposted", listed.days[0].status);
     try std.testing.expectEqualStrings("2026-03-09", listed.days[1].date);
     try std.testing.expectEqualStrings("unknown", listed.days[1].status);
+}
+
+test "projects_rev changes with the project list only" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const Rev = struct { projects_rev: []const u8 };
+    const rev = struct {
+        fn of(fx: *Fixture) ![]const u8 {
+            return (try fx.get(Rev, "/api/state")).projects_rev;
+        }
+    }.of;
+    const start = try rev(&f);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"newest\"}").status);
+    try std.testing.expectEqualStrings(start, try rev(&f));
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"Rev\"}").status);
+    const created = try rev(&f);
+    try std.testing.expect(!std.mem.eql(u8, start, created));
+    const listed = try f.get(struct { projects: []const struct { id: i64, label: []const u8 } }, "/api/projects?archived=1");
+    var id: i64 = 0;
+    for (listed.projects) |p| if (std.mem.eql(u8, p.label, "Rev")) {
+        id = p.id;
+    };
+    const target = try std.fmt.allocPrint(f.arena.allocator(), "/api/projects/{d}", .{id});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, "{\"label\":\"Rev two\"}").status);
+    const renamed = try rev(&f);
+    try std.testing.expect(!std.mem.eql(u8, created, renamed));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, "{\"archived\":true}").status);
+    try std.testing.expect(!std.mem.eql(u8, renamed, try rev(&f)));
 }
 
 test "settings keep the 0.3.0 names and zones come from the system" {

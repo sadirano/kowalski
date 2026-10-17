@@ -164,12 +164,21 @@ fn sqlText(value: anytype) []const u8 {
     return @tagName(value);
 }
 
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+var store_opens: u64 = 0;
+
 pub const Store = struct {
     db: *sqlite.Db,
     allocator: std.mem.Allocator,
     // Finding a named Windows zone walks the registry; every request needs
     // the zone, so the last one found is kept.
     zone_cache: ?struct { id: [128]u8, len: usize, zone: zone.Zone } = null,
+    // Counts writes to the projects table, so a page refetches the list only
+    // after one. It restarts with the process; /api/state pairs it with the pid.
+    projects_rev: u64 = 0,
+    // Tells this store's lifetime apart from earlier ones (a restart, the
+    // tour's store, a reused pid), so a counter that restarted never matches.
+    incarnation: u64 = 0,
 
     fn validProjectLabel(label: []const u8) bool {
         return label.len > 0 and label.len <= 200 and
@@ -200,6 +209,7 @@ pub const Store = struct {
         if (try stmt.step() != .row) return error.Sqlite;
         const id = stmt.columnI64(0);
         if (try stmt.step() != .done) return error.Sqlite;
+        s.projects_rev += 1;
         return id;
     }
 
@@ -223,6 +233,7 @@ pub const Store = struct {
         try stmt.bindI64(2, id);
         _ = try stmt.step();
         try tx.commit();
+        s.projects_rev += 1;
     }
 
     pub fn archiveProject(s: *Store, id: i64, archived: bool, now_ms: i64) Error!void {
@@ -235,6 +246,7 @@ pub const Store = struct {
         try stmt.bindI64(2, id);
         _ = try stmt.step();
         try tx.commit();
+        s.projects_rev += 1;
     }
 
     /// Removes a project. Its tasks, time and capture keys move to `into`;
@@ -271,6 +283,7 @@ pub const Store = struct {
         try drop.bindI64(1, id);
         _ = try drop.step();
         try tx.commit();
+        s.projects_rev += 1;
     }
 
     pub fn setTaskProject(s: *Store, task: i64, project: ?i64, now_ms: i64) Error!void {
@@ -576,7 +589,8 @@ pub const Store = struct {
 
     pub fn init(db: *sqlite.Db, allocator: std.mem.Allocator) Error!Store {
         try schema.ensure(db);
-        return .{ .db = db, .allocator = allocator };
+        const opened = @atomicRmw(u64, &store_opens, .Add, 1, .monotonic);
+        return .{ .db = db, .allocator = allocator, .incarnation = GetTickCount64() *% 1024 +% opened };
     }
 
     fn begin(s: *Store, now_ms: i64, force: bool) !sqlite.Transaction {
@@ -2597,6 +2611,17 @@ test "mutations refuse times outside the supported range" {
     try std.testing.expectError(error.InvalidTime, s.onStart(-1));
     try std.testing.expectError(error.InvalidTime, s.onHeartbeat(max_time_ms));
     try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM meta"));
+}
+
+test "each store lifetime has its own incarnation" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    const first = try Store.init(&db, std.testing.allocator);
+    const second = try Store.init(&db, std.testing.allocator);
+    // Same process, same counter: only the incarnation tells them apart.
+    try std.testing.expectEqual(first.projects_rev, second.projects_rev);
+    try std.testing.expect(first.incarnation != second.incarnation);
 }
 
 test "store refuses a future schema version" {

@@ -2,6 +2,7 @@
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 let projects = [];
 let _projectsLoading = null;
+let _projectsRev = null; // S.projects_rev when the list was last fetched
 
 function projectName(projectId) {
   if (projectId == null) return t('project_unassigned');
@@ -16,8 +17,10 @@ function focusProjectId() {
 
 async function loadProjects() {
   if (_projectsLoading) return _projectsLoading;
+  const rev = S?.projects_rev ?? null;
   _projectsLoading = apiJSON('GET', '/api/projects?archived=1').then(data => {
     projects = data.projects;
+    _projectsRev = rev;
     return projects;
   }).finally(() => { _projectsLoading = null; });
   return _projectsLoading;

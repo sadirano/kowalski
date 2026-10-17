@@ -18,6 +18,16 @@ function setDateTitle(date) {
 
 // Each day load takes a generation; neither response may paint an older day.
 let _dayGen = 0;
+
+// The refresh asks for the project list only after the daemon reports a
+// change; null keeps the list it has.
+// The list and its rev are kept together, and only when the day load that
+// asked for them is used.
+function backgroundProjects() {
+  const rev = S?.projects_rev ?? null;
+  if (rev != null && rev === _projectsRev) return Promise.resolve(null);
+  return apiJSON('GET', '/api/projects?archived=1').then(data => ({ list: data.projects, rev })).catch(() => null);
+}
 let _dayLoads = 0;
 
 async function loadDay(date, { chart = false, background = false } = {}) {
@@ -31,12 +41,12 @@ async function loadDay(date, { chart = false, background = false } = {}) {
       apiJSON('GET', '/api/day?date=' + date),
       // Background results stay local until the editing check below.
       background
-        ? apiJSON('GET', '/api/projects?archived=1').then(data => data.projects).catch(() => null)
+        ? backgroundProjects()
         : loadProjects().catch(() => null),
     ]);
     if (gen !== _dayGen || selectedDate !== date || activeTab !== tab) return;
     if (background && isEditing()) return;
-    if (background && Array.isArray(dayProjects)) projects = dayProjects;
+    if (background && Array.isArray(dayProjects?.list)) { projects = dayProjects.list; _projectsRev = dayProjects.rev; }
     weekData = days;
     D = day;
     setDateTitle(date);
