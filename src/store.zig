@@ -618,7 +618,7 @@ pub const Store = struct {
         if (!try s.hasOpen()) return;
         const last = try s.lastHeartbeat();
         try s.db.exec("DELETE FROM saved_set");
-        try s.db.exec("INSERT INTO saved_set(task_id,role) SELECT task_id,role FROM intervals WHERE end_ms IS NULL");
+        try s.db.exec("INSERT INTO saved_set(task_id,role,project_id) SELECT task_id,role,project_id FROM intervals WHERE end_ms IS NULL");
         var stmt = try s.db.prepare("UPDATE intervals SET end_ms=max(start_ms,coalesce(?1,start_ms)), closed_by='recovered' WHERE end_ms IS NULL");
         defer stmt.finalize();
         if (last) |ms| try stmt.bindI64(1, ms) else try stmt.bindNull(1);
@@ -2759,6 +2759,20 @@ test "recovery from lifecycle events and guarded mutation" {
     try std.testing.expectEqual(@as(i64, 400_300), try testScalar(&db, "SELECT min(end_ms) FROM intervals WHERE opened_by='resume' AND start_ms=400300"));
     try s.@"resume"(500_000);
     try std.testing.expectError(error.NoFocus, s.addNote(null, "late", 1_100_001));
+}
+
+test "a recovered interval resumes in its project" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const project = try s.createProject("Client work", 0);
+    const a = try s.createTask("A", 0);
+    _ = try s.switchToProject(a, null, .{ .selected = project }, 0);
+    try s.onStart(400_000);
+    try std.testing.expectEqual(project, try testScalar(&db, "SELECT project_id FROM saved_set WHERE task_id=1"));
+    try s.@"resume"(400_100);
+    try std.testing.expectEqual(project, try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL AND opened_by='resume'"));
 }
 
 test "guard recovery survives NoFocus" {
