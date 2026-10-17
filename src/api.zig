@@ -3474,6 +3474,36 @@ test "day status keeps unknown posting while quoting other days" {
     try std.testing.expectEqualStrings("unknown", listed.days[1].status);
 }
 
+test "settings keep the 0.3.0 names and zones come from the system" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // Keys renamed or dropped in 0.3.0 are refused, so an old page cannot write them back.
+    for ([_][]const u8{ "ui_autofill_obs", "ui_open_on_launch", "ui_hide_weekends", "ui_chart_engine", "ui_poll_seconds" }) |old| {
+        const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"1\"}}", .{old});
+        try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", body).status);
+    }
+    for ([_][2][]const u8{
+        .{ "post_daily_notes", "1" }, .{ "open_on_launch", "0" }, .{ "ui_show_weekends", "0" },
+        .{ "ui_left_width", "240" },  .{ "ui_reader_width", "480" },
+    }) |kv| {
+        const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"{s}\"}}", .{ kv[0], kv[1] });
+        try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", body).status);
+    }
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_left_width\":\"40\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_reader_width\":\"wide\"}").status);
+
+    const listed = try f.get(struct { zones: []const []const u8 }, "/api/zones");
+    try std.testing.expect(listed.zones.len > 0);
+    var has_utc = false;
+    for (listed.zones) |z| has_utc = has_utc or std.mem.eql(u8, z, "UTC");
+    try std.testing.expect(has_utc);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"reporting_zone\":\"Not A Zone\"}").status);
+    const pick = try std.fmt.allocPrint(a, "{{\"reporting_zone\":\"{s}\"}}", .{listed.zones[listed.zones.len / 2]});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", pick).status);
+}
+
 test "settings validate preferences and paid breaks credit only the pause" {
     var f: Fixture = .{};
     try f.init();
