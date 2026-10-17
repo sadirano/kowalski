@@ -124,7 +124,7 @@ pub const Capture = struct {
     task: ?i64 = null,
     /// The run's task until a `subject` names one (e.g. its repository).
     default_task: ?i64 = null,
-    /// False for a run nobody watches: it never takes the focus.
+    /// False for a run nobody watches; holding sources still take focus.
     attended: bool = true,
     /// A note for the run's open interval: the prompt's text on `prompt`,
     /// what came of the turn on `stop`. Written once per event id.
@@ -906,29 +906,41 @@ pub const Store = struct {
         if (c.kind != .subject) target_task = run.task;
         const project = try s.resolveCaptureProject(c.source, key, c.project_hint, target_task);
         try s.setRunProject(c, project);
+        const holding = try s.isHoldingSource(c.source);
         switch (c.kind) {
-            .start => {},
+            .start => if (holding and run.task != null) {
+                try s.setRun(c, run.task, true, .focus, at + capture_lease_ms);
+                try s.setRole(c, try s.engage(c, run.task, .focus, project, at));
+            },
             .subject => {
                 const task = target_task.?;
                 if (run.task != task) {
                     try s.moveRun(c, run, task, project, at, true);
+                    if (holding and !run.working and run.idle == null) {
+                        try s.setRun(c, task, true, .focus, at + capture_lease_ms);
+                        try s.setRole(c, try s.engage(c, task, .focus, project, at));
+                    }
                 } else if (run.working) {
-                    // In its grace the run moves project when work resumes, not now.
-                    try s.setRole(c, try s.engage(c, task, run.role orelse .parallel, project, at));
+                    try s.setRole(c, try s.engage(c, task, if (holding) .focus else run.role orelse .parallel, project, at));
+                } else if (holding and run.idle == null) {
+                    try s.setRun(c, task, true, .focus, at + capture_lease_ms);
+                    try s.setRole(c, try s.engage(c, task, .focus, project, at));
                 }
             },
             .prompt => {
-                const role: Role = if (c.attended) .focus else .parallel;
+                const role: Role = if (holding or c.attended) .focus else .parallel;
                 try s.setRun(c, run.task, true, role, at + capture_lease_ms);
                 try s.setRole(c, try s.engage(c, run.task, role, project, at));
             },
             .busy => {
                 if (run.working or run.idle != null) {
-                    try s.setRun(c, run.task, true, run.role, at + capture_lease_ms);
-                    try s.setRole(c, try s.engage(c, run.task, run.role orelse .parallel, project, at));
+                    const role: Role = if (holding) .focus else run.role orelse .parallel;
+                    try s.setRun(c, run.task, true, role, at + capture_lease_ms);
+                    try s.setRole(c, try s.engage(c, run.task, role, project, at));
                 } else {
-                    try s.setRun(c, run.task, true, .parallel, at + capture_lease_ms);
-                    _ = try s.engage(c, run.task, .parallel, project, at);
+                    const role: Role = if (holding) .focus else .parallel;
+                    try s.setRun(c, run.task, true, role, at + capture_lease_ms);
+                    try s.setRole(c, try s.engage(c, run.task, role, project, at));
                 }
             },
             .stop => if (run.working) {
@@ -983,7 +995,7 @@ pub const Store = struct {
         try s.setIdle(c, run.idle);
         if (run.working or run.idle != null) {
             try s.releaseTask(c, run.task, at, .@"switch");
-            if (engage_now) try s.setRole(c, try s.engage(c, task, run.role orelse .parallel, project, at));
+            if (engage_now) try s.setRole(c, try s.engage(c, task, if (try s.isHoldingSource(c.source)) .focus else run.role orelse .parallel, project, at));
         }
     }
 
@@ -1084,13 +1096,19 @@ pub const Store = struct {
         _ = try stmt.step();
     }
 
-    /// Whether a working run of a holding source (capture_hold_sources)
+    fn isHoldingSource(s: *Store, source: []const u8) !bool {
+        const list = try s.getSetting("capture_hold_sources") orelse return false;
+        defer s.allocator.free(list);
+        return holdsFocus(list, source);
+    }
+
+    /// Whether an active run of a holding source (capture_hold_sources)
     /// has the focus on another task, so this run's prompt leaves it there.
     fn focusHeld(s: *Store, c: Capture, task: i64) !bool {
         const list = try s.getSetting("capture_hold_sources") orelse return false;
         defer s.allocator.free(list);
         if (holdsFocus(list, c.source)) return false;
-        var stmt = try s.db.prepare("SELECT r.source FROM capture_runs r JOIN intervals i ON i.task_id=r.task_id AND i.end_ms IS NULL AND i.role='focus' WHERE r.working=1 AND r.task_id<>?1");
+        var stmt = try s.db.prepare("SELECT r.source FROM capture_runs r JOIN intervals i ON i.task_id=r.task_id AND i.end_ms IS NULL AND i.role='focus' WHERE (r.working=1 OR r.idle_since_ms IS NOT NULL) AND r.task_id<>?1");
         defer stmt.finalize();
         try stmt.bindI64(1, task);
         while (try stmt.step() == .row) if (holdsFocus(list, stmt.columnText(0).?)) return true;
@@ -1114,6 +1132,7 @@ pub const Store = struct {
     /// had it to parallel when another run still works on it.
     fn engage(s: *Store, c: Capture, task: ?i64, role: Role, project: ?i64, at: i64) !Role {
         const t = task orelse return role;
+        const holding = try s.isHoldingSource(c.source);
         var open_role: ?Role = null;
         var open_id: ?i64 = null;
         var open_project: ?i64 = null;
@@ -1129,6 +1148,12 @@ pub const Store = struct {
                 open_captured = stmt.columnI64(3) != 0;
             }
         }
+        if (holding and open_role == .parallel) {
+            try s.promoteFocusInterval(open_id.?, at);
+            if (open_captured and open_project != project)
+                try s.splitCapturedProject(open_id.?, t, .focus, project, at);
+            return .focus;
+        }
         var focus_task: ?i64 = null;
         var focus_start: i64 = 0;
         {
@@ -1139,7 +1164,7 @@ pub const Store = struct {
                 focus_start = stmt.columnI64(1);
             }
         }
-        if (role == .focus and focus_task == null and open_role == .parallel) {
+        if (!holding and role == .focus and focus_task == null and open_role == .parallel) {
             // The former focus may have closed when its stopped run's grace
             // expired. Its prompts still delimit a stretch already in progress.
             var stmt = try s.db.prepare("SELECT task_id,start_ms FROM intervals WHERE role='focus' AND task_id<>?1 AND end_ms IS NOT NULL AND end_ms<=?2 ORDER BY end_ms DESC,id DESC LIMIT 1");
@@ -1149,8 +1174,8 @@ pub const Store = struct {
             if (try stmt.step() == .row)
                 if (try s.sustainFocus(t, stmt.columnI64(0), stmt.columnI64(1), at)) return .focus;
         }
-        const held = try s.focusHeld(c, t);
-        if (role == .parallel or held or (focus_task != null and focus_task.? != t)) {
+        const held = if (holding) false else try s.focusHeld(c, t);
+        if (!holding and (role == .parallel or held or (focus_task != null and focus_task.? != t))) {
             if (open_role == null) try s.continueOrOpen(t, .parallel, project, at)
             else if (open_role == .parallel and open_captured and open_project != project)
                 try s.splitCapturedProject(open_id.?, t, .parallel, project, at);
@@ -3544,4 +3569,142 @@ test "take focus refuses an empty span and keeps the demoted part's end reason" 
     try db.exec("UPDATE intervals SET end_ms=16000 WHERE task_id=2");
     try s.takeFocus(try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2"), .{ .start_ms = 12_000, .end_ms = 16_000 }, 17_000);
     try testText(&db, "SELECT closed_by FROM intervals WHERE task_id=1 AND role='parallel'", "stop");
+}
+
+test "holding source start takes focus over a working run" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const background = try s.createTask("background", 0);
+    const held = try s.createTask("held", 0);
+    try s.setSetting("capture_hold_sources", "overlay", 0);
+    const agent: Capture = .{ .source = "agent", .run = "a", .kind = .prompt, .default_task = background };
+    _ = try s.capture(agent, 1_000);
+    const holder: Capture = .{ .source = "overlay", .run = "h", .kind = .start, .default_task = held, .attended = false };
+    _ = try s.capture(holder, 2_000);
+    try std.testing.expectEqual(held, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(background, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    var pulse = agent;
+    pulse.kind = .busy;
+    _ = try s.capture(pulse, 3_000);
+    try std.testing.expectEqual(held, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+}
+
+test "holding source keeps focus through subject and busy" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const first = try s.createTask("first", 0);
+    const second = try s.createTask("second", 0);
+    try s.setSetting("capture_hold_sources", "overlay", 0);
+    var holder: Capture = .{ .source = "overlay", .run = "h", .kind = .prompt, .default_task = first, .attended = false };
+    _ = try s.capture(holder, 1_000);
+    holder.kind = .subject;
+    holder.task = second;
+    _ = try s.capture(holder, 2_000);
+    try std.testing.expectEqual(second, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    holder.kind = .busy;
+    holder.task = null;
+    _ = try s.capture(holder, 3_000);
+    _ = try s.capture(holder, 4_000);
+    try std.testing.expectEqual(second, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND role='parallel'"));
+}
+
+test "holding source promotes its open parallel interval" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const background = try s.createTask("background", 0);
+    const held = try s.createTask("held", 0);
+    const agent: Capture = .{ .source = "agent", .run = "a", .kind = .prompt, .default_task = background };
+    _ = try s.capture(agent, 1_000);
+    var holder: Capture = .{ .source = "overlay", .run = "h", .kind = .prompt, .default_task = held, .attended = false };
+    _ = try s.capture(holder, 2_000);
+    const id = try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2 AND end_ms IS NULL AND role='parallel'");
+    try s.setSetting("capture_hold_sources", "overlay", 3_000);
+    holder.kind = .busy;
+    _ = try s.capture(holder, 4_000);
+    try std.testing.expectEqual(id, try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2 AND end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND role='parallel'"));
+    try std.testing.expectEqual(background, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+}
+
+test "holding promotion splits a simultaneous project change" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const background = try s.createTask("background", 0);
+    const held = try s.createTask("held", 0);
+    const agent: Capture = .{ .source = "agent", .run = "a", .kind = .prompt, .default_task = background };
+    _ = try s.capture(agent, 1_000);
+    var holder: Capture = .{ .source = "overlay", .run = "h", .kind = .prompt, .default_task = held, .attended = false, .project_key = "P", .project_hint = "P" };
+    _ = try s.capture(holder, 2_000);
+    const first_id = try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2 AND end_ms IS NULL AND role='parallel'");
+    const first_project = try testScalar(&db, "SELECT project_id FROM intervals WHERE task_id=2 AND end_ms IS NULL");
+    try s.setSetting("capture_hold_sources", "overlay", 3_000);
+    holder.kind = .busy;
+    holder.project_key = "Q";
+    holder.project_hint = "Q";
+    _ = try s.capture(holder, 4_000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND role='focus' AND start_ms=2000 AND end_ms=4000"));
+    try std.testing.expectEqual(first_project, try testScalar(&db, "SELECT project_id FROM intervals WHERE task_id=2 AND end_ms=4000"));
+    const second_id = try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2 AND end_ms IS NULL AND role='focus'");
+    try std.testing.expect(second_id != first_id);
+    try std.testing.expectEqual(@as(i64, 4_000), try testScalar(&db, "SELECT start_ms FROM intervals WHERE task_id=2 AND end_ms IS NULL"));
+    try std.testing.expect(first_project != try testScalar(&db, "SELECT project_id FROM intervals WHERE task_id=2 AND end_ms IS NULL"));
+    try std.testing.expectEqual(first_id, try testScalar(&db, "SELECT posting_span_id FROM intervals WHERE task_id=2 AND end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND role='parallel'"));
+}
+
+test "holding subject defers a project change during idle grace" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("held", 0);
+    var holder: Capture = .{ .source = "overlay", .run = "h", .kind = .prompt, .default_task = task, .attended = false, .project_key = "P", .project_hint = "P" };
+    _ = try s.capture(holder, 1_000);
+    const first_id = try testScalar(&db, "SELECT id FROM intervals WHERE end_ms IS NULL AND role='parallel'");
+    const first_project = try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL");
+    holder.kind = .stop;
+    _ = try s.capture(holder, 2_000);
+    try s.setSetting("capture_hold_sources", "overlay", 2_000);
+    holder.kind = .subject;
+    holder.task = task;
+    holder.project_key = "Q";
+    holder.project_hint = "Q";
+    _ = try s.capture(holder, 3_000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(first_project, try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL"));
+    holder.kind = .busy;
+    holder.task = null;
+    holder.project_key = null;
+    holder.project_hint = null;
+    _ = try s.capture(holder, 4_000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE role='focus' AND end_ms=4000"));
+    try std.testing.expectEqual(first_project, try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms=4000"));
+    try std.testing.expectEqual(@as(i64, 4_000), try testScalar(&db, "SELECT start_ms FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expect(first_project != try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(first_id, try testScalar(&db, "SELECT posting_span_id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+}
+
+test "inactive nonholding busy ignores a stored focus role" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("task", 0);
+    var run: Capture = .{ .source = "agent", .run = "a", .kind = .start, .default_task = task };
+    _ = try s.capture(run, 1_000);
+    try db.exec("UPDATE capture_runs SET role='focus' WHERE source='agent' AND run='a'");
+    run.kind = .busy;
+    _ = try s.capture(run, 2_000);
+    try std.testing.expectEqual(task, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    try testText(&db, "SELECT role FROM capture_runs WHERE source='agent' AND run='a'", "parallel");
 }
