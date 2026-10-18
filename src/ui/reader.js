@@ -203,21 +203,32 @@ function mapRange(rep) {
   _ribbonB = Math.max(_ribbonA + H, rep.start_ms + Math.ceil((e0 - rep.start_ms) / H) * H);
 }
 
+// Other tasks get one of a few muted tints, in order of first appearance, so
+// neighbours read apart without naming them.
+const OTHER_TINTS = 6;
+function otherTints(rep) {
+  const m = new Map();
+  for (const s of readerIntervals(rep).sort((p, q) => p.start_ms - q.start_ms))
+    if (s.task.id !== _readerTask && !m.has(s.task.id)) m.set(s.task.id, m.size % OTHER_TINTS);
+  return m;
+}
+
 // One clickable strip covering [a, b), left to right.
 function stripHtml(rep, a, b) {
   const pos = ms => ((ms - a) / (b - a) * 100).toFixed(3) + '%';
   const size = (x, y) => Math.max((y - x) / (b - a) * 100, 0.2).toFixed(3) + '%';
-  const seg = (s, cls, title) => {
+  // The hover cursor names what is under it, so segments carry no tooltip of their own.
+  const seg = (s, cls) => {
     const x = Math.max(s.start_ms, a), y = Math.min(readerEnd(s), b);
-    return y <= x ? '' : `<div class="rd-seg ${cls}" data-t="${s.task.id}" style="left:${pos(x)};width:${size(x, y)}" title="${escAttr(title)}"></div>`;
+    return y <= x ? '' : `<div class="rd-seg ${cls}" data-t="${s.task.id}" style="left:${pos(x)};width:${size(x, y)}"></div>`;
   };
+  const tint = otherTints(rep);
   const H = 3600000;
   let lines = '';
   for (let h = a + H; h < b; h += H) lines += `<i class="rd-hl" style="left:${pos(h)}"></i>`;
-  const other = s => `${taskLabel(s.task)} ${s.task.title}`;
   return `<div class="rd-strip" data-a="${a}" data-b="${b}" onclick="readerRibbonClick(event,this)" onmousemove="readerHover(event,this)" onmouseleave="readerHoverOut(this)">${lines}`
-    + readerIntervals(rep).filter(s => s.task.id !== _readerTask).map(s => seg(s, s.role === 'focus' ? 'o' : 'o op', other(s))).join('')
-    + readerIntervals(rep).filter(s => s.task.id === _readerTask).map(s => seg(s, s.role === 'focus' ? 'f' : 'p', `${fmtTime(s.start_ms)} - ${fmtTime(readerEnd(s))} ${t(s.role === 'focus' ? 'rd_legend_you' : 'rd_legend_par')}`)).join('')
+    + readerIntervals(rep).filter(s => s.task.id !== _readerTask).map(s => seg(s, `o t${tint.get(s.task.id)}${s.role === 'focus' ? '' : ' op'}`)).join('')
+    + readerIntervals(rep).filter(s => s.task.id === _readerTask).map(s => seg(s, s.role === 'focus' ? 'f' : 'p')).join('')
     + (_readerPin != null && _readerPin >= a && _readerPin < b ? `<div class="rd-pin" style="left:${pos(_readerPin)}"></div>` : '')
     + '</div>';
 }

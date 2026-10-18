@@ -785,7 +785,10 @@
   .rd-hl{position:absolute;background:#ffffff0d}
   .rd-map .rd-hl{top:0;bottom:0;width:1px}
   .rd-seg{position:absolute;border-radius:1px}
-  .rd-seg.o,.rd-sw.o{background:#64748b66}
+  .rd-seg.o{background:#64748b66}
+  .rd-seg.o.t0{background:#8b7cc477}.rd-seg.o.t1{background:#c2876b77}.rd-seg.o.t2{background:#5fa3a877}
+  .rd-seg.o.t3{background:#b5a36a77}.rd-seg.o.t4{background:#c27a9a77}.rd-seg.o.t5{background:#7f93b077}
+  .rd-sw.o{background:linear-gradient(90deg,#8b7cc477 0 33%,#c2876b77 33% 66%,#5fa3a877 66%)}
   .rd-seg.f,.rd-sw.f{background:var(--acc)}
   .rd-seg.op{display:none}
   .rd-map.lit .rd-seg{opacity:.25}
