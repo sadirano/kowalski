@@ -529,6 +529,17 @@ pub fn changedAfterPosting(store: *Store, day: []const u8) !bool {
     return try stmt.step() == .row;
 }
 
+/// Tasks with a posting still in effect or awaiting its outcome that day.
+pub fn postedTasks(store: *Store, a: std.mem.Allocator, day: []const u8) ![]i64 {
+    var stmt = try store.db.prepare("SELECT DISTINCT task_id FROM postings WHERE day=?1 AND state IN ('confirmed','sending','unknown') ORDER BY task_id");
+    defer stmt.finalize();
+    try stmt.bindText(1, day);
+    var ids: std.ArrayList(i64) = .empty;
+    errdefer ids.deinit(a);
+    while (try stmt.step() == .row) try ids.append(a, stmt.columnI64(0));
+    return ids.toOwnedSlice(a);
+}
+
 pub const OpenSpan = struct { start_ms: i64, end_ms: ?i64 };
 
 /// A task's focus intervals, oldest first.

@@ -39,6 +39,8 @@ pub const Error = error{
     /// An open interval's end is "now"; it cannot be set.
     OpenEnd,
     InvalidRange,
+    InvalidSelection,
+    ReviewChanged,
     NotMergeable,
     /// A task with posting history is kept, so the history stays whole.
     TaskHasPostings,
@@ -2232,6 +2234,226 @@ pub const Store = struct {
     /// A stretch of an interval: [from, to).
     pub const Part = struct { from: i64, to: i64 };
 
+    pub const SelectionOp = enum { delete, assign };
+    pub const SelectionSource = struct { id: i64, seen: Span, ranges: []const Part };
+    pub const LostNote = struct { id: i64, at_ms: i64, text: []const u8 };
+    pub const LostText = struct { interval: i64, text: []const u8 };
+    pub const Lost = struct { notes: []const LostNote = &.{}, texts: []const LostText = &.{} };
+    /// The caller owns `pieces` and frees it with the store's allocator.
+    pub const SelectionResult = struct { pieces: []i64, ms: i64 };
+    pub const Source = SelectionSource;
+    pub const Result = SelectionResult;
+
+    const PreparedSelection = struct { id: i64, row: Row, ranges: []Part };
+    const SelectionPiece = struct { start: i64, end: i64, selected: bool, id: i64 = 0 };
+    const SelectedCheck = struct { id: i64, start: i64, end: i64, role: Role };
+
+    fn prepareSelection(s: *Store, source: SelectionSource) Error!PreparedSelection {
+        const row = try s.intervalRow(source.id);
+        errdefer s.freeRow(row);
+        try checkSeen(row, source.seen);
+        const end = row.end_ms orelse return error.OpenEnd;
+        if (source.ranges.len == 0) return error.InvalidSelection;
+        var ranges: std.ArrayList(Part) = .empty;
+        errdefer ranges.deinit(s.allocator);
+        try ranges.appendSlice(s.allocator, source.ranges);
+        std.mem.sort(Part, ranges.items, {}, struct {
+            fn lessThan(_: void, a: Part, b: Part) bool {
+                return a.from < b.from or (a.from == b.from and a.to < b.to);
+            }
+        }.lessThan);
+        var merged: usize = 0;
+        for (ranges.items) |range| {
+            if (range.from >= range.to or range.from < row.start_ms or range.to > end) return error.InvalidRange;
+            if (merged > 0) {
+                const previous = &ranges.items[merged - 1];
+                if (range.from < previous.to) return error.InvalidRange;
+                if (range.from == previous.to) {
+                    previous.to = range.to;
+                    continue;
+                }
+            }
+            ranges.items[merged] = range;
+            merged += 1;
+        }
+        ranges.items.len = merged;
+        return .{ .id = source.id, .row = row, .ranges = try ranges.toOwnedSlice(s.allocator) };
+    }
+
+    fn selectedAt(ranges: []const Part, at: i64, end: i64) bool {
+        for (ranges) |range| {
+            if (range.from <= at and (at < range.to or (at == range.to and range.to == end))) return true;
+        }
+        return false;
+    }
+
+    fn reviewSelectionLoss(s: *Store, sources: []const PreparedSelection, lost: ?Lost) Error!void {
+        const expected = lost orelse Lost{};
+        var notes: std.ArrayList(LostNote) = .empty;
+        defer {
+            for (notes.items) |note| s.allocator.free(note.text);
+            notes.deinit(s.allocator);
+        }
+        var texts: std.ArrayList(LostText) = .empty;
+        defer texts.deinit(s.allocator);
+        for (sources) |source| {
+            const row = source.row;
+            if (selectedAt(source.ranges, row.start_ms, row.end_ms.?)) {
+                if (row.text) |value| try texts.append(s.allocator, .{ .interval = source.id, .text = value });
+            }
+            var stmt = try s.db.prepare("SELECT id,at_ms,text FROM notes WHERE interval_id=?1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, source.id);
+            while (try stmt.step() == .row) {
+                const at = stmt.columnI64(1);
+                if (!selectedAt(source.ranges, at, row.end_ms.?)) continue;
+                const value = try s.allocator.dupe(u8, stmt.columnText(2).?);
+                notes.append(s.allocator, .{ .id = stmt.columnI64(0), .at_ms = at, .text = value }) catch |err| {
+                    s.allocator.free(value);
+                    return err;
+                };
+            }
+        }
+        if (notes.items.len != expected.notes.len or texts.items.len != expected.texts.len) return error.ReviewChanged;
+        for (notes.items) |actual| {
+            var matches: usize = 0;
+            for (expected.notes) |provided| {
+                if (actual.id == provided.id and actual.at_ms == provided.at_ms and std.mem.eql(u8, actual.text, provided.text)) matches += 1;
+            }
+            if (matches != 1) return error.ReviewChanged;
+        }
+        for (texts.items) |actual| {
+            var matches: usize = 0;
+            for (expected.texts) |provided| {
+                if (actual.interval == provided.interval and std.mem.eql(u8, actual.text, provided.text)) matches += 1;
+            }
+            if (matches != 1) return error.ReviewChanged;
+        }
+    }
+
+    fn reshapeSelection(s: *Store, id: i64, task: i64, start: i64, end: i64, closed_by: []const u8) Error!void {
+        var stmt = try s.db.prepare("UPDATE intervals SET task_id=?1,start_ms=?2,end_ms=?3,closed_by=?4 WHERE id=?5");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        try stmt.bindI64(2, start);
+        try stmt.bindI64(3, end);
+        try stmt.bindText(4, closed_by);
+        try stmt.bindI64(5, id);
+        _ = try stmt.step();
+    }
+
+    fn moveSelectionNotes(s: *Store, from_id: i64, piece: SelectionPiece, include_end: bool) Error!void {
+        var stmt = try s.db.prepare("UPDATE notes SET interval_id=?1 WHERE interval_id=?2 AND at_ms>=?3 AND (at_ms<?4 OR (?5=1 AND at_ms=?4))");
+        defer stmt.finalize();
+        try stmt.bindI64(1, piece.id);
+        try stmt.bindI64(2, from_id);
+        try stmt.bindI64(3, piece.start);
+        try stmt.bindI64(4, piece.end);
+        try stmt.bindI64(5, @intFromBool(include_end));
+        _ = try stmt.step();
+    }
+
+    fn checkSelectedFree(s: *Store, dest: i64, piece: SelectedCheck) Error!void {
+        var stmt = try s.db.prepare("SELECT 1 FROM intervals WHERE id<>?1 AND (task_id=?2 OR (?3='focus' AND role='focus')) AND start_ms<?4 AND coalesce(end_ms,?5)>?6 AND coalesce(end_ms,?5)>start_ms LIMIT 1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, piece.id);
+        try stmt.bindI64(2, dest);
+        try stmt.bindText(3, sqlText(piece.role));
+        try stmt.bindI64(4, piece.end);
+        try stmt.bindI64(5, max_time_ms);
+        try stmt.bindI64(6, piece.start);
+        if (try stmt.step() == .row) return error.Overlap;
+    }
+
+    /// Applies one reviewed selection across closed intervals atomically.
+    pub fn applySelection(s: *Store, op: SelectionOp, dest_task: ?i64, sources: []const Source, lost: ?Lost, now_ms: i64) Error!Result {
+        if (sources.len == 0) return error.InvalidSelection;
+        if ((op == .assign and (dest_task == null or lost != null)) or (op == .delete and dest_task != null)) return error.InvalidSelection;
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        if (dest_task) |dest| {
+            var stmt = try s.db.prepare("SELECT 1 FROM tasks WHERE id=?1");
+            defer stmt.finalize();
+            try stmt.bindI64(1, dest);
+            if (try stmt.step() == .done) return error.UnknownTask;
+        }
+        var prepared: std.ArrayList(PreparedSelection) = .empty;
+        defer {
+            for (prepared.items) |source| {
+                s.freeRow(source.row);
+                s.allocator.free(source.ranges);
+            }
+            prepared.deinit(s.allocator);
+        }
+        var total_ms: i64 = 0;
+        for (sources, 0..) |source, i| {
+            for (sources[0..i]) |prior| if (prior.id == source.id) return error.InvalidSelection;
+            const item = try s.prepareSelection(source);
+            prepared.append(s.allocator, item) catch |err| {
+                s.freeRow(item.row);
+                s.allocator.free(item.ranges);
+                return err;
+            };
+            for (item.ranges) |range| total_ms = try std.math.add(i64, total_ms, range.to - range.from);
+        }
+        if (op == .delete) try s.reviewSelectionLoss(prepared.items, lost);
+
+        var result: std.ArrayList(i64) = .empty;
+        defer result.deinit(s.allocator);
+        var checks: std.ArrayList(SelectedCheck) = .empty;
+        defer checks.deinit(s.allocator);
+        for (prepared.items) |source| {
+            const row = source.row;
+            const end = row.end_ms.?;
+            if (op == .assign and row.task == dest_task.?) {
+                try result.append(s.allocator, source.id);
+                for (source.ranges) |range| {
+                    try checks.append(s.allocator, .{ .id = source.id, .start = range.from, .end = range.to, .role = row.role });
+                    try s.markEdited(range.from, range.to, now_ms);
+                }
+                continue;
+            }
+            var pieces: std.ArrayList(SelectionPiece) = .empty;
+            defer pieces.deinit(s.allocator);
+            var at = row.start_ms;
+            for (source.ranges) |range| {
+                if (at < range.from) try pieces.append(s.allocator, .{ .start = at, .end = range.from, .selected = false });
+                try pieces.append(s.allocator, .{ .start = range.from, .end = range.to, .selected = true });
+                at = range.to;
+                try s.markEdited(range.from, range.to, now_ms);
+            }
+            if (at < end) try pieces.append(s.allocator, .{ .start = at, .end = end, .selected = false });
+            for (pieces.items, 0..) |*piece, i| {
+                const last = i + 1 == pieces.items.len;
+                const close = if (last) row.closed_by orelse "stop" else if (op == .delete and !piece.selected) "stop" else "switch";
+                const task = if (op == .assign and piece.selected) dest_task.? else row.task;
+                if (i == 0) {
+                    piece.id = source.id;
+                    try s.reshapeSelection(source.id, task, piece.start, piece.end, close);
+                } else {
+                    piece.id = try s.insertPiece(task, row.role, piece.start, piece.end, close, row.project, row.posting_span, row.captured);
+                }
+                if (piece.selected and op == .assign) {
+                    try result.append(s.allocator, piece.id);
+                    try checks.append(s.allocator, .{ .id = piece.id, .start = piece.start, .end = piece.end, .role = row.role });
+                }
+            }
+            for (pieces.items[1..], 1..) |piece, i| try s.moveSelectionNotes(source.id, piece, i + 1 == pieces.items.len);
+            if (op == .delete) for (pieces.items) |piece| {
+                if (!piece.selected) continue;
+                var stmt = try s.db.prepare("DELETE FROM intervals WHERE id=?1");
+                defer stmt.finalize();
+                try stmt.bindI64(1, piece.id);
+                _ = try stmt.step();
+            };
+        }
+        if (dest_task) |dest| for (checks.items) |piece| try s.checkSelectedFree(dest, piece);
+        const owned = try result.toOwnedSlice(s.allocator);
+        errdefer s.allocator.free(owned);
+        try tx.commit();
+        return .{ .pieces = owned, .ms = total_ms };
+    }
+
     /// Gives a closed interval, or the `part` of it, to another task, with
     /// the notes in that stretch. Moving a part cuts the interval into up to
     /// three pieces (before, moved, after) that keep their times; the other
@@ -3166,6 +3388,173 @@ test "a part of an interval moves to another task, cutting it into pieces" {
     // Moving the start of a piece keeps the row id for the moved part.
     try std.testing.expectEqual(@as(i64, 1), try s.moveInterval(1, .{ .start_ms = o, .end_ms = o + h }, b, .{ .from = o, .to = o + h / 4 }, o + 6 * h));
     try std.testing.expectEqual(b, try testScalar(&db, "SELECT task_id FROM intervals WHERE id=1"));
+}
+
+test "selection deletes a middle range and keeps the boundary note and first text" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("A", 1);
+    const id = try s.switchTo(task, "session", 1_000);
+    try s.pause(5_000);
+    const removed = try s.addNoteAt(id, 2_500, "removed", 6_000);
+    const boundary = try s.addNoteAt(id, 3_000, "boundary", 6_000);
+    const result = try s.applySelection(.delete, null, &.{.{ .id = id, .seen = .{ .start_ms = 1_000, .end_ms = 5_000 }, .ranges = &.{.{ .from = 2_000, .to = 3_000 }} }}, .{ .notes = &.{.{ .id = removed, .at_ms = 2_500, .text = "removed" }} }, 7_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 1_000), result.ms);
+    try std.testing.expectEqual(@as(usize, 0), result.pieces.len);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND start_ms=1000 AND end_ms=2000 AND closed_by='stop' AND text='session'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id<>1 AND start_ms=3000 AND end_ms=5000 AND closed_by='pause' AND text IS NULL"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM notes WHERE text='removed'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM notes n JOIN intervals i ON i.id=n.interval_id WHERE n.text='boundary' AND n.at_ms=3000 AND i.start_ms=3000"));
+    try std.testing.expectEqual(boundary, try testScalar(&db, "SELECT id FROM notes WHERE text='boundary'"));
+}
+
+test "selection deleting the first range requires review of lost session text" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("A", 1);
+    const id = try s.switchTo(task, "session", 1_000);
+    try s.pause(3_000);
+    const sources: []const Store.SelectionSource = &.{.{ .id = id, .seen = .{ .start_ms = 1_000, .end_ms = 3_000 }, .ranges = &.{.{ .from = 1_000, .to = 2_000 }} }};
+    try std.testing.expectError(error.ReviewChanged, s.applySelection(.delete, null, sources, null, 4_000));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND start_ms=1000 AND end_ms=3000 AND text='session'"));
+    const result = try s.applySelection(.delete, null, sources, .{ .texts = &.{.{ .interval = id, .text = "session" }} }, 4_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id<>1 AND start_ms=2000 AND end_ms=3000 AND text IS NULL"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1"));
+}
+
+test "selection deleting a whole interval includes a note at its end" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("A", 1);
+    const id = try s.addInterval(task, .focus, 1_000, 2_000, 2_000);
+    const note = try s.addNoteAt(id, 2_000, "end", 3_000);
+    try std.testing.expectError(error.ReviewChanged, s.applySelection(.delete, null, &.{.{ .id = id, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_000, .to = 2_000 }} }}, null, 4_000));
+    const result = try s.applySelection(.delete, null, &.{.{ .id = id, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_000, .to = 2_000 }} }}, .{ .notes = &.{.{ .id = note, .at_ms = 2_000, .text = "end" }} }, 4_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 1_000), result.ms);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM notes"));
+}
+
+test "selection deletes across tasks atomically when a later source is stale" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 1);
+    const first = try s.addInterval(a, .focus, 1_000, 2_000, 3_000);
+    const second = try s.addInterval(b, .focus, 2_000, 3_000, 3_000);
+    const stale: []const Store.SelectionSource = &.{
+        .{ .id = first, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_000, .to = 2_000 }} },
+        .{ .id = second, .seen = .{ .start_ms = 2_000, .end_ms = 2_999 }, .ranges = &.{.{ .from = 2_000, .to = 3_000 }} },
+    };
+    try std.testing.expectError(error.Stale, s.applySelection(.delete, null, stale, null, 4_000));
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND start_ms=1000 AND end_ms=2000"));
+    const valid: []const Store.SelectionSource = &.{ stale[0], .{ .id = second, .seen = .{ .start_ms = 2_000, .end_ms = 3_000 }, .ranges = &.{.{ .from = 2_000, .to = 3_000 }} } };
+    const result = try s.applySelection(.delete, null, valid, null, 4_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 2_000), result.ms);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals"));
+}
+
+test "selection assigns ranges from two tasks and preserves notes and projects" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 1);
+    const c = try s.createTask("C", 1);
+    const project_a = try s.createProject("One", 1);
+    const project_b = try s.createProject("Two", 1);
+    const first = try s.addIntervalProject(a, .focus, 1_000, 2_000, .{ .selected = project_a }, 3_000);
+    const second = try s.addIntervalProject(b, .focus, 2_000, 3_000, .{ .selected = project_b }, 3_000);
+    _ = try s.addNoteAt(first, 1_500, "A note", 4_000);
+    _ = try s.addNoteAt(second, 2_000, "B note", 4_000);
+    const result = try s.applySelection(.assign, c, &.{
+        .{ .id = first, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_500, .to = 2_000 }} },
+        .{ .id = second, .seen = .{ .start_ms = 2_000, .end_ms = 3_000 }, .ranges = &.{.{ .from = 2_000, .to = 2_500 }} },
+    }, null, 5_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 1_000), result.ms);
+    try std.testing.expectEqual(@as(usize, 2), result.pieces.len);
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals i JOIN notes n ON n.interval_id=i.id WHERE i.task_id=3 AND i.project_id=1 AND n.at_ms=1500 AND n.text='A note'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals i JOIN notes n ON n.interval_id=i.id WHERE i.task_id=3 AND i.project_id=2 AND n.at_ms=2000 AND n.text='B note'"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND start_ms=1000 AND end_ms=1500"));
+}
+
+test "selection rejects colliding incoming focus and parallel pieces atomically" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 1);
+    const c = try s.createTask("C", 1);
+    const first = try s.addInterval(a, .focus, 1_000, 2_000, 3_000);
+    const second = try s.addInterval(b, .parallel, 1_000, 2_000, 3_000);
+    try std.testing.expectError(error.Overlap, s.applySelection(.assign, c, &.{
+        .{ .id = first, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_000, .to = 1_500 }} },
+        .{ .id = second, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_000, .to = 1_500 }} },
+    }, null, 4_000));
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM day_edits WHERE edited_ms=4000"));
+}
+
+test "selection leaves an existing destination source whole while moving another" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const c = try s.createTask("C", 1);
+    const existing = try s.addInterval(c, .focus, 1_000, 2_000, 3_000);
+    const incoming = try s.addInterval(a, .focus, 2_000, 3_000, 3_000);
+    const result = try s.applySelection(.assign, c, &.{
+        .{ .id = existing, .seen = .{ .start_ms = 1_000, .end_ms = 2_000 }, .ranges = &.{.{ .from = 1_200, .to = 1_800 }} },
+        .{ .id = incoming, .seen = .{ .start_ms = 2_000, .end_ms = 3_000 }, .ranges = &.{.{ .from = 2_200, .to = 2_800 }} },
+    }, null, 4_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 1_200), result.ms);
+    try std.testing.expectEqual(@as(usize, 2), result.pieces.len);
+    try std.testing.expectEqual(existing, result.pieces[0]);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND task_id=2 AND start_ms=1000 AND end_ms=2000"));
+    try std.testing.expectEqual(@as(i64, 4), try testScalar(&db, "SELECT count(*) FROM intervals"));
+}
+
+test "selection keeps session text on the first piece for both assignment positions" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const a = try s.createTask("A", 1);
+    const b = try s.createTask("B", 1);
+    const c = try s.createTask("C", 1);
+    const first = try s.switchTo(a, "first text", 1_000);
+    try s.pause(3_000);
+    const second = try s.switchTo(b, "second text", 4_000);
+    try s.pause(6_000);
+    const result = try s.applySelection(.assign, c, &.{
+        .{ .id = first, .seen = .{ .start_ms = 1_000, .end_ms = 3_000 }, .ranges = &.{.{ .from = 1_000, .to = 1_500 }} },
+        .{ .id = second, .seen = .{ .start_ms = 4_000, .end_ms = 6_000 }, .ranges = &.{.{ .from = 5_000, .to = 5_500 }} },
+    }, null, 7_000);
+    defer s.allocator.free(result.pieces);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE id=1 AND task_id=3 AND start_ms=1000 AND end_ms=1500 AND text='first text'"));
+    var query_buf: [160]u8 = undefined;
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, try std.fmt.bufPrint(&query_buf, "SELECT count(*) FROM intervals WHERE id={d} AND task_id=2 AND start_ms=4000 AND end_ms=5000 AND text='second text'", .{second})));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=3 AND text='second text'"));
 }
 
 test "a task is deleted with its time, unless it is open or was posted" {

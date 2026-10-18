@@ -160,8 +160,8 @@ fn errorResponse(a: std.mem.Allocator, err: anyerror) Response {
     if (err == error.TaskBound) return fail(a, .{ .status = .conflict, .code = "TaskBound", .message = "title comes from the provider" });
     const status: std.http.Status = switch (err) {
         error.UnknownTask, error.UnknownInterval, error.UnknownNote, error.UnknownProject => .not_found,
-        error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen, error.DuplicateProject, error.AmbiguousTask => .conflict,
-        error.InvalidRange => .bad_request,
+        error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen, error.DuplicateProject, error.AmbiguousTask, error.ReviewChanged => .conflict,
+        error.InvalidRange, error.InvalidSelection => .bad_request,
         error.NoFocus, error.NoOpenInterval, error.AlreadyOpen, error.SomethingOpen, error.BindingConflict, error.PostingBlocked, error.PostingInFlight, error.InvalidState, error.NoProvider, error.NotBound, error.NothingToPost, error.SessionOpen => .conflict,
         error.UnknownPosting => .not_found,
         error.ProviderOutput => .bad_gateway,
@@ -853,6 +853,7 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
         .lunch_back_ms = if (lunches.len > 0 and !(lunch_open and lunches[lunches.len - 1].end_ms >= app.clock())) lunches[lunches.len - 1].end_ms else null,
         .last_end_ms = last_end,
         .changed_after_posting = try query.changedAfterPosting(app.store, date.text),
+        .posted_tasks = try query.postedTasks(app.store, a, date.text),
     });
 }
 
@@ -1428,6 +1429,29 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         const body = try parseBody(struct { first: Side, second: Side }, a, req.body) orelse return badRequest(a, "body");
         try app.store.mergeIntervals(body.first.id, .{ .start_ms = body.first.start_ms, .end_ms = body.first.end_ms }, body.second.id, .{ .start_ms = body.second.start_ms, .end_ms = body.second.end_ms }, app.clock());
         return send(a, .ok, .{ .interval = body.first.id });
+    }
+    if (is(req, .POST, path, "/api/intervals/selection")) {
+        const SourceBody = struct { id: i64, seen: SeenBody, ranges: []const [2]i64 };
+        const body = try parseBody(struct {
+            op: Store.SelectionOp,
+            task: ?i64 = null,
+            sources: []const SourceBody,
+            lost: ?Store.Lost = null,
+        }, a, req.body) orelse return badRequest(a, "body");
+        const raw = try parseBody(std.json.Value, a, req.body) orelse return badRequest(a, "body");
+        if (raw != .object) return badRequest(a, "body");
+        const has_task = raw.object.get("task") != null;
+        const has_lost = raw.object.get("lost") != null;
+        if ((body.op == .assign and (!has_task or has_lost)) or (body.op == .delete and has_task)) return badRequest(a, "body");
+        const sources = try a.alloc(Store.SelectionSource, body.sources.len);
+        for (body.sources, sources) |source, *target| {
+            const ranges = try a.alloc(Store.Part, source.ranges.len);
+            for (source.ranges, ranges) |range, *part| part.* = .{ .from = range[0], .to = range[1] };
+            target.* = .{ .id = source.id, .seen = seenOf(source.seen), .ranges = ranges };
+        }
+        const result = try app.store.applySelection(body.op, body.task, sources, body.lost, app.clock());
+        defer app.store.allocator.free(result.pieces);
+        return send(a, .ok, .{ .op = body.op, .pieces = result.pieces, .ms = result.ms });
     }
     if (req.method == .POST) if (idBetween(path, "/api/tasks/", "/delete")) |id| {
         try app.store.deleteTask(id, app.clock());
@@ -3297,6 +3321,56 @@ test "history merges and deletes closed intervals" {
     const empty = try f.get(Day, "/api/day?date=2026-03-10");
     try std.testing.expectEqual(@as(i64, 0), empty.numbers.total_ms);
     try std.testing.expectEqual(@as(usize, 0), empty.intervals.len);
+}
+
+test "selection API assigns and deletes ranges and day lists posted tasks" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_129_600_000;
+    test_now = start + 4 * 3_600_000;
+    const task_a = try f.store.createTask("A", test_now);
+    const task_b = try f.store.createTask("B", test_now);
+    const task_c = try f.store.createTask("C", test_now);
+    const first = try f.store.addInterval(task_a, .focus, start, start + 3_600_000, test_now);
+    const second = try f.store.addInterval(task_b, .focus, start + 2 * 3_600_000, start + 3 * 3_600_000, test_now);
+    const SourceBody = struct { id: i64, seen: SeenBody, ranges: []const [2]i64 };
+    const ResultBody = struct { op: []const u8, pieces: []i64, ms: i64 };
+    const assign_body = try std.json.Stringify.valueAlloc(a, .{
+        .op = "assign",
+        .task = task_c,
+        .sources = &[_]SourceBody{.{ .id = first, .seen = .{ .start_ms = start, .end_ms = start + 3_600_000 }, .ranges = &[_][2]i64{.{ start + 900_000, start + 1_800_000 }} }},
+    }, .{});
+    const assign_response = f.call(.POST, "/api/intervals/selection", assign_body);
+    try std.testing.expectEqual(std.http.Status.ok, assign_response.status);
+    const assigned = try std.json.parseFromSliceLeaky(ResultBody, a, assign_response.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("assign", assigned.op);
+    try std.testing.expectEqual(@as(i64, 900_000), assigned.ms);
+    try std.testing.expectEqual(@as(usize, 1), assigned.pieces.len);
+    try std.testing.expectEqual(task_c, try historyScalar(&f.db, try std.fmt.allocPrint(a, "SELECT task_id FROM intervals WHERE id={d}", .{assigned.pieces[0]})));
+    const delete_body = try std.json.Stringify.valueAlloc(a, .{
+        .op = "delete",
+        .sources = &[_]SourceBody{.{ .id = second, .seen = .{ .start_ms = start + 2 * 3_600_000, .end_ms = start + 3 * 3_600_000 }, .ranges = &[_][2]i64{.{ start + 2 * 3_600_000 + 900_000, start + 2 * 3_600_000 + 1_800_000 }} }},
+    }, .{});
+    const delete_response = f.call(.POST, "/api/intervals/selection", delete_body);
+    try std.testing.expectEqual(std.http.Status.ok, delete_response.status);
+    const deleted = try std.json.parseFromSliceLeaky(ResultBody, a, delete_response.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("delete", deleted.op);
+    try std.testing.expectEqual(@as(i64, 900_000), deleted.ms);
+    try std.testing.expectEqual(@as(usize, 0), deleted.pieces.len);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, try std.fmt.allocPrint(a, "SELECT count(*) FROM intervals WHERE task_id={d} AND start_ms<{d} AND end_ms>{d}", .{ task_b, start + 2 * 3_600_000 + 1_800_000, start + 2 * 3_600_000 + 900_000 })));
+    try f.db.exec(try std.fmt.allocPrint(
+        a,
+        "INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms) VALUES" ++
+            "('2026-03-10',{d},'fake','a','confirmed','1',1000000,{d},{d})," ++
+            "('2026-03-10',{d},'fake','c','confirmed','1',1000000,{d},{d})," ++
+            "('2026-03-10',{d},'fake','c2','unknown','1',1000000,{d},NULL)," ++
+            "('2026-03-10',{d},'fake','b','cancelled','1',1000000,{d},NULL)",
+        .{ task_a, test_now, test_now, task_c, test_now, test_now, task_c, test_now, task_b, test_now },
+    ));
+    const viewed = try f.get(struct { posted_tasks: []i64 }, "/api/day?date=2026-03-10");
+    try std.testing.expectEqualSlices(i64, &.{ task_a, task_c }, viewed.posted_tasks);
 }
 
 test "timed notes can be added moved edited and deleted" {
