@@ -362,6 +362,30 @@ kowalski post 2026-10-07 48213
 
 A task is `#<id>`, an external ref, or a title.
 
+### Project keys for launchers
+
+A launcher (a shell alias, an editor task, a directory tool) can name the
+project by a stable key of its own instead of an id:
+
+```
+kowalski track --project-key repo:gaze --project-hint gaze "fix login"
+kowalski day --project-key repo:gaze
+kowalski project bind #4 --key repo:gaze-old
+```
+
+The key is opaque. One key names one project, whichever source sent it, so
+a launcher and an agent capture hook that use the same key share the
+project. A write with an unknown key makes the project from the hint (or
+reuses an unclaimed project of that name); a read with an unknown key is an
+error, never a new project. `project bind` points a key at a project, for
+example after a rename.
+
+### For agents
+
+`kowalski --agent [<command>]` describes each command for an agent: whether
+it only reads, writes the live tracker (and what else it closes), sends
+something outside, or runs the daemon. `--json` gives the same as data.
+
 ## Making these screenshots
 
 The screenshots come from `kowalski demo`, which fills an empty database

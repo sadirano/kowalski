@@ -333,8 +333,8 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         }
     }
     if (is(req, .POST, path, "/api/tasks")) {
-        const body = try parseBody(struct { title: []const u8, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
-        const id = try app.store.createTaskWithProject(std.mem.trim(u8, body.title, " \t"), try projectChoice(a, req.body), app.clock());
+        const body = try parseBody(struct { title: []const u8, project_id: ?i64 = null, project_key: ?[]const u8 = null, project_hint: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
+        const id = try app.store.createTaskWithProject(std.mem.trim(u8, body.title, " \t"), try keyChoice(app, a, req.body), app.clock());
         return send(a, .created, .{ .task = (try query.task(app.store, a, id)).? });
     }
     if (is(req, .POST, path, "/api/capture")) {
@@ -396,8 +396,8 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         };
     }
     if (is(req, .POST, path, "/api/switch") or is(req, .POST, path, "/api/parallel")) {
-        const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
-        const choice = try projectChoice(a, req.body);
+        const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null, project_id: ?i64 = null, project_key: ?[]const u8 = null, project_hint: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
+        const choice = try keyChoice(app, a, req.body);
         const scope = try choiceScope(app, choice);
         var created = false;
         const id = switch (try query.resolve(app.store, a, body.task, scope)) {
@@ -519,9 +519,10 @@ fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8
     if (is(req, .PATCH, path, "/api/project-keys")) {
         const body = try parseBody(struct { source: ?[]const u8 = null, project_key: []const u8, project_id: i64 }, a, req.body) orelse return badRequest(a, "body");
         if (body.project_id <= 0) return badRequest(a, "project_id");
-        // Without a source, every source's mapping of the key moves together.
+        // Without a source, every source's mapping of the key moves together;
+        // a key nobody sent yet is bound for the CLI.
         const source = body.source orelse {
-            try app.store.setKeyProject(body.project_key, body.project_id, app.clock());
+            try app.store.bindKey(key_source, body.project_key, body.project_id, app.clock());
             return send(a, .ok, .{ .keys = try query.captureProjectKeys(app.store, a) });
         };
         var hint: ?[]const u8 = null;
@@ -642,6 +643,25 @@ fn projectChoice(a: std.mem.Allocator, body: []const u8) !store_mod.ProjectChoic
         .integer => |id| if (id > 0) .{ .selected = id } else error.InvalidProjectLabel,
         else => error.InvalidProjectLabel,
     };
+}
+
+/// The source the CLI and other launchers map their project keys under.
+const key_source = "cli";
+
+/// `project_key` (with an optional `project_hint`) names a project the way
+/// capture does, made on first sight; otherwise `project_id` as usual.
+fn keyChoice(app: *App, a: std.mem.Allocator, body: []const u8) !store_mod.ProjectChoice {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return error.InvalidProjectLabel;
+    if (value != .object) return error.InvalidProjectLabel;
+    const raw = value.object.get("project_key") orelse return projectChoice(a, body);
+    if (raw == .null) return projectChoice(a, body);
+    if (raw != .string or value.object.get("project_id") != null) return error.InvalidProjectKey;
+    const hint = if (value.object.get("project_hint")) |h| switch (h) {
+        .string => |text| text,
+        .null => raw.string,
+        else => return error.InvalidProjectLabel,
+    } else raw.string;
+    return .{ .selected = try app.store.projectForKey(key_source, raw.string, hint, app.clock()) };
 }
 
 fn focusProject(app: *App) !?i64 {
@@ -2430,6 +2450,34 @@ fn apiScalar(db: *sqlite.Db, sql: []const u8) !i64 {
     defer stmt.finalize();
     try std.testing.expectEqual(.row, try stmt.step());
     return stmt.columnI64(0);
+}
+
+test "a project key on switch and new finds the project capture made for it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"nix:gaze\",\"project_hint\":\"gaze\"}").status);
+    const project = try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='nix:gaze'");
+    const r = f.call(.POST, "/api/switch", "{\"task\":\"Fix login\",\"project_key\":\"nix:gaze\",\"project_hint\":\"gaze\"}");
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    try std.testing.expect(contains(r.body, try std.fmt.allocPrint(f.arena.allocator(), "\"project_id\":{d}", .{project})));
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"Later\",\"project_key\":\"nix:gaze\"}").status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id=(SELECT project_id FROM capture_project_keys WHERE source='agent')"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys"));
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/switch", "{\"task\":\"X\",\"project_key\":\"nix:gaze\",\"project_id\":1}").status);
+}
+
+test "a new project key makes its project from the hint, and bind points a key at one" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Setup\",\"project_key\":\"nix:newrepo\",\"project_hint\":\"newrepo\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects WHERE label='newrepo'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"project_key\":\"nix:renamed\",\"project_id\":1}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"More\",\"project_key\":\"nix:renamed\",\"project_hint\":\"renamed\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id=1"));
 }
 
 test "manual focus keeps its project when capture maps the same task elsewhere" {

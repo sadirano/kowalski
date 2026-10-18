@@ -474,6 +474,33 @@ pub const Store = struct {
         }
     }
 
+    /// The project a key names, made from the hint on first sight, exactly
+    /// as capture resolves one: a key another source knows keeps its project.
+    pub fn projectForKey(s: *Store, source: []const u8, key: []const u8, hint: []const u8, now_ms: i64) Error!i64 {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        const id = (try s.resolveCaptureProject(source, key, hint, null)).?;
+        try tx.commit();
+        return id;
+    }
+
+    /// Points every source's mapping of a key at a project; a key no source
+    /// knows yet is mapped for `source`.
+    pub fn bindKey(s: *Store, source: []const u8, key: []const u8, project: i64, now_ms: i64) Error!void {
+        if (key.len == 0 or key.len > 2048) return error.InvalidProjectKey;
+        var known = try s.db.prepare("SELECT 1 FROM capture_project_keys WHERE project_key=?1 LIMIT 1");
+        defer known.finalize();
+        try known.bindText(1, key);
+        if (try known.step() == .row) return s.setKeyProject(key, project, now_ms);
+        var stmt = try s.db.prepare("SELECT label FROM projects WHERE id=?1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, project);
+        if (try stmt.step() != .row) return error.UnknownProject;
+        const label = try s.allocator.dupe(u8, stmt.columnText(0).?);
+        defer s.allocator.free(label);
+        return s.setCaptureProjectKey(source, key, label, project, now_ms);
+    }
+
     fn resolveCaptureProject(s: *Store, source: []const u8, key: ?[]const u8, hint: ?[]const u8, task: ?i64) !?i64 {
         if (key) |k| {
             if (k.len == 0 or k.len > 2048) return error.InvalidProjectKey;

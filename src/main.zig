@@ -14,6 +14,7 @@ const update_guard = @import("update_guard.zig");
 const doctor = @import("doctor.zig");
 
 test { _ = @import("kowalskiw.zig"); }
+test { _ = @import("agent.zig"); }
 test { _ = @import("update.zig"); }
 test { _ = @import("update_journal.zig"); }
 test { _ = @import("update_lock.zig"); }
@@ -45,6 +46,7 @@ fn run(init: std.process.Init) !u8 {
 
     var db_path: ?[]const u8 = null;
     var json = false;
+    var agent = false;
     var words: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < all.len) : (i += 1) {
@@ -55,6 +57,8 @@ fn run(init: std.process.Init) !u8 {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json = true;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            agent = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             try std.Io.File.stdout().writeStreamingAll(init.io, "kowalski " ++ @import("build_options").version ++ "\n");
             return 0;
@@ -62,6 +66,19 @@ fn run(init: std.process.Init) !u8 {
             try std.Io.File.stdout().writeStreamingAll(init.io, cli.usage);
             return 0;
         } else try words.append(a, arg);
+    }
+    if (agent) {
+        const spec = @import("agent.zig");
+        const name = if (words.items.len == 0) null else try std.mem.join(a, " ", words.items);
+        const only = if (name) |n| spec.find(n) orelse {
+            std.debug.print("kowalski: no command named {s}\n", .{n});
+            return 2;
+        } else null;
+        var out: std.Io.Writer.Allocating = .init(a);
+        if (json) try spec.writeJson(&out.writer, only) else try spec.writeText(&out.writer, only);
+        if (json) try out.writer.writeAll("\n");
+        try std.Io.File.stdout().writeStreamingAll(init.io, out.written());
+        return 0;
     }
     const command = if (words.items.len > 0) words.items[0] else "status";
     const args = if (words.items.len > 0) words.items[1..] else words.items;

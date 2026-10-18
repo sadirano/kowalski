@@ -32,9 +32,9 @@ pub const usage =
     \\  open                         start the daemon if needed and open the dashboard
     \\  doctor [--fix] [--json]      diagnose launch; repair only with --fix
     \\  autostart [on|off]           start the daemon at logon, or show the setting
-    \\  status                       focus, parallel work and today's numbers
-    \\  switch|track [--project <#id|unassigned>] <task> [-m <text>]
-    \\  parallel [--project <#id|unassigned>] <task> [-m <text>]
+    \\  status [--project-key <key>]  focus, parallel work and today's numbers
+    \\  switch|track [--project <#id|unassigned> | --project-key <key> [--project-hint <h>]] <task> [-m <text>]
+    \\  parallel [--project <#id|unassigned> | --project-key <key> [--project-hint <h>]] <task> [-m <text>]
     \\  stop <task>                  close a task's open interval
     \\  pause | resume               save and close everything open, or bring it back
     \\  note [-t <task>] <text>      note on the focus, or on the named task
@@ -42,18 +42,19 @@ pub const usage =
     \\          [--default <task>] [--project-key <key>] [--project-hint <hint>]
     \\          [--first-prompt <text>] [--unattended]
     \\                               record an outside run (start|subject|prompt|busy|stop|end)
-    \\  tasks [<filter>]             tasks by recent use
-    \\  new <title>                  create a task without opening it
+    \\  tasks [<filter>] [--project-key <key>]  tasks by recent use
+    \\  new [--project-key <key> [--project-hint <h>]] <title>  create a task without opening it
     \\  rename <#id> <title>         change a task's title
     \\  project list [--all]         list projects
     \\  project add <label>          add a project
     \\  project rename <#id> <label> rename a project
     \\  project archive <#id> [--undo]  archive or unarchive
+    \\  project bind <#id> --key <key>  point a project key at a project
     \\  project assign <#id|unassigned> --task <#id> [--apply <hash>]
     \\  project assign <#id|unassigned> --interval <#id>... [--apply <hash>]
     \\  project assign <#id|unassigned> --suggest [--apply <hash>]
     \\  delete <#id>                 delete a task and its time (not while running or posted)
-    \\  day [<YYYY-MM-DD>]           totals, hops, timeline and summary
+    \\  day [<YYYY-MM-DD>] [--project-key <key>]  totals, hops, timeline and summary
     \\  summary [<YYYY-MM-DD>] [<text>]  show or set a day's summary ("" clears)
     \\  settings | set <key> <value> | unset <key>
     \\  provider                     provider status and fields
@@ -159,7 +160,7 @@ fn callUnchecked(ctx: *Context, method: []const u8, target: []const u8, body: ?[
     return .{ .status = code, .body = raw[head_end + 4 ..] };
 }
 
-const Task = struct { id: i64, title: []const u8, ref: ?[]const u8 = null };
+const Task = struct { id: i64, title: []const u8, ref: ?[]const u8 = null, project_id: ?i64 = null };
 const Note = struct { at_ms: i64, text: []const u8 };
 const Interval = struct {
     task: Task,
@@ -293,6 +294,60 @@ fn hashId(text: []const u8) !i64 {
     const id = std.fmt.parseInt(i64, text[1..], 10) catch return error.Usage;
     if (id <= 0) return error.Usage;
     return id;
+}
+
+/// Adds a project key and its hint to a request body.
+fn putKey(ctx: *Context, body: *std.json.ObjectMap, key: ?[]const u8, hint: ?[]const u8) !void {
+    const k = key orelse return;
+    try body.put(ctx.a, "project_key", .{ .string = k });
+    if (hint) |h| try body.put(ctx.a, "project_hint", .{ .string = h });
+}
+
+/// The one project a key names. A read never creates one.
+fn keyProject(ctx: *Context, key: []const u8) !i64 {
+    const reply = try call(ctx, "GET", "/api/project-keys", null);
+    if (reply.status < 200 or reply.status >= 300) {
+        _ = try settle(ctx, reply);
+        return error.Reported;
+    }
+    const r = try parse(struct { keys: []struct { project_key: []const u8, project_id: i64 } }, ctx, reply.body);
+    var found: ?i64 = null;
+    for (r.keys) |k| if (std.mem.eql(u8, k.project_key, key)) {
+        if (found != null and found.? != k.project_id) {
+            try asciiLine(ctx.err, try std.fmt.allocPrint(ctx.a, "kowalski: key {s} names several projects; pick one with: kowalski project bind <#id> --key {s}", .{ key, key }));
+            return error.Reported;
+        }
+        found = k.project_id;
+    };
+    return found orelse {
+        try asciiLine(ctx.err, try std.fmt.allocPrint(ctx.a, "kowalski: no project has key {s} yet (track or new with the key makes one)", .{key}));
+        return error.Reported;
+    };
+}
+
+/// One project's share of a day: its focus total and its tasks.
+fn renderProjectDay(ctx: *Context, body: []const u8, project: i64) !void {
+    const r = try parse(struct {
+        date: []const u8,
+        tasks: []struct { task: Task, focus_ms: i64 },
+        project_totals: []struct { project_id: ?i64 = null, label: ?[]const u8 = null, focus_ms: i64 },
+    }, ctx, body);
+    var total: i64 = 0;
+    var label: ?[]const u8 = null;
+    for (r.project_totals) |p| if (p.project_id == project) {
+        total = p.focus_ms;
+        label = p.label;
+    };
+    try ctx.out.print("{s}  #{d} {s}  ", .{ r.date, project, label orelse "" });
+    try duration(ctx.out, total);
+    try ctx.out.writeAll("\n");
+    for (r.tasks) |t| if (t.task.project_id == project and t.focus_ms > 0) {
+        try ctx.out.writeAll("  ");
+        try duration(ctx.out, t.focus_ms);
+        try ctx.out.writeAll("  ");
+        try writeTask(ctx.out, t.task);
+        try ctx.out.writeAll("\n");
+    };
 }
 
 fn projectId(text: []const u8) !?i64 {
@@ -486,6 +541,16 @@ fn dispatch(ctx: *Context, command: []const u8, args: []const []const u8) !Exit 
 fn projectCommand(ctx: *Context, args: []const []const u8) !Exit {
     if (args.len == 0) return error.Usage;
     const eql = std.mem.eql;
+    if (eql(u8, args[0], "bind")) {
+        const o = try options(ctx, args[1..], &.{"--key"});
+        if (o.words.len != 1) return error.Usage;
+        const key = o.values[0] orelse return error.Usage;
+        const id = try hashId(o.words[0]);
+        const reply = try call(ctx, "PATCH", "/api/project-keys", try jsonBody(ctx, .{ .project_key = key, .project_id = id }));
+        if (!try settle(ctx, reply)) return .ok;
+        try ctx.out.print("bound     {s} -> #{d}\n", .{ key, id });
+        return .ok;
+    }
     if (eql(u8, args[0], "list")) {
         if (args.len > 2 or (args.len == 2 and !eql(u8, args[1], "--all"))) return error.Usage;
         const reply = try call(ctx, "GET", if (args.len == 2) "/api/projects?archived=1" else "/api/projects", null);
@@ -599,12 +664,21 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
     const eql = std.mem.eql;
     if (eql(u8, command, "project")) return projectCommand(ctx, args);
     if (eql(u8, command, "status")) {
-        if (args.len != 0) return error.Usage;
-        return status(ctx);
+        const o = try options(ctx, args, &.{"--project-key"});
+        if (o.words.len != 0) return error.Usage;
+        const key = o.values[0] orelse return status(ctx);
+        const project = try keyProject(ctx, key);
+        const s = try fetchState(ctx);
+        try renderState(ctx, s);
+        const where = if (s.focus) |f| (if (f.task.project_id == project) "the focus is in this project" else "the focus is in another project") else "nothing is focused";
+        try ctx.out.print("project   #{d}: {s}\n", .{ project, where });
+        return .ok;
     }
     if (eql(u8, command, "switch") or eql(u8, command, "track") or eql(u8, command, "parallel")) {
-        const o = try options(ctx, args, &.{ "-m", "--text", "--project" });
+        const o = try options(ctx, args, &.{ "-m", "--text", "--project", "--project-key", "--project-hint" });
         if (o.words.len == 0) return error.Usage;
+        if (o.values[2] != null and o.values[3] != null) return error.Usage;
+        if (o.values[4] != null and o.values[3] == null) return error.Usage;
         const text = o.values[0] orelse o.values[1];
         const target = if (eql(u8, command, "parallel")) "/api/parallel" else "/api/switch";
         var body: std.json.ObjectMap = .empty;
@@ -614,6 +688,7 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
             const id = try projectId(raw);
             try body.put(ctx.a, "project_id", if (id) |value| .{ .integer = value } else .null);
         }
+        try putKey(ctx, &body, o.values[3], o.values[4]);
         const reply = try call(ctx, "POST", target, try jsonBody(ctx, std.json.Value{ .object = body }));
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { task: Task, created: bool }, ctx, reply.body);
@@ -672,12 +747,18 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "tasks")) {
-        const target = if (args.len == 0) "/api/tasks?limit=40" else try std.fmt.allocPrint(ctx.a, "/api/tasks?limit=200&q={s}", .{try pathEscape(ctx, try joined(ctx, args))});
+        const o = try options(ctx, args, &.{"--project-key"});
+        const project = if (o.values[0]) |key| try keyProject(ctx, key) else null;
+        const target = if (o.words.len == 0 and project == null) "/api/tasks?limit=40" else if (o.words.len == 0) "/api/tasks?limit=1000" else try std.fmt.allocPrint(ctx.a, "/api/tasks?limit=200&q={s}", .{try pathEscape(ctx, try joined(ctx, o.words))});
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
-        const r = try parse(struct { tasks: []struct { id: i64, title: []const u8, ref: ?[]const u8 = null, last_ms: ?i64 = null } }, ctx, reply.body);
+        const r = try parse(struct { tasks: []struct { id: i64, title: []const u8, ref: ?[]const u8 = null, project_id: ?i64 = null, last_ms: ?i64 = null } }, ctx, reply.body);
         const z = try currentZone(ctx);
+        var shown: usize = 0;
         for (r.tasks) |t| {
+            if (project) |id| if (t.project_id != id) continue;
+            if (project != null and shown == 40) break;
+            shown += 1;
             var id_buf: [24]u8 = undefined;
             try ctx.out.print("{s: <6} ", .{try std.fmt.bufPrint(&id_buf, "#{d}", .{t.id})});
             if (t.last_ms) |ms| {
@@ -691,8 +772,13 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "new")) {
-        if (args.len == 0) return error.Usage;
-        const reply = try call(ctx, "POST", "/api/tasks", try jsonBody(ctx, .{ .title = try joined(ctx, args) }));
+        const o = try options(ctx, args, &.{ "--project-key", "--project-hint" });
+        if (o.words.len == 0) return error.Usage;
+        if (o.values[1] != null and o.values[0] == null) return error.Usage;
+        var body: std.json.ObjectMap = .empty;
+        try body.put(ctx.a, "title", .{ .string = try joined(ctx, o.words) });
+        try putKey(ctx, &body, o.values[0], o.values[1]);
+        const reply = try call(ctx, "POST", "/api/tasks", try jsonBody(ctx, std.json.Value{ .object = body }));
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { task: Task }, ctx, reply.body);
         try ctx.out.writeAll("created   ");
@@ -722,11 +808,13 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "day")) {
-        if (args.len > 1) return error.Usage;
-        const target = if (args.len == 1) try std.fmt.allocPrint(ctx.a, "/api/day?date={s}", .{try pathEscape(ctx, args[0])}) else "/api/day";
+        const o = try options(ctx, args, &.{"--project-key"});
+        if (o.words.len > 1) return error.Usage;
+        const project = if (o.values[0]) |key| try keyProject(ctx, key) else null;
+        const target = if (o.words.len == 1) try std.fmt.allocPrint(ctx.a, "/api/day?date={s}", .{try pathEscape(ctx, o.words[0])}) else "/api/day";
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
-        try renderDay(ctx, reply.body);
+        if (project) |id| try renderProjectDay(ctx, reply.body, id) else try renderDay(ctx, reply.body);
         return .ok;
     }
     if (eql(u8, command, "summary")) {
