@@ -1864,6 +1864,10 @@ pub const Store = struct {
     }
 
     pub fn addNote(s: *Store, target: ?i64, text: []const u8, now_ms: i64) Error!i64 {
+        return s.addNoteWithStar(target, text, false, now_ms);
+    }
+
+    pub fn addNoteWithStar(s: *Store, target: ?i64, text: []const u8, starred: bool, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
         if (text.len == 0) return error.EmptyText;
@@ -1875,11 +1879,12 @@ pub const Store = struct {
             if (try stmt.step() == .done) return if (target == null) error.NoFocus else error.NoOpenInterval;
             break :blk stmt.columnI64(0);
         };
-        var stmt = try s.db.prepare("INSERT INTO notes(interval_id,at_ms,text) VALUES(?1,?2,?3) RETURNING id");
+        var stmt = try s.db.prepare("INSERT INTO notes(interval_id,at_ms,text,starred) VALUES(?1,?2,?3,?4) RETURNING id");
         defer stmt.finalize();
         try stmt.bindI64(1, interval_id);
         try stmt.bindI64(2, now_ms);
         try stmt.bindText(3, text);
+        try stmt.bindI64(4, @intFromBool(starred));
         if (try stmt.step() != .row) return error.Sqlite;
         const id = stmt.columnI64(0);
         if (try stmt.step() != .done) return error.Sqlite;
@@ -2651,15 +2656,20 @@ pub const Store = struct {
 
     /// A note at any time inside an interval, open or closed.
     pub fn addNoteAt(s: *Store, interval: i64, at_ms: i64, text: []const u8, now_ms: i64) Error!i64 {
+        return s.addNoteAtWithStar(interval, at_ms, text, false, now_ms);
+    }
+
+    pub fn addNoteAtWithStar(s: *Store, interval: i64, at_ms: i64, text: []const u8, starred: bool, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
         if (text.len == 0) return error.EmptyText;
         try s.noteFits(interval, at_ms, now_ms);
-        var stmt = try s.db.prepare("INSERT INTO notes(interval_id,at_ms,text) VALUES(?1,?2,?3) RETURNING id");
+        var stmt = try s.db.prepare("INSERT INTO notes(interval_id,at_ms,text,starred) VALUES(?1,?2,?3,?4) RETURNING id");
         defer stmt.finalize();
         try stmt.bindI64(1, interval);
         try stmt.bindI64(2, at_ms);
         try stmt.bindText(3, text);
+        try stmt.bindI64(4, @intFromBool(starred));
         if (try stmt.step() != .row) return error.Sqlite;
         const id = stmt.columnI64(0);
         if (try stmt.step() != .done) return error.Sqlite;
@@ -2676,17 +2686,39 @@ pub const Store = struct {
     }
 
     pub fn editNote(s: *Store, note: i64, text: []const u8, at_ms: ?i64, now_ms: i64) Error!void {
+        return s.updateNote(note, text, at_ms, null, now_ms);
+    }
+
+    pub fn updateNote(s: *Store, note: i64, text: ?[]const u8, at_ms: ?i64, starred: ?bool, now_ms: i64) Error!void {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
-        if (text.len == 0) return error.EmptyText;
+        if (text) |value| if (value.len == 0) return error.EmptyText;
         const interval = try s.noteInterval(note);
         if (at_ms) |at| try s.noteFits(interval, at, now_ms);
-        var stmt = try s.db.prepare("UPDATE notes SET text=?1,at_ms=coalesce(?2,at_ms) WHERE id=?3");
+        var stmt = try s.db.prepare("UPDATE notes SET text=coalesce(?1,text),at_ms=coalesce(?2,at_ms),starred=coalesce(?3,starred) WHERE id=?4");
         defer stmt.finalize();
-        try stmt.bindText(1, text);
+        try stmt.bindOptionalText(1, text);
         if (at_ms) |at| try stmt.bindI64(2, at) else try stmt.bindNull(2);
-        try stmt.bindI64(3, note);
+        if (starred) |value| try stmt.bindI64(3, @intFromBool(value)) else try stmt.bindNull(3);
+        try stmt.bindI64(4, note);
         _ = try stmt.step();
+        try tx.commit();
+    }
+
+    /// A mark changes no interval or day edit. The transaction rolls back if any id is unknown.
+    pub fn starNotes(s: *Store, ids: []const i64, starred: bool, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        var stmt = try s.db.prepare("UPDATE notes SET starred=?1 WHERE id=?2");
+        defer stmt.finalize();
+        for (ids, 0..) |id, index| {
+            if (std.mem.indexOfScalar(i64, ids[0..index], id) != null) continue;
+            _ = try s.noteInterval(id);
+            try stmt.bindI64(1, @intFromBool(starred));
+            try stmt.bindI64(2, id);
+            _ = try stmt.step();
+            try stmt.reset();
+        }
         try tx.commit();
     }
 
@@ -2698,6 +2730,22 @@ pub const Store = struct {
         defer stmt.finalize();
         try stmt.bindI64(1, note);
         _ = try stmt.step();
+        try tx.commit();
+    }
+
+    /// Apply the single-note deletion rules to every id, atomically.
+    pub fn deleteNotes(s: *Store, ids: []const i64, now_ms: i64) Error!void {
+        var tx = try s.begin(now_ms, false);
+        defer tx.deinit();
+        var stmt = try s.db.prepare("DELETE FROM notes WHERE id=?1");
+        defer stmt.finalize();
+        for (ids, 0..) |id, index| {
+            if (std.mem.indexOfScalar(i64, ids[0..index], id) != null) continue;
+            _ = try s.noteInterval(id);
+            try stmt.bindI64(1, id);
+            _ = try stmt.step();
+            try stmt.reset();
+        }
         try tx.commit();
     }
 
@@ -2923,7 +2971,7 @@ test "store refuses a future schema version" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
-    try db.exec("PRAGMA user_version=13");
+    try db.exec("PRAGMA user_version=14");
     try std.testing.expectError(error.SchemaVersion, Store.init(&db, std.testing.allocator));
 }
 
@@ -3755,6 +3803,48 @@ test "notes at a time can be moved, edited and deleted inside their interval" {
     try std.testing.expectError(error.UnknownInterval, s.addNoteAt(9, 1_000, "x", 2_000));
 }
 
+test "bulk note marks and deletes are atomic, including under a posted span" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("Task", 100);
+    const interval = try s.addInterval(task, .focus, 1_000, 2_000, 3_000);
+    const first = try s.addNoteAt(interval, 1_200, "first", 3_000);
+    const second = try s.addNoteAtWithStar(interval, 1_800, "second", true, 3_000);
+    try db.exec("UPDATE intervals SET posting_span_id=id WHERE id=1");
+    try db.exec("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms,covered_start_ms,covered_end_ms) VALUES('1970-01-01',1,'sample','ref','confirmed','1',1000000,3000,3000,1000,2000)");
+    const edited_before = try testScalar(&db, "SELECT coalesce(max(edited_ms),0) FROM day_edits");
+
+    try std.testing.expectError(error.UnknownNote, s.starNotes(&.{ first, 999 }, true, 4_000));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT starred FROM notes WHERE id=1"));
+    try s.starNotes(&.{ first, second }, true, 4_000);
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM notes WHERE starred=1"));
+    try s.starNotes(&.{first}, false, 4_001);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT starred FROM notes WHERE id=1"));
+    try std.testing.expectEqual(edited_before, try testScalar(&db, "SELECT coalesce(max(edited_ms),0) FROM day_edits"));
+
+    try std.testing.expectError(error.UnknownNote, s.deleteNotes(&.{ first, 999 }, 4_002));
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM notes"));
+    try s.deleteNotes(&.{ first, second }, 4_003);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM notes"));
+}
+
+test "bulk note operations treat repeated ids as one" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("Task", 100);
+    const interval = try s.addInterval(task, .focus, 1_000, 2_000, 3_000);
+    const note = try s.addNoteAt(interval, 1_200, "note", 3_000);
+    try s.starNotes(&.{ note, note }, true, 4_000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT starred FROM notes WHERE id=1"));
+    try s.starNotes(&.{ note, note }, false, 4_001);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT starred FROM notes WHERE id=1"));
+    try s.deleteNotes(&.{ note, note }, 4_002);
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM notes"));
+}
 
 test "captured runs share one focus and keep turns together" {
     var db: sqlite.Db = .{};

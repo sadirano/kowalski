@@ -56,6 +56,8 @@ existing rules.
   open interval is an error. Without a target they go to the focus; with no
   focus they are an error, not a guess. Switching to the task that is
   already the focus does nothing.
+- Starring a note is a saved mark, not a history edit; it does not mark the
+  day edited and is allowed under posted spans.
 - Intervals are half-open `[start, end)` in UTC Unix milliseconds. The API
   carries milliseconds or strings, never nanoseconds (too large for
   JavaScript numbers).

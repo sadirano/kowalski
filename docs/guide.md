@@ -362,6 +362,13 @@ kowalski post 2026-10-07 48213
 
 A task is `#<id>`, an external ref, or a title.
 
+### Starred notes
+
+Use `kowalski note --star "important detail"` to save a starred note. Run
+`kowalski day --starred` (or add a date) to list only starred notes with
+their time and task. Each line starts with an id such as `n7`; use
+`kowalski star n7 n8` or `kowalski unstar n7` to change saved marks.
+
 ### Project keys for launchers
 
 A launcher (a shell alias, an editor task, a directory tool) can name the

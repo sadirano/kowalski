@@ -255,7 +255,7 @@ pub fn fields(store: *Store, a: std.mem.Allocator, task_id: i64) ![]Field {
 
 /// `source`: "prompt" or "outcome" for one capture wrote from a turn; null otherwise
 /// (written by hand, or a report a source sent along the way).
-pub const Note = struct { id: i64, at_ms: i64, text: []const u8, source: ?[]const u8 = null };
+pub const Note = struct { id: i64, at_ms: i64, text: []const u8, source: ?[]const u8 = null, starred: bool = false };
 
 pub const Interval = struct {
     id: i64,
@@ -275,11 +275,11 @@ pub const Interval = struct {
 };
 
 fn notesOf(store: *Store, a: std.mem.Allocator, interval: i64) ![]Note {
-    var stmt = try store.db.prepare("SELECT id,at_ms,text,source FROM notes WHERE interval_id=?1 ORDER BY at_ms,id");
+    var stmt = try store.db.prepare("SELECT id,at_ms,text,source,starred FROM notes WHERE interval_id=?1 ORDER BY at_ms,id");
     defer stmt.finalize();
     try stmt.bindI64(1, interval);
     var rows: std.ArrayList(Note) = .empty;
-    while (try stmt.step() == .row) try rows.append(a, .{ .id = stmt.columnI64(0), .at_ms = stmt.columnI64(1), .text = try a.dupe(u8, stmt.columnText(2).?), .source = try dupeOpt(a, stmt.columnText(3)) });
+    while (try stmt.step() == .row) try rows.append(a, .{ .id = stmt.columnI64(0), .at_ms = stmt.columnI64(1), .text = try a.dupe(u8, stmt.columnText(2).?), .source = try dupeOpt(a, stmt.columnText(3)), .starred = stmt.columnI64(4) == 1 });
     return rows.items;
 }
 

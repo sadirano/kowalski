@@ -39,7 +39,7 @@ pub const header =
 
 pub const commands = [_]Command{
     .{ .name = "status", .usage = "status [--project-key <key>]", .safety = .safe, .project_key = true, .summary = "focus, parallel work and today's numbers; with a key, whether the focus is in that project" },
-    .{ .name = "day", .usage = "day [<YYYY-MM-DD>] [--project-key <key>]", .safety = .safe, .project_key = true, .summary = "a day's totals, timeline and summary; with a key, that project's share" },
+    .{ .name = "day", .usage = "day [<YYYY-MM-DD>] [--project-key <key>] [--starred]", .safety = .safe, .project_key = true, .summary = "a day's totals, timeline and summary; --starred lists only marked notes" },
     .{ .name = "tasks", .usage = "tasks [<filter>] [--project-key <key>]", .safety = .safe, .project_key = true, .summary = "tasks by recent use" },
     .{ .name = "project list", .usage = "project list [--all]", .safety = .safe, .summary = "projects" },
     .{ .name = "postings", .usage = "postings [<YYYY-MM-DD>]", .safety = .safe, .summary = "what can be posted for a day, and what was" },
@@ -51,7 +51,9 @@ pub const commands = [_]Command{
     .{ .name = "stop", .usage = "stop <task>", .safety = .writes_live, .summary = "close a task's open interval", .effects = &.{"closes that task's interval, focus or parallel"} },
     .{ .name = "pause", .usage = "pause", .safety = .writes_live, .summary = "save and close everything open", .effects = &.{"closes every open interval, in every project"} },
     .{ .name = "resume", .usage = "resume", .safety = .writes_live, .summary = "bring back what pause saved", .effects = &.{"reopens the saved focus and parallel work"} },
-    .{ .name = "note", .usage = "note [-t <task>] <text>", .safety = .writes_live, .summary = "a note on the focus, or on the named task's open interval", .effects = &.{"adds a note; nothing closes"} },
+    .{ .name = "note", .usage = "note [-t <task>] [--star] <text>", .safety = .writes_live, .summary = "a note on the focus, or on the named task's open interval", .effects = &.{"adds a note; nothing closes"} },
+    .{ .name = "star", .usage = "star n<id>...", .safety = .writes_live, .summary = "star saved notes", .effects = &.{"marks notes; history unchanged"} },
+    .{ .name = "unstar", .usage = "unstar n<id>...", .safety = .writes_live, .summary = "remove saved stars", .effects = &.{"marks notes; history unchanged"} },
     .{ .name = "new", .usage = "new [--project-key <key> [--project-hint <h>]] <title>", .safety = .writes_live, .project_key = true, .summary = "create a task without opening it", .effects = &.{"adds a task"} },
     .{ .name = "rename", .usage = "rename <#id> <title>", .safety = .writes_live, .summary = "change a task's title", .effects = &.{"renames the task everywhere it shows; history keeps interval text"} },
     .{ .name = "project bind", .usage = "project bind <#id> --key <key>", .safety = .writes_live, .summary = "point a project key at a project (an alias rename keeps its project)", .effects = &.{"moves every source's mapping of the key"} },

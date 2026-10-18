@@ -438,12 +438,12 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return state(app, a);
     }
     if (is(req, .POST, path, "/api/notes")) {
-        const body = try parseBody(struct { task: ?[]const u8 = null, text: []const u8, interval: ?i64 = null, at_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { task: ?[]const u8 = null, text: []const u8, interval: ?i64 = null, at_ms: ?i64 = null, starred: bool = false }, a, req.body) orelse return badRequest(a, "body");
         if (body.text.len > 2000) return badRequest(a, "text");
         const text = if (std.mem.trim(u8, body.text, " \t\r\n").len == 0) "" else try noteText(a, body.text);
         if (body.interval) |interval| {
             const at = body.at_ms orelse return badRequest(a, "at_ms");
-            const note = try app.store.addNoteAt(interval, at, text, app.clock());
+            const note = try app.store.addNoteAtWithStar(interval, at, text, body.starred, app.clock());
             return send(a, .created, .{ .note = note });
         }
         var target: ?i64 = null;
@@ -451,7 +451,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             .id => |id| target = id,
             .response => |r| return r,
         };
-        const note = try app.store.addNote(target, text, app.clock());
+        const note = try app.store.addNoteWithStar(target, text, body.starred, app.clock());
         return send(a, .created, .{ .note = note });
     }
     if (is(req, .POST, path, "/api/notes/captured")) {
@@ -1512,15 +1512,30 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         try app.store.editInterval(id, seenOf(body.seen), body.start_ms, body.end_ms, app.clock());
         return send(a, .ok, .{ .interval = id });
     };
+    if (is(req, .POST, path, "/api/notes/star")) {
+        const body = try parseBody(struct { ids: []const i64, starred: bool }, a, req.body) orelse return badRequest(a, "body");
+        if (body.ids.len > 500) return badRequest(a, "ids");
+        try app.store.starNotes(body.ids, body.starred, app.clock());
+        return send(a, .ok, .{ .updated = body.ids.len, .starred = body.starred });
+    }
+    if (is(req, .POST, path, "/api/notes/delete")) {
+        const body = try parseBody(struct { ids: []const i64 }, a, req.body) orelse return badRequest(a, "body");
+        if (body.ids.len > 500) return badRequest(a, "ids");
+        try app.store.deleteNotes(body.ids, app.clock());
+        return send(a, .ok, .{ .deleted = body.ids.len });
+    }
     if (req.method == .POST) if (idBetween(path, "/api/notes/", "/delete")) |id| {
         try app.store.deleteNote(id, app.clock());
         return send(a, .ok, .{ .deleted = id });
     };
     if (req.method == .PATCH) if (idBetween(path, "/api/notes/", "")) |id| {
-        const body = try parseBody(struct { text: []const u8, at_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
-        if (body.text.len > 2000) return badRequest(a, "text");
-        const text = if (std.mem.trim(u8, body.text, " \t\r\n").len == 0) "" else try noteText(a, body.text);
-        try app.store.editNote(id, text, body.at_ms, app.clock());
+        const body = try parseBody(struct { text: ?[]const u8 = null, at_ms: ?i64 = null, starred: ?bool = null }, a, req.body) orelse return badRequest(a, "body");
+        if (body.text == null and body.starred == null) return badRequest(a, "body");
+        const text = if (body.text) |input| blk: {
+            if (input.len > 2000) return badRequest(a, "text");
+            break :blk if (std.mem.trim(u8, input, " \t\r\n").len == 0) "" else try noteText(a, input);
+        } else null;
+        try app.store.updateNote(id, text, body.at_ms, body.starred, app.clock());
         return send(a, .ok, .{ .note = id });
     };
     return null;
@@ -3478,6 +3493,62 @@ test "timed notes can be added moved edited and deleted" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, try std.fmt.allocPrint(a, "/api/notes/{d}/delete", .{note}), "").status);
     const after = try f.get(Day, "/api/day?date=2026-03-10");
     try std.testing.expectEqual(@as(usize, 0), after.intervals[0].notes.len);
+}
+
+test "starred notes can be created, patched and changed in bulk" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_129_600_000;
+    test_now = start + 3_600_000;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"A\"}").status);
+    const opened = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, test_now }));
+    try std.testing.expectEqual(std.http.Status.created, opened.status);
+    const interval = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, opened.body, .{})).interval;
+    const first_body = try std.fmt.allocPrint(a, "{{\"interval\":{d},\"at_ms\":{d},\"text\":\"first\",\"starred\":true}}", .{ interval, start + 1_000 });
+    const second_body = try std.fmt.allocPrint(a, "{{\"interval\":{d},\"at_ms\":{d},\"text\":\"second\"}}", .{ interval, start + 2_000 });
+    const first_response = f.call(.POST, "/api/notes", first_body);
+    const second_response = f.call(.POST, "/api/notes", second_body);
+    try std.testing.expectEqual(std.http.Status.created, first_response.status);
+    try std.testing.expectEqual(std.http.Status.created, second_response.status);
+    const first = (try std.json.parseFromSliceLeaky(struct { note: i64 }, a, first_response.body, .{})).note;
+    const second = (try std.json.parseFromSliceLeaky(struct { note: i64 }, a, second_response.body, .{})).note;
+    const Day = struct { intervals: []struct { notes: []query.Note } };
+    const before = try f.get(Day, "/api/day?date=2026-03-10");
+    try std.testing.expect(before.intervals[0].notes[0].starred);
+    try std.testing.expect(!before.intervals[0].notes[1].starred);
+
+    const target = try std.fmt.allocPrint(a, "/api/notes/{d}", .{first});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, "{\"starred\":false}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, target, "{}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, target, "{\"at_ms\":1000}").status);
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.PATCH, "/api/notes/999", "{\"starred\":true}").status);
+    const after_patch = try f.get(Day, "/api/day?date=2026-03-10");
+    try std.testing.expectEqualStrings("first", after_patch.intervals[0].notes[0].text);
+    try std.testing.expect(!after_patch.intervals[0].notes[0].starred);
+
+    const unknown = try std.fmt.allocPrint(a, "{{\"ids\":[{d},999],\"starred\":true}}", .{first});
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.POST, "/api/notes/star", unknown).status);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM notes WHERE starred=1"));
+    const mark = try std.fmt.allocPrint(a, "{{\"ids\":[{d},{d}],\"starred\":true}}", .{ first, second });
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/notes/star", mark).status);
+    const after_mark = try f.get(Day, "/api/day?date=2026-03-10");
+    try std.testing.expect(after_mark.intervals[0].notes[0].starred);
+    try std.testing.expect(after_mark.intervals[0].notes[1].starred);
+
+    const delete_unknown = try std.fmt.allocPrint(a, "{{\"ids\":[{d},999]}}", .{first});
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.POST, "/api/notes/delete", delete_unknown).status);
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM notes"));
+    const delete_both = try std.fmt.allocPrint(a, "{{\"ids\":[{d},{d}]}}", .{ first, second });
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/notes/delete", delete_both).status);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM notes"));
+
+    const too_many = try a.alloc(i64, 501);
+    @memset(too_many, first);
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .ids = too_many, .starred = true }, .{});
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/star", oversized).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/delete", oversized).status);
 }
 
 test "manual notes preserve lines and enforce the byte limit on every path" {

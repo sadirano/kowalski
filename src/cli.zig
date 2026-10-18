@@ -37,7 +37,9 @@ pub const usage =
     \\  parallel [--project <#id|unassigned> | --project-key <key> [--project-hint <h>]] <task> [-m <text>]
     \\  stop <task>                  close a task's open interval
     \\  pause | resume               save and close everything open, or bring it back
-    \\  note [-t <task>] <text>      note on the focus, or on the named task
+    \\  note [-t <task>] [--star] <text>  note on the focus, or on the named task
+    \\  star n<id>...               mark notes as starred
+    \\  unstar n<id>...             clear notes' starred marks
     \\  capture <kind> --source <s> --run <r> [--event <id>] [--subject <task>]
     \\          [--default <task>] [--project-key <key>] [--project-hint <hint>]
     \\          [--first-prompt <text>] [--unattended]
@@ -54,7 +56,7 @@ pub const usage =
     \\  project assign <#id|unassigned> --interval <#id>... [--apply <hash>]
     \\  project assign <#id|unassigned> --suggest [--apply <hash>]
     \\  delete <#id>                 delete a task and its time (not while running or posted)
-    \\  day [<YYYY-MM-DD>] [--project-key <key>]  totals, hops, timeline and summary
+    \\  day [<YYYY-MM-DD>] [--project-key <key>] [--starred]  day or starred notes only
     \\  summary [<YYYY-MM-DD>] [<text>]  show or set a day's summary ("" clears)
     \\  settings | set <key> <value> | unset <key>
     \\  provider                     provider status and fields
@@ -78,6 +80,7 @@ pub const usage =
     \\                               fill an empty database with made-up history
     \\
     \\A task is `#<id>`, an external ref, or a title (case-insensitive).
+    \\A note id is `n<id>` (shown by `day --starred`).
     \\The database defaults to <Roaming AppData>\sadirano\kowalski\kowalski.db.
     \\
 ;
@@ -161,7 +164,7 @@ fn callUnchecked(ctx: *Context, method: []const u8, target: []const u8, body: ?[
 }
 
 const Task = struct { id: i64, title: []const u8, ref: ?[]const u8 = null, project_id: ?i64 = null };
-const Note = struct { at_ms: i64, text: []const u8 };
+const Note = struct { id: i64 = 0, at_ms: i64, text: []const u8, starred: bool = false };
 const Interval = struct {
     task: Task,
     role: []const u8,
@@ -169,6 +172,7 @@ const Interval = struct {
     end_ms: ?i64 = null,
     text: ?[]const u8 = null,
     notes: []Note = &.{},
+    project_id: ?i64 = null,
 };
 const Numbers = struct {
     total_ms: i64,
@@ -291,6 +295,13 @@ fn options(ctx: *Context, args: []const []const u8, comptime flags: []const []co
 
 fn hashId(text: []const u8) !i64 {
     if (text.len < 2 or text[0] != '#') return error.Usage;
+    const id = std.fmt.parseInt(i64, text[1..], 10) catch return error.Usage;
+    if (id <= 0) return error.Usage;
+    return id;
+}
+
+fn noteId(text: []const u8) !i64 {
+    if (text.len < 2 or text[0] != 'n') return error.Usage;
     const id = std.fmt.parseInt(i64, text[1..], 10) catch return error.Usage;
     if (id <= 0) return error.Usage;
     return id;
@@ -738,12 +749,34 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "note")) {
-        const o = try options(ctx, args, &.{ "-t", "--task" });
+        var rest: std.ArrayList([]const u8) = .empty;
+        var starred = false;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (eql(u8, arg, "-t") or eql(u8, arg, "--task")) {
+                if (i + 1 >= args.len) return error.Usage;
+                try rest.append(ctx.a, arg);
+                i += 1;
+                try rest.append(ctx.a, args[i]);
+            } else if (eql(u8, arg, "--star")) starred = true else try rest.append(ctx.a, arg);
+        }
+        const o = try options(ctx, rest.items, &.{ "-t", "--task" });
         if (o.words.len == 0) return error.Usage;
         const task = o.values[0] orelse o.values[1];
-        const reply = try call(ctx, "POST", "/api/notes", try jsonBody(ctx, .{ .task = task, .text = try joined(ctx, o.words) }));
+        const reply = try call(ctx, "POST", "/api/notes", try jsonBody(ctx, .{ .task = task, .text = try joined(ctx, o.words), .starred = starred }));
         if (!try settle(ctx, reply)) return .ok;
         try ctx.out.writeAll("noted\n");
+        return .ok;
+    }
+    if (eql(u8, command, "star") or eql(u8, command, "unstar")) {
+        if (args.len == 0 or args.len > 500) return error.Usage;
+        const ids = try ctx.a.alloc(i64, args.len);
+        for (args, 0..) |arg, i| ids[i] = try noteId(arg);
+        const starred = eql(u8, command, "star");
+        const reply = try call(ctx, "POST", "/api/notes/star", try jsonBody(ctx, .{ .ids = ids, .starred = starred }));
+        if (!try settle(ctx, reply)) return .ok;
+        try ctx.out.print("{s} {d} note{s}\n", .{ if (starred) "starred" else "unstarred", ids.len, if (ids.len == 1) "" else "s" });
         return .ok;
     }
     if (eql(u8, command, "tasks")) {
@@ -808,13 +841,25 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "day")) {
-        const o = try options(ctx, args, &.{"--project-key"});
+        var rest: std.ArrayList([]const u8) = .empty;
+        var starred = false;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (eql(u8, arg, "--project-key")) {
+                if (i + 1 >= args.len) return error.Usage;
+                try rest.append(ctx.a, arg);
+                i += 1;
+                try rest.append(ctx.a, args[i]);
+            } else if (eql(u8, arg, "--starred")) starred = true else try rest.append(ctx.a, arg);
+        }
+        const o = try options(ctx, rest.items, &.{"--project-key"});
         if (o.words.len > 1) return error.Usage;
         const project = if (o.values[0]) |key| try keyProject(ctx, key) else null;
         const target = if (o.words.len == 1) try std.fmt.allocPrint(ctx.a, "/api/day?date={s}", .{try pathEscape(ctx, o.words[0])}) else "/api/day";
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
-        if (project) |id| try renderProjectDay(ctx, reply.body, id) else try renderDay(ctx, reply.body);
+        if (starred) try renderStarredDay(ctx, reply.body, project) else if (project) |id| try renderProjectDay(ctx, reply.body, id) else try renderDay(ctx, reply.body);
         return .ok;
     }
     if (eql(u8, command, "summary")) {
@@ -1290,8 +1335,16 @@ test "daemon database guard refuses a different file and accepts matching or leg
     try std.testing.expectEqual(@as(usize, 2), Fake.calls);
 }
 
+fn asciiByte(c: u8) u8 {
+    return if (std.ascii.isPrint(c)) c else '?';
+}
+
+fn asciiBytes(w: *Io.Writer, bytes: []const u8) !void {
+    for (bytes) |c| try w.writeByte(asciiByte(c));
+}
+
 fn asciiLine(w: *Io.Writer, bytes: []const u8) !void {
-    for (bytes) |c| try w.writeByte(if (std.ascii.isPrint(c)) c else '?');
+    try asciiBytes(w, bytes);
     try w.writeByte('\n');
 }
 
@@ -1393,6 +1446,32 @@ fn renderState(ctx: *Context, s: State) !void {
     try w.writeAll("\n");
 }
 
+fn renderStarredDay(ctx: *Context, body: []const u8, project: ?i64) !void {
+    const d = try parse(struct { date: []const u8, zone: []const u8, day_start_min: u16 = 0, intervals: []Interval }, ctx, body);
+    var z = try zone.Zone.load(d.zone);
+    z.day_start_min = d.day_start_min;
+    const date = try api.parseDate(ctx.a, d.date);
+    const bounds = try z.dayBounds(date.year, date.month, date.day);
+    for (d.intervals) |i| {
+        if (project != null and i.project_id != project) continue;
+        for (i.notes) |note| {
+            if (!note.starred or note.at_ms < bounds.start_ms or note.at_ms >= bounds.end_ms) continue;
+            try ctx.out.print("n{d}  ", .{note.id});
+            try clockTime(ctx.out, &z, note.at_ms);
+            try ctx.out.print("  #{d} ", .{i.task.id});
+            try asciiBytes(ctx.out, i.task.title);
+            if (i.task.ref) |ref| {
+                try ctx.out.writeAll(" [");
+                try asciiBytes(ctx.out, ref);
+                try ctx.out.writeByte(']');
+            }
+            try ctx.out.writeAll("  ");
+            try asciiBytes(ctx.out, note.text);
+            try ctx.out.writeByte('\n');
+        }
+    }
+}
+
 fn renderDay(ctx: *Context, body: []const u8) !void {
     const Day = struct {
         date: []const u8,
@@ -1456,4 +1535,139 @@ test "day listing keeps each multiline note on one row" {
     try renderDay(&ctx, body);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "first...\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "second") == null);
+}
+
+test "starred note commands and day output use the API" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn request(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            defer calls += 1;
+            switch (calls) {
+                0 => {
+                    try std.testing.expectEqualStrings("POST", method);
+                    try std.testing.expectEqualStrings("/api/notes", target);
+                    const b = try parse(struct { task: ?[]const u8, text: []const u8, starred: bool }, ctx, body.?);
+                    try std.testing.expect(b.task == null);
+                    try std.testing.expectEqualStrings("important", b.text);
+                    try std.testing.expect(b.starred);
+                    return .{ .status = 201, .body = "{\"note\":7}" };
+                },
+                1, 2 => {
+                    try std.testing.expectEqualStrings("POST", method);
+                    try std.testing.expectEqualStrings("/api/notes/star", target);
+                    const b = try parse(struct { ids: []i64, starred: bool }, ctx, body.?);
+                    try std.testing.expectEqualSlices(i64, if (calls == 1) &.{ 7, 8 } else &.{8}, b.ids);
+                    try std.testing.expectEqual(calls == 1, b.starred);
+                    return .{ .status = 200, .body = "{}" };
+                },
+                3 => {
+                    try std.testing.expectEqualStrings("GET", method);
+                    try std.testing.expectEqualStrings("/api/day?date=2026-03-10", target);
+                    return .{ .status = 200, .body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"intervals\":[{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773100800000,\"notes\":[{\"id\":7,\"at_ms\":1773100800000,\"text\":\"first\\nline\",\"starred\":true},{\"id\":8,\"at_ms\":1773100860000,\"text\":\"hidden\",\"starred\":false}]}]}" };
+                },
+                else => return error.UnexpectedCall,
+            }
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{ "--star", "important" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "star", &.{ "n7", "n8" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "unstar", &.{"n8"}));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "day", &.{ "2026-03-10", "--starred" }));
+    try std.testing.expectEqual(@as(usize, 4), Fake.calls);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "n7  00:00  #1 A  first?line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "hidden") == null);
+}
+
+test "starred day lists only notes within the selected day" {
+    const Fake = struct {
+        const day_body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"intervals\":[" ++
+            "{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773100680000,\"end_ms\":1773100920000,\"notes\":[" ++
+            "{\"id\":1,\"at_ms\":1773100740000,\"text\":\"previous\",\"starred\":true}," ++
+            "{\"id\":2,\"at_ms\":1773100800000,\"text\":\"current\",\"starred\":true}]}," ++
+            "{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773187080000,\"end_ms\":1773187320000,\"notes\":[" ++
+            "{\"id\":3,\"at_ms\":1773187140000,\"text\":\"late\",\"starred\":true}," ++
+            "{\"id\":4,\"at_ms\":1773187200000,\"text\":\"next\",\"starred\":true}]}]}";
+        fn request(_: *Context, method: []const u8, target: []const u8, _: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            try std.testing.expectEqualStrings("GET", method);
+            try std.testing.expectEqualStrings("/api/day?date=2026-03-10", target);
+            return .{ .status = 200, .body = day_body };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "day", &.{ "2026-03-10", "--starred" }));
+    try std.testing.expectEqualStrings("n2  00:00  #1 A  current\nn3  23:59  #1 A  late\n", out.written());
+}
+
+test "starred day replaces non-ASCII and control bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer };
+    const body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"intervals\":[{\"task\":{\"id\":1,\"title\":\"Caf\\u00e9\",\"ref\":\"R\\u00e9f\"},\"role\":\"focus\",\"start_ms\":1773100800000,\"notes\":[{\"id\":7,\"at_ms\":1773100800000,\"text\":\"na\\u00efve\\u0001 note\",\"starred\":true}]}]}";
+    try renderStarredDay(&ctx, body, null);
+    try std.testing.expectEqualStrings("n7  00:00  #1 Caf?? [R??f]  na??ve? note\n", out.written());
+    for (out.written()) |ch| try std.testing.expect(ch < 128);
+}
+
+test "boolean-looking option values stay attached to their options" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn request(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            defer calls += 1;
+            switch (calls) {
+                0 => {
+                    try std.testing.expectEqualStrings("POST", method);
+                    try std.testing.expectEqualStrings("/api/notes", target);
+                    const b = try parse(struct { task: []const u8, text: []const u8, starred: bool }, ctx, body.?);
+                    try std.testing.expectEqualStrings("--star", b.task);
+                    try std.testing.expectEqualStrings("text", b.text);
+                    try std.testing.expect(!b.starred);
+                    return .{ .status = 201, .body = "{\"note\":1}" };
+                },
+                1 => {
+                    try std.testing.expectEqualStrings("GET", method);
+                    try std.testing.expectEqualStrings("/api/project-keys", target);
+                    return .{ .status = 200, .body = "{\"keys\":[{\"project_key\":\"--starred\",\"project_id\":1}]}" };
+                },
+                2 => {
+                    try std.testing.expectEqualStrings("GET", method);
+                    try std.testing.expectEqualStrings("/api/day", target);
+                    return .{ .status = 200, .body = "{\"date\":\"2026-03-10\",\"tasks\":[],\"project_totals\":[{\"project_id\":1,\"label\":\"P\",\"focus_ms\":0}]}" };
+                },
+                else => return error.UnexpectedCall,
+            }
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{ "-t", "--star", "text" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "day", &.{ "--project-key", "--starred" }));
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "2026-03-10  #1 P") != null);
 }
