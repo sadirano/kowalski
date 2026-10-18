@@ -133,11 +133,14 @@ function renderReader(rep, area) {
     _readerTask = tasks.some(e => e.task.id === _currentTaskId) ? _currentTaskId : tasks[0].task.id;
   }
   const pinned = _readerPin;
+  // A task with an open interval shows the report's live badge; parallel work in its muted form.
+  const live = new Map(rep.intervals.filter(s => s.end_ms == null).map(s => [s.task.id, s.role]));
+  const liveBadge = id => !live.has(id) ? '' : `<span class="open-badge${live.get(id) === 'parallel' ? ' par' : ''}">${t('live')}</span>`;
   mapRange(rep);
   area.innerHTML = `<div class="rd">
     <nav class="rd-tabs" role="tablist">${tasks.map(e => `<button class="rd-tab" role="tab" data-t="${e.task.id}" aria-selected="${e.task.id === _readerTask}" onclick="readerPick(${e.task.id})"
         onmouseenter="readerLight(${e.task.id})" onmouseleave="readerLight(null)" onfocus="readerLight(${e.task.id})" onblur="readerLight(null)">
-        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}</small></span><span class="rd-t">${fmtMs(e.focus_ms)}</span></button>`).join('')}</nav>
+        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}${liveBadge(e.task.id)}</small></span><span class="rd-t">${fmtMs(e.focus_ms)}</span></button>`).join('')}</nav>
     <div class="rd-main" id="rd-main">${readerMainHtml(rep)}</div>
     <div class="rd-work">
       <div class="resize-handle" onpointerdown="startRdResize(event)" ondblclick="resetRdWorkWidth()" title="${escAttr(t('rd_resize_hint'))}"></div>
