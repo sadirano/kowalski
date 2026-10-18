@@ -1,13 +1,15 @@
 'use strict';
 // ── Task search (Feature 7: find a task by any text that identifies it) ────────
 // Type anything that identifies a task — ref, title, field, or note — and the dropdown lists matching tasks
-// with the days they were worked on. Picking a hit opens its most recent day;
-// ▶ switches the tracker to it. Ctrl+K focuses the field from anywhere.
+// with the days they were worked on. Picking a hit opens its most recent day
+// (or the day chip clicked) on that task: the Timeline reads it and the report
+// marks its card; ▶ switches the tracker to it. Ctrl+K focuses the field from anywhere.
 let _searchHits  = [];
 let _searchSel   = -1;
 let _searchTimer = null;
 let _searchedQ   = null; // the query the hits answer
 let _searchSeq   = 0; // guards a slow response from overwriting a newer one
+let _searchFound = null; // { task, date }: the hit opened, marked on that day's report
 
 function onSearchInput() {
   const q = id('task-search').value.trim();
@@ -60,7 +62,7 @@ function renderSearch() {
     const hidden = nDays - days.length;
     const chips  = days.map(d =>
       `<span class="sr-day" title="${escAttr(t('search_open_day', { d: d.date }))} · ${fmtMs(d.total_ms)}"
-             onclick="event.stopPropagation();searchGoDay('${d.date}')">${esc(shortDate(d.date))}</span>`).join('')
+             onclick="event.stopPropagation();searchGoDay(${i},'${d.date}')">${esc(shortDate(d.date))}</span>`).join('')
       + (hidden > 0 ? `<span class="sr-day more">+${hidden}</span>` : '');
     const start = `<button class="sr-go" title="${escAttr(t('search_switch'))}"
       onclick="event.stopPropagation();searchSwitch(${i})">▶</button>`;
@@ -138,12 +140,32 @@ async function onSearchKey(e) {
 
 function searchOpen(i) {
   const h = _searchHits[i];
-  if (!h || !h.last_date) return; // a task with no time has no day to open
-  closeSearch();
-  goToDate(h.last_date); // the most recent day this task was worked on
+  // The most recent day this task was focused on; a task with only parallel
+  // time opens on the shown day when it is there, else has no day to open.
+  const date = h?.last_date || (h && D?.tasks?.some(e => e.task.id === h.task.id) ? selectedDate : null);
+  if (!date) return;
+  return searchGoDay(i, date);
 }
 
-function searchGoDay(date) { closeSearch(); goToDate(date); }
+// Opens a day on a hit's task: the Timeline reads it, and the report marks and
+// scrolls to its card.
+async function searchGoDay(i, date) {
+  const h = _searchHits[i];
+  closeSearch();
+  if (!h) return goToDate(date);
+  _searchFound = { task: h.task.id, date };
+  _readerTask = h.task.id;
+  _readerSitting = 0;
+  _readerPin = null;
+  saveLS('readerTask', h.task.id);
+  await goToDate(date);
+  if (activeTab === 'report') document.querySelector(`.task-card[data-task="${h.task.id}"]`)?.scrollIntoView({ block: 'start' });
+}
+
+// The task card a search opened, while its day is shown.
+function isSearchFound(taskId) {
+  return _searchFound?.task === taskId && _searchFound.date === selectedDate;
+}
 
 async function searchSwitch(i) {
   const h = _searchHits[i];
@@ -162,6 +184,7 @@ function clearSearch() {
   _searchedQ = null;
   _searchHits = [];
   _searchSel  = -1;
+  _searchFound = null;
   id('task-search').value = '';
   id('search-clear').style.display = 'none';
   closeSearch();

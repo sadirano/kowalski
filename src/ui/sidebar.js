@@ -140,7 +140,7 @@ function goToDate(date, options) {
   selectedDate = date;
   saveLS('selectedDate', { date, sessionDate: todayStr(), time: Date.now() });
   hideCalendar();
-  loadDay(date, options);
+  return loadDay(date, options);
 }
 
 async function fetchCalTotals() {

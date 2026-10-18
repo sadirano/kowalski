@@ -610,6 +610,7 @@
   /* Dragging an interval onto another task */
   .block-hdr[draggable=true]{cursor:grab}
   .block.dragging{opacity:.4}
+  .task-card.found{border-color:var(--warn);box-shadow:0 0 0 1px var(--warn);scroll-margin-top:12px}
   .task-card.drop-target{outline:2px dashed var(--acc);outline-offset:-2px}
   .sr-sub{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .sr-snip{font-size:11px;color:var(--muted);font-style:italic;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}

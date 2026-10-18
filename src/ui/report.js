@@ -167,7 +167,7 @@ function renderReport(rep) {
           <div class="task-id">${ref}</div>
           <div class="task-meta">${projectTag ? `<span class="task-project">${projectTag}</span>` : ''}${meta}</div>
         </div>`;
-    const card = `<div class="task-card${folded ? ' folded' : ''}" data-task="${task.id}" ondragover="dragOverTask(event,${taskIdx})" ondragleave="dragLeaveTask(event)" ondrop="dropOnTask(event,${taskIdx})">
+    const card = `<div class="task-card${folded ? ' folded' : ''}${isSearchFound(task.id) ? ' found' : ''}" data-task="${task.id}" ondragover="dragOverTask(event,${taskIdx})" ondragleave="dragLeaveTask(event)" ondrop="dropOnTask(event,${taskIdx})">
       ${head}
         <div style="display:flex;align-items:center;gap:10px">
           <button class="${switchCls}" title="${escAttr(switchTitle)}" aria-label="${escAttr(switchTitle)}" ${switchClick}>${switchLabel}</button>
