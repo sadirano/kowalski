@@ -185,6 +185,7 @@ function clearSearch() {
   _searchHits = [];
   _searchSel  = -1;
   _searchFound = null;
+  document.querySelectorAll('.task-card.found').forEach(el => el.classList.remove('found'));
   id('task-search').value = '';
   id('search-clear').style.display = 'none';
   closeSearch();
