@@ -72,10 +72,11 @@ function parallelMsOf(rep, taskId) {
   return unionMs(items.map(s => [s.start_ms, readerEnd(s)])) - unionMs(items.filter(s => s.role === 'focus').map(s => [s.start_ms, readerEnd(s)]));
 }
 
-// Focus time, with the task's parallel time beside it, muted, when it has any.
+// Focus time, with the task's parallel time beside it, muted, when it has any;
+// the second figure needs no label.
 function durHtml(rep, entry) {
   const par = parallelMsOf(rep, entry.task.id);
-  return fmtMs(entry.focus_ms) + (par >= 60000 ? `<span class="dur-par"> · ${esc(t('dur_par', { d: fmtMs(par) }))}</span>` : '');
+  return fmtMs(entry.focus_ms) + (par >= 60000 ? `<span class="dur-par"> · ${fmtMs(par)}</span>` : '');
 }
 
 // The focus other tasks had between two sittings, longest first.
