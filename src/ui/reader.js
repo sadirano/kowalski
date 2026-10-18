@@ -66,6 +66,18 @@ function sittingsOf(rep, taskId) {
   return out;
 }
 
+// A task's time running in parallel, outside its own focus.
+function parallelMsOf(rep, taskId) {
+  const items = readerIntervals(rep).filter(s => s.task.id === taskId);
+  return unionMs(items.map(s => [s.start_ms, readerEnd(s)])) - unionMs(items.filter(s => s.role === 'focus').map(s => [s.start_ms, readerEnd(s)]));
+}
+
+// Focus time, with the task's parallel time beside it, muted, when it has any.
+function durHtml(rep, entry) {
+  const par = parallelMsOf(rep, entry.task.id);
+  return fmtMs(entry.focus_ms) + (par >= 60000 ? `<span class="dur-par"> · ${esc(t('dur_par', { d: fmtMs(par) }))}</span>` : '');
+}
+
 // The focus other tasks had between two sittings, longest first.
 function meanwhileOf(rep, taskId, a, b) {
   const m = new Map();
@@ -140,7 +152,7 @@ function renderReader(rep, area) {
   area.innerHTML = `<div class="rd">
     <nav class="rd-tabs" role="tablist">${tasks.map(e => `<button class="rd-tab" role="tab" data-t="${e.task.id}" aria-selected="${e.task.id === _readerTask}" onclick="readerPick(${e.task.id})"
         onmouseenter="readerLight(${e.task.id})" onmouseleave="readerLight(null)" onfocus="readerLight(${e.task.id})" onblur="readerLight(null)">
-        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}${liveBadge(e.task.id)}</small></span><span class="rd-t">${fmtMs(e.focus_ms)}</span></button>`).join('')}</nav>
+        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}${liveBadge(e.task.id)}</small></span><span class="rd-t">${durHtml(rep, e)}</span></button>`).join('')}</nav>
     <div class="rd-main" id="rd-main">${readerMainHtml(rep)}</div>
     <div class="rd-work">
       <div class="resize-handle" onpointerdown="startRdResize(event)" ondblclick="resetRdWorkWidth()" title="${escAttr(t('rd_resize_hint'))}"></div>

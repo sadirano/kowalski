@@ -173,7 +173,7 @@ function renderReport(rep) {
           <button class="${switchCls}" title="${escAttr(switchTitle)}" aria-label="${escAttr(switchTitle)}" ${switchClick}>${switchLabel}</button>
           <button class="btn-icon" title="${escAttr(t('open_timeline'))}" aria-label="${escAttr(t('open_timeline'))}" onclick="event.stopPropagation();openInTimeline(${task.id})">${icon('lanes')}</button>
           <div>
-            <div class="task-dur">${fmtMs(entry.focus_ms)}</div>
+            <div class="task-dur">${durHtml(rep, entry)}</div>
             <div class="task-hops ${hopCls}">${hopText}</div>
           </div>
         </div>

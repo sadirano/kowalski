@@ -407,6 +407,7 @@
   .ref-link:hover{text-decoration-style:solid;text-decoration-color:currentColor}
   .task-meta{font-size:12px;color:var(--muted);margin-top:2px}
   .task-dur{font-size:16px;font-weight:700;white-space:nowrap;text-align:right}
+  .dur-par{font-size:12px;font-weight:400;color:var(--muted)}
   .task-hops{font-size:11px;text-align:right;margin-top:2px}
   .task-hops.none{color:var(--muted)}
   .task-hops.some{color:var(--warn)}
