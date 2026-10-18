@@ -518,6 +518,17 @@ pub const Store = struct {
                 return id;
             }
         }
+        // An unscoped capture may name a task in any project; several matches
+        // make a new task rather than fail the capture.
+        if (scope == null) {
+            var stmt = try s.db.prepare("SELECT id FROM tasks WHERE title=?1 COLLATE NOCASE ORDER BY id LIMIT 2");
+            defer stmt.finalize();
+            try stmt.bindText(1, title);
+            if (try stmt.step() == .row) {
+                const id = stmt.columnI64(0);
+                if (try stmt.step() != .row) return id;
+            }
+        }
         return s.insertTask(title, .{ .selected = scope }, now_ms);
     }
 
@@ -4142,4 +4153,43 @@ test "inactive nonholding busy ignores a stored focus role" {
     _ = try s.capture(run, 2_000);
     try std.testing.expectEqual(task, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
     try testText(&db, "SELECT role FROM capture_runs WHERE source='agent' AND run='a'", "parallel");
+}
+
+test "capture resolves task across projects when scope is null" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const proj = try s.createProject("game", 1);
+    const task_id = try s.createTaskWithProject("Character One", .{ .selected = proj }, 2);
+    const C: Capture = .{ .source = "overlay", .run = "run1", .kind = .prompt, .subject = "Character One" };
+    _ = try s.capture(C, 1000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM tasks"));
+    try std.testing.expectEqual(task_id, try testScalar(&db, "SELECT task_id FROM capture_runs WHERE run='run1'"));
+}
+
+test "unscoped capture with a title in two projects makes a new task" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    _ = try s.createTaskWithProject("Fix login", .{ .selected = try s.createProject("alpha", 1) }, 2);
+    _ = try s.createTaskWithProject("Fix login", .{ .selected = try s.createProject("beta", 1) }, 2);
+    _ = try s.capture(.{ .source = "overlay", .run = "r", .kind = .prompt, .subject = "Fix login" }, 1000);
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT count(*) FROM tasks"));
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT task_id FROM capture_runs WHERE run='r'"));
+}
+
+test "scoped capture keeps to its project" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    _ = try s.createTaskWithProject("Fix login", .{ .selected = try s.createProject("alpha", 1) }, 2);
+    _ = try s.createTaskWithProject("Fix login", .{ .selected = try s.createProject("beta", 1) }, 2);
+    _ = try s.capture(.{ .source = "overlay", .run = "r1", .kind = .prompt, .subject = "Fix login", .project_key = "beta", .project_hint = "beta" }, 1000);
+    _ = try s.capture(.{ .source = "overlay", .run = "r2", .kind = .prompt, .subject = "Fix login", .project_key = "gamma", .project_hint = "gamma" }, 2000);
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT count(*) FROM tasks"));
+    try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT task_id FROM capture_runs WHERE run='r1'"));
+    try std.testing.expectEqual(@as(i64, 3), try testScalar(&db, "SELECT task_id FROM capture_runs WHERE run='r2'"));
 }
