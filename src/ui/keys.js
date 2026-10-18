@@ -81,8 +81,33 @@ document.addEventListener('keydown', e => {
   // A confirmation sits on top of everything: it takes Enter and Escape alone.
   if ((e.key === 'Escape' || e.key === 'Enter') && id('confirm-popup').classList.contains('show')) {
     e.preventDefault();
-    closeConfirm(e.key === 'Enter');
+    closeConfirm(e.key === 'Enter' && e.target !== id('confirm-cancel'));
     return;
+  }
+  if (e.key === 'Escape' && selectionUiOpen()) {
+    e.preventDefault();
+    if (_selectionMenu) closeSelectionMenu(); else closeSelectionPicker();
+    return;
+  }
+  if (activeTab === 'report' && !anyPopupOpen() && !selectionUiOpen()) {
+    const row = e.target.closest?.('.slot-row');
+    if ((e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) && row?.classList.contains('sel') && e.target.classList?.contains('slot-time')) {
+      e.preventDefault();
+      openSelectionMenu(e, row);
+      return;
+    }
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.classList?.contains('slot-time') && e.target.classList.contains('pick')) {
+      e.preventDefault();
+      selectSlot(e, Number(row.dataset.bi), Number(row.dataset.slot));
+      return;
+    }
+    if (_slotSel && !isTyping(e)) {
+      if (e.key === 'Escape') { e.preventDefault(); clearSlotSelection(); return; }
+      if (e.key === 'Delete') { e.preventDefault(); deleteSelectedTime(); return; }
+      if (ctrl && (e.key === 'c' || e.key === 'C') && !window.getSelection()?.toString()) {
+        e.preventDefault(); copySelectedTime(); return;
+      }
+    }
   }
   // The calendar can sit on top of another dialog: it takes the key alone.
   if ((e.key === 'Escape' || e.key === 'Enter') && id('cal-popup').classList.contains('show')) {

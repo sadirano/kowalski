@@ -15,15 +15,23 @@ function typedMs(hhmm, anchorMs) {
 // Asks in the page, never with a browser dialog. Resolves true on OK; a newer
 // question answers the older one with false.
 let _confirmDone = null;
-function askConfirm(text, okLabel, danger = false) {
+function askConfirm(text, okLabel, danger = false, { details = [], focusCancel = false } = {}) {
   if (_confirmDone) closeConfirm(false);
   id('confirm-text').textContent = text;
+  const list = id('confirm-details');
+  list.replaceChildren();
+  for (const detail of details) {
+    const item = document.createElement('li');
+    item.textContent = detail;
+    list.appendChild(item);
+  }
+  list.hidden = !details.length;
   const ok = id('confirm-ok');
   ok.textContent = okLabel;
   ok.classList.toggle('danger', danger);
   id('confirm-overlay').classList.add('show');
   id('confirm-popup').classList.add('show');
-  setTimeout(() => ok.focus(), 50);
+  setTimeout(() => (focusCancel ? id('confirm-cancel') : ok).focus(), 50);
   return new Promise(resolve => { _confirmDone = resolve; });
 }
 
@@ -260,28 +268,32 @@ async function applyAddEntry() {
 }
 
 // ── Move an interval to another task by dragging ─────────────────────────────
-// A closed interval's header, or a run of its selected 15-minute slots,
-// drags onto another task's card on the same day. A run cuts the interval:
-// only that stretch moves. Times and notes stay; the report re-sorts on reload.
-let _drag = null; // { bi, part: null | { from, to } }
+// Headers drag one full interval; a selected slot drags the whole clock range.
+let _drag = null; // { snapshot }
 
 function dragBlock(e, bi) {
-  _drag = { bi, part: null };
+  const s = _blockData[bi];
+  if (!s || s.end_ms == null) return;
+  _drag = { snapshot: {
+    pieces: [{ s, from: s.start_ms, to: s.end_ms }],
+    sources: [{ id: s.id, seen: seenOf(s), ranges: [[s.start_ms, s.end_ms]] }],
+    from_ms: s.start_ms, to_ms: s.end_ms,
+    posted_tasks: new Set(D.posted_tasks || []),
+  } };
   e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', String(bi));
+  e.dataTransfer.setData('text/plain', String(s.id));
   e.currentTarget.closest('.block').classList.add('dragging');
 }
 
 // Dragging a slot outside the selection selects just that slot first.
 function dragSlots(e, bi, k) {
   e.stopPropagation();
-  if (!(_slotSel?.bi === bi && k >= _slotSel.a && k <= _slotSel.b)) {
-    _slotSel = { bi, a: k, b: k };
-    markSlotSel();
-  }
-  _drag = { bi, part: slotRange(bi, _slotSel.a, _slotSel.b) };
+  if (!e.currentTarget.closest('.slot-row').classList.contains('sel')) selectSlot({ stopPropagation() {}, shiftKey: false }, bi, k);
+  const snapshot = selectionSnapshot();
+  if (!snapshot?.sources.length) return;
+  _drag = { snapshot };
   e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', String(bi));
+  e.dataTransfer.setData('text/plain', String(_blockData[bi].id));
 }
 
 function dragEndBlock() {
@@ -292,9 +304,8 @@ function dragEndBlock() {
 
 // Only another task's card accepts the drop.
 function dropTask(idx) {
-  const s = _drag && _blockData[_drag.bi];
   const task = _taskData[idx]?.task;
-  return s && task && task.id !== s.task.id ? task : null;
+  return _drag?.snapshot?.sources.length && task && _drag.snapshot.pieces.some(p => p.s.task.id !== task.id) ? task : null;
 }
 
 function dragOverTask(e, idx) {
@@ -314,15 +325,5 @@ async function dropOnTask(e, idx) {
   const task = dropTask(idx);
   dragEndBlock();
   if (!task) return;
-  const s = _blockData[drag.bi];
-  const body = { seen: seenOf(s), task: task.id };
-  if (drag.part) { body.from_ms = drag.part.from; body.to_ms = drag.part.to; }
-  try {
-    await apiJSON('POST', '/api/intervals/' + s.id + '/move', body);
-    const what = drag.part ? `${fmtTime(drag.part.from)}–${fmtTime(drag.part.to)}` : `${fmtTime(s.start_ms)}–${fmtTime(s.end_ms)}`;
-    showToast(t('moved_to', { what, name: task.ref || task.title }));
-  } catch (err) {
-    showError(err.data?.error === 'Overlap' ? t('move_overlap') : err.message);
-  }
-  loadDay(selectedDate, { chart: true });
+  await assignSelectionToTask(task, drag.snapshot);
 }

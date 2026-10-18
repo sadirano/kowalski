@@ -190,6 +190,7 @@ function initLayout({ migrate = false } = {}) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 // Clicks and keyboard shortcuts both select the tab by name.
 function setTab(tab) {
+  if (activeTab === 'report' && tab !== 'report') clearSlotSelection();
   activeTab = tab;
   applyActiveTab(activeTab);
   saveLS('activeTab', activeTab);

@@ -144,9 +144,9 @@ function restartPolling() {
 
 function isEditing() {
   const focused = document.activeElement?.tagName;
-  return _noteEditors > 0 || (typeof _slotSel !== 'undefined' && _slotSel != null)
+  return _noteEditors > 0 || selectionUiOpen()
     || focused === 'INPUT' || focused === 'TEXTAREA'
-    || !!document.querySelector('.modal.show, .popup.show')
+    || !!document.querySelector('.modal.show, .popup.show, #confirm-popup.show')
     || !!(_resize || _rdResize);
 }
 

@@ -291,9 +291,10 @@
 <div class="newtask-overlay confirm-overlay" id="confirm-overlay" onclick="closeConfirm(false)"></div>
 <div class="newtask-popup confirm-popup" id="confirm-popup" role="alertdialog" aria-modal="true" aria-labelledby="confirm-text">
   <div class="confirm-text" id="confirm-text"></div>
+  <ul class="confirm-details" id="confirm-details" hidden></ul>
   <div class="popup-row">
     <button class="apply-btn" id="confirm-ok" onclick="closeConfirm(true)" style="flex:1"></button>
-    <span class="cancel-link" onclick="closeConfirm(false)" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
+    <button type="button" class="cancel-link" id="confirm-cancel" onclick="closeConfirm(false)" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</button>
   </div>
 </div>
 
