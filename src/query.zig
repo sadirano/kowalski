@@ -379,12 +379,13 @@ pub const Posted = struct {
     confirmed_ms: i64,
 };
 
-pub fn postedOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8) ![]Posted {
-    var stmt = try store.db.prepare("SELECT amount_text,amount_micro,confirmed_ms FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state='confirmed' ORDER BY confirmed_ms,id");
+pub fn postedOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8, task_id: i64) ![]Posted {
+    var stmt = try store.db.prepare("SELECT amount_text,amount_micro,confirmed_ms FROM postings WHERE " ++ store_mod.posting_scope ++ " AND state='confirmed' ORDER BY confirmed_ms,id");
     defer stmt.finalize();
     try stmt.bindText(1, day);
     try stmt.bindText(2, instance);
     try stmt.bindText(3, ref);
+    try stmt.bindI64(4, task_id);
     var rows: std.ArrayList(Posted) = .empty;
     while (try stmt.step() == .row) try rows.append(a, .{
         .amount_text = try a.dupe(u8, stmt.columnText(0).?),
@@ -396,12 +397,13 @@ pub fn postedOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: 
 
 pub const PostedFingerprint = struct { text: []const u8, in_flight: bool };
 
-pub fn postedFingerprint(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8) !PostedFingerprint {
-    var stmt = try store.db.prepare("SELECT coalesce(sum(CASE WHEN state='confirmed' THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN state='confirmed' THEN amount_micro ELSE 0 END),0),coalesce(max(CASE WHEN state='confirmed' THEN id END),0),coalesce(max(CASE WHEN state IN ('sending','unknown') THEN 1 ELSE 0 END),0) FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state IN ('confirmed','sending','unknown')");
+pub fn postedFingerprint(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8, task_id: i64) !PostedFingerprint {
+    var stmt = try store.db.prepare("SELECT coalesce(sum(CASE WHEN state='confirmed' THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN state='confirmed' THEN amount_micro ELSE 0 END),0),coalesce(max(CASE WHEN state='confirmed' THEN id END),0),coalesce(max(CASE WHEN state IN ('sending','unknown') THEN 1 ELSE 0 END),0) FROM postings WHERE " ++ store_mod.posting_scope ++ " AND state IN ('confirmed','sending','unknown')");
     defer stmt.finalize();
     try stmt.bindText(1, day);
     try stmt.bindText(2, instance);
     try stmt.bindText(3, ref);
+    try stmt.bindI64(4, task_id);
     if (try stmt.step() != .row) return error.Sqlite;
     const value = try std.fmt.allocPrint(a, "{d}:{d}:{d}", .{ stmt.columnI64(0), stmt.columnI64(1), stmt.columnI64(2) });
     return .{ .text = value, .in_flight = stmt.columnI64(3) != 0 };
@@ -483,23 +485,25 @@ pub fn focusOnDay(store: *Store, a: std.mem.Allocator, task_id: i64, start_ms: i
     return .{ .spans = spans.items, .open_session = open };
 }
 
-pub fn coverageOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8) ![]Span {
-    var stmt = try store.db.prepare("SELECT covered_start_ms,covered_end_ms FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state IN ('confirmed','sending','unknown') AND covered_start_ms IS NOT NULL ORDER BY covered_start_ms");
+pub fn coverageOn(store: *Store, a: std.mem.Allocator, day: []const u8, instance: []const u8, ref: []const u8, task_id: i64) ![]Span {
+    var stmt = try store.db.prepare("SELECT covered_start_ms,covered_end_ms FROM postings WHERE " ++ store_mod.posting_scope ++ " AND state IN ('confirmed','sending','unknown') AND covered_start_ms IS NOT NULL ORDER BY covered_start_ms");
     defer stmt.finalize();
     try stmt.bindText(1, day);
     try stmt.bindText(2, instance);
     try stmt.bindText(3, ref);
+    try stmt.bindI64(4, task_id);
     var spans: std.ArrayList(Span) = .empty;
     while (try stmt.step() == .row) try spans.append(a, .{ .start_ms = stmt.columnI64(0), .end_ms = stmt.columnI64(1) });
     return spans.items;
 }
 
-pub fn hasTotalPosting(store: *Store, day: []const u8, instance: []const u8, ref: []const u8) !bool {
-    var stmt = try store.db.prepare("SELECT 1 FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state!='cancelled' AND covered_start_ms IS NULL LIMIT 1");
+pub fn hasTotalPosting(store: *Store, day: []const u8, instance: []const u8, ref: []const u8, task_id: i64) !bool {
+    var stmt = try store.db.prepare("SELECT 1 FROM postings WHERE " ++ store_mod.posting_scope ++ " AND state!='cancelled' AND covered_start_ms IS NULL LIMIT 1");
     defer stmt.finalize();
     try stmt.bindText(1, day);
     try stmt.bindText(2, instance);
     try stmt.bindText(3, ref);
+    try stmt.bindI64(4, task_id);
     return try stmt.step() == .row;
 }
 

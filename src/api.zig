@@ -1325,14 +1325,14 @@ fn dayList(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
             if (t.focus_ms <= 0) continue;
             const b = try query.binding(app.store, a, t.task_id) orelse continue;
             if (!std.mem.eql(u8, b.instance, instance)) continue;
-            const posted = try query.postedOn(app.store, a, date.text, instance, b.ref);
+            const posted = try query.postedOn(app.store, a, date.text, instance, b.ref, t.task_id);
             const remaining = if (session_mode) try remainingFor(app, a, date, t.task_id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
             const request = try std.json.Stringify.valueAlloc(a, .{
                 .day = date.text, .ref = b.ref, .day_over = now >= bounds.end_ms, .task_open = try query.taskOpen(app.store, t.task_id),
                 .total_focus_ms = if (session_mode) focusLength(remaining.pieces) else t.focus_ms,
                 .posted = if (session_mode) &.{} else posted,
             }, .{});
-            try items.append(a, .{ .row = row, .request = request, .in_flight = try app.store.isBlocked(date.text, instance, b.ref), .confirmed = posted.len > 0 });
+            try items.append(a, .{ .row = row, .request = request, .in_flight = try app.store.isBlocked(date.text, instance, b.ref, t.task_id), .confirmed = posted.len > 0 });
         }
     }
     const job = try a.create(StatusJob);
@@ -1535,6 +1535,9 @@ fn bindTask(app: *App, a: std.mem.Allocator, id: i64, raw: []const u8) !Response
     if (ref.len == 0) return badRequest(a, "ref");
     _ = try query.task(app.store, a, id) orelse return error.UnknownTask;
     if (try app.store.taskByBinding(instance, ref)) |bound| if (bound != id) return error.BindingConflict;
+    // A new ref waits for the task's unresolved postings, which keep the old one.
+    if (try app.store.hasUnresolvedPosting(id)) if (try query.binding(app.store, a, id)) |b|
+        if (!std.mem.eql(u8, b.instance, instance) or !std.mem.eql(u8, b.ref, ref)) return error.PostingInFlight;
     return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{ .task = id, .ref = try a.dupe(u8, ref) } } };
 }
 
@@ -1563,7 +1566,7 @@ fn remainingFor(app: *App, a: std.mem.Allocator, date: Date, task: i64, instance
     const z = try loadZone(app, a);
     const bounds = try z.dayBounds(date.year, date.month, date.day);
     const focus = try query.focusOnDay(app.store, a, task, bounds.start_ms, bounds.end_ms);
-    const coverage = try query.coverageOn(app.store, a, date.text, instance, ref);
+    const coverage = try query.coverageOn(app.store, a, date.text, instance, ref, task);
     var focus_spans: std.ArrayList(sessions.Span) = .empty;
     var prior_span: ?i64 = null;
     for (focus.spans) |span| {
@@ -1610,14 +1613,14 @@ fn chainSuccess(app: *App, a: std.mem.Allocator, chain: *SessionChain) !Response
 fn nextSessionQuote(app: *App, a: std.mem.Allocator, chain: *SessionChain) !?Response {
     if (chain.confirmed.items.len >= chain.limit) return null;
     const date = try dateParam(app, a, chain.day);
-    if (try app.store.isBlocked(chain.day, app.provider.?, chain.ref))
+    if (try app.store.isBlocked(chain.day, app.provider.?, chain.ref, chain.task))
         return try postingError(a, chain, .conflict, "PostingBlocked", "");
-    if (try query.hasTotalPosting(app.store, chain.day, app.provider.?, chain.ref))
+    if (try query.hasTotalPosting(app.store, chain.day, app.provider.?, chain.ref, chain.task))
         return try postingError(a, chain, .conflict, "PostedAsTotal", "this day was posted as a total; turn off posting by session to post the rest");
     const remaining = try remainingFor(app, a, date, chain.task, app.provider.?, chain.ref);
     if (remaining.pieces.len == 0) return null;
     const piece = remaining.pieces[0];
-    const fingerprint = try query.postedFingerprint(app.store, a, chain.day, app.provider.?, chain.ref);
+    const fingerprint = try query.postedFingerprint(app.store, a, chain.day, app.provider.?, chain.ref, chain.task);
     const request = try std.json.Stringify.valueAlloc(a, .{
         .day = chain.day, .ref = chain.ref, .day_over = chain.day_over,
         .task_open = try query.taskOpen(app.store, chain.task),
@@ -1646,9 +1649,9 @@ fn offers(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
     for (try focusOn(app, a, date)) |t| {
         const b = try query.binding(app.store, a, t.task_id);
         const mine = if (b) |v| app.provider != null and std.mem.eql(u8, v.instance, app.provider.?) else false;
-        const blocked = if (mine) try app.store.isBlocked(date.text, b.?.instance, b.?.ref) else false;
+        const blocked = if (mine) try app.store.isBlocked(date.text, b.?.instance, b.?.ref, t.task_id) else false;
         const remaining = if (mode and mine) try remainingFor(app, a, date, t.task_id, b.?.instance, b.?.ref) else Remaining{ .pieces = &.{}, .open_session = false };
-        const total = if (mode and mine) try query.hasTotalPosting(app.store, date.text, b.?.instance, b.?.ref) else false;
+        const total = if (mode and mine) try query.hasTotalPosting(app.store, date.text, b.?.instance, b.?.ref, t.task_id) else false;
         try list.append(a, .{
             .task = (try query.task(app.store, a, t.task_id)).?,
             .ref = if (mine) b.?.ref else null,
@@ -1678,9 +1681,9 @@ fn startPosting(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
     const b = try query.binding(app.store, a, id) orelse return error.NotBound;
     if (!std.mem.eql(u8, b.instance, instance)) return error.NotBound;
     const date = try dateParam(app, a, body.date);
-    if (try app.store.isBlocked(date.text, instance, b.ref)) return error.PostingBlocked;
+    if (try app.store.isBlocked(date.text, instance, b.ref, id)) return error.PostingBlocked;
     const mode = try sessionsMode(app);
-    if (mode and try query.hasTotalPosting(app.store, date.text, instance, b.ref))
+    if (mode and try query.hasTotalPosting(app.store, date.text, instance, b.ref, id))
         return fail(a, .{ .status = .conflict, .code = "PostedAsTotal", .message = "this day was posted as a total; turn off posting by session to post the rest" });
     const remaining = if (mode) try remainingFor(app, a, date, id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
     if (mode and remaining.pieces.len == 0) {
@@ -1696,8 +1699,8 @@ fn startPosting(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
     const bounds = try z.dayBounds(date.year, date.month, date.day);
     const day_over = app.clock() >= bounds.end_ms;
     const task_open = try query.taskOpen(app.store, id);
-    const posted = if (mode) &.{} else try query.postedOn(app.store, a, date.text, instance, b.ref);
-    const fingerprint = try query.postedFingerprint(app.store, a, date.text, instance, b.ref);
+    const posted = if (mode) &.{} else try query.postedOn(app.store, a, date.text, instance, b.ref, id);
+    const fingerprint = try query.postedFingerprint(app.store, a, date.text, instance, b.ref, id);
     const request = try std.json.Stringify.valueAlloc(a, .{
         .day = date.text, .ref = b.ref, .day_over = day_over, .task_open = task_open,
         .total_focus_ms = if (mode) (if (body.dry_run) focusLength(remaining.pieces) else remaining.pieces[0].end_ms - remaining.pieces[0].start_ms) else focus_ms, .posted = posted,
@@ -1848,7 +1851,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
             const binding = try query.binding(app.store, a, r.task) orelse return error.NotBound;
             if (!std.mem.eql(u8, binding.instance, instance) or !std.mem.eql(u8, binding.ref, r.ref))
                 return postingError(a, r.chain, .conflict, "QuoteStale", "postings changed while quoting; try again");
-            const fingerprint = try query.postedFingerprint(app.store, a, r.day, instance, r.ref);
+            const fingerprint = try query.postedFingerprint(app.store, a, r.day, instance, r.ref, r.task);
             if (fingerprint.in_flight or !std.mem.eql(u8, fingerprint.text, r.fingerprint))
                 return postingError(a, r.chain, .conflict, "QuoteStale", "postings changed while quoting; try again");
             // A dry run shows what a post would send and stops there.
@@ -1856,9 +1859,9 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
                 if (r.all_sessions) |all| return send(a, .ok, .{ .day = r.day, .task = r.task, .ref = r.ref, .amount_text = quoted.amount_text, .amount_micro = quoted.amount_micro, .sessions = all });
                 return send(a, .ok, .{ .day = r.day, .task = r.task, .ref = r.ref, .amount_text = quoted.amount_text, .amount_micro = quoted.amount_micro });
             }
-            if (r.session != null and try query.hasTotalPosting(app.store, r.day, instance, r.ref))
+            if (r.session != null and try query.hasTotalPosting(app.store, r.day, instance, r.ref, r.task))
                 return postingError(a, r.chain, .conflict, "PostedAsTotal", "this day was posted as a total; turn off posting by session to post the rest");
-            if (try app.store.isBlocked(r.day, instance, r.ref)) {
+            if (try app.store.isBlocked(r.day, instance, r.ref, r.task)) {
                 if (r.chain != null) return postingError(a, r.chain, .conflict, "PostingBlocked", "");
                 return error.PostingBlocked;
             }
@@ -2172,7 +2175,7 @@ test "day list synthetic 60 day timing" {
             times.binding += benchNow() - mark;
             if (!std.mem.eql(u8, b.instance, f.app.provider.?)) continue;
             mark = benchNow();
-            _ = try query.postedOn(&f.store, a, date.text, b.instance, b.ref);
+            _ = try query.postedOn(&f.store, a, date.text, b.instance, b.ref, t.task_id);
             times.posted += benchNow() - mark;
             mark = benchNow();
             _ = try remainingFor(&f.app, a, date, t.task_id, b.instance, b.ref);
@@ -2181,7 +2184,7 @@ test "day list synthetic 60 day timing" {
             _ = try query.taskOpen(&f.store, t.task_id);
             times.task_open += benchNow() - mark;
             mark = benchNow();
-            _ = try f.store.isBlocked(date.text, b.instance, b.ref);
+            _ = try f.store.isBlocked(date.text, b.instance, b.ref, t.task_id);
             times.blocked += benchNow() - mark;
         }
     }
@@ -2938,7 +2941,7 @@ test "session chain unknown second post blocks further posting" {
     try std.testing.expect(contains(r.body, "\"start\":\"10:00\",\"end\":\"10:30\""));
     const rows = try query.postingsOn(&f.store, f.arena.allocator(), "2026-03-10", task_id);
     try std.testing.expectEqualStrings("unknown", rows[1].state);
-    try std.testing.expect(try f.store.isBlocked("2026-03-10", "fake", "R-1"));
+    try std.testing.expect(try f.store.isBlocked("2026-03-10", "fake", "R-1", task_id));
 }
 
 test "session edits offer only extra coverage and suppress equal rounded endpoints" {
@@ -3156,7 +3159,7 @@ test "post accepts the provider's adjusted amount and data" {
     try std.testing.expectEqual(@as(i64, 1), worker.Fake.seen_posting.load(.acquire));
 }
 
-test "rebinding starts a new posted history for the new ref" {
+test "rebinding keeps time posted under the old ref posted" {
     var f: Fixture = .{};
     try postingFixture(&f);
     defer f.deinit();
@@ -3164,11 +3167,34 @@ test "rebinding starts a new posted history for the new ref" {
     try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/postings", "{\"task\":\"#1\"}").status);
     _ = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-2\"}");
     const r = f.call(.POST, "/api/postings", "{\"task\":\"#1\"}");
-    try std.testing.expectEqual(std.http.Status.created, r.status);
-    try std.testing.expect(contains(r.body, "\"amount_text\":\"1.25\""));
-    try std.testing.expect(contains(r.body, "\"external_ref\":\"T-2\""));
+    // The fake provider quotes total minus posted: nothing is left for T-2.
+    try std.testing.expect(r.status != .created);
     const old = (try query.posting(&f.store, f.arena.allocator(), 1)).?;
     try std.testing.expectEqualStrings("T-1", old.external_ref);
+    var count = try f.db.prepare("SELECT count(*) FROM postings WHERE state='confirmed'");
+    defer count.finalize();
+    _ = try count.step();
+    try std.testing.expectEqual(@as(i64, 1), count.columnI64(0));
+}
+
+test "a rebind waits for the task's unresolved posting and drops the old fields" {
+    var f: Fixture = .{};
+    try postingFixture(&f);
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}");
+    try f.db.exec("INSERT INTO task_fields VALUES(1,'old_only','x')");
+    const id = try f.store.startPosting("2026-03-10", 1, "fake", "T-1", "0.25", 250_000, test_now, null);
+    const waiting = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-2\"}");
+    try std.testing.expectEqual(std.http.Status.conflict, waiting.status);
+    try std.testing.expect(contains(waiting.body, "PostingInFlight"));
+    // Binding the same ref again is a refresh, not a rebind.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try f.store.postingFailed(id, test_now);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-2\"}").status);
+    var stmt = try f.db.prepare("SELECT count(*) FROM task_fields WHERE task_id=1 AND name='old_only'");
+    defer stmt.finalize();
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(i64, 0), stmt.columnI64(0));
 }
 
 test "a failed post with a known outcome is cancelled and can be retried" {

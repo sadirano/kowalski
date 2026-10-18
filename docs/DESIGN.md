@@ -11,6 +11,8 @@ The data model and behavior of kowalski. Contributor rules are in
   external ref)`, both opaque strings. The provider describes its extra
   fields (label, type, order) and kowalski displays them; it never knows
   what they mean.
+- Binding a task to a different ref drops the old ref's fields, and waits
+  while any of the task's postings is `sending` or `unknown`.
 - A task without a provider is a complete local task.
 
 ## Projects
@@ -117,7 +119,8 @@ existing rules.
   day's focus and confirmed postings. Several confirmed postings can share
   a day and ref. `sending` is saved before the provider is called, with a
   stable id for provider-side de-duplication. Only a `sending` or `unknown`
-  posting blocks another for the same day, provider instance and ref. A
+  posting blocks another for the same day and either the same task or the
+  same provider instance and ref. A
   timeout, or a `sending` row found at startup, becomes `unknown`; a late
   completion is applied when it arrives. Manual resolution is refused while
   that provider call still runs. After a crash, an `unknown` outcome needs
@@ -129,6 +132,10 @@ existing rules.
   cannot book the same time twice. Older postings have NULL coverage and
   represent day totals; total and session postings cannot mix for one day
   and ref because a total does not identify which minutes it covered.
+
+  What counts as posted for a task's day is every posting of that task,
+  under any ref it was bound to, plus every posting under its current ref.
+  So a rebind never makes time posted under the old ref postable again.
 
 ## Imported history
 

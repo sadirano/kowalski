@@ -3,6 +3,12 @@ const sqlite = @import("sqlite.zig");
 const schema = @import("schema.zig");
 const zone = @import("zone.zig");
 
+/// The postings that count for one task's day under one ref: the task's own,
+/// under any ref it was bound to, and any other task's under this ref. A
+/// rebind never makes time posted under the old ref postable again.
+/// Binds ?1 day, ?2 instance, ?3 ref, ?4 task.
+pub const posting_scope = "day=?1 AND (task_id=?4 OR (provider_instance=?2 AND external_ref=?3))";
+
 pub const Error = error{
     Sqlite,
     ForeignKeyViolation,
@@ -771,11 +777,20 @@ pub const Store = struct {
 
     /// Binds a task and stores the provider's field values in one transaction.
     /// An empty value removes the field; fields not named are left alone.
+    /// A new ref drops the old ref's fields first, and is refused while one
+    /// of the task's postings is unresolved.
     pub fn bindWithFields(s: *Store, task: i64, instance: []const u8, ref: []const u8, values: []const FieldValue, now_ms: i64) Error!void {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
         if (try s.taskByBinding(instance, ref)) |bound_task| {
             if (bound_task != task) return error.BindingConflict;
+        }
+        if (try s.bindingChanges(task, instance, ref)) {
+            if (try s.hasUnresolvedPosting(task)) return error.PostingBlocked;
+            var clear = try s.db.prepare("DELETE FROM task_fields WHERE task_id=?1");
+            defer clear.finalize();
+            try clear.bindI64(1, task);
+            _ = try clear.step();
         }
         var stmt = try s.db.prepare("INSERT INTO task_bindings(task_id,provider_instance,external_ref) VALUES(?1,?2,?3) ON CONFLICT(task_id) DO UPDATE SET provider_instance=excluded.provider_instance,external_ref=excluded.external_ref");
         defer stmt.finalize();
@@ -786,6 +801,23 @@ pub const Store = struct {
         for (values) |v| try s.putField(task, v.name, v.value);
         try s.applyProviderProjectFallback(task, values);
         try tx.commit();
+    }
+
+    /// Whether binding `task` to (instance, ref) replaces a different binding.
+    fn bindingChanges(s: *Store, task: i64, instance: []const u8, ref: []const u8) !bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM task_bindings WHERE task_id=?1 AND (provider_instance!=?2 OR external_ref!=?3)");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        try stmt.bindText(2, instance);
+        try stmt.bindText(3, ref);
+        return try stmt.step() == .row;
+    }
+
+    pub fn hasUnresolvedPosting(s: *Store, task: i64) Error!bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM postings WHERE task_id=?1 AND state IN ('sending','unknown') LIMIT 1");
+        defer stmt.finalize();
+        try stmt.bindI64(1, task);
+        return try stmt.step() == .row;
     }
 
     fn applyProviderProjectFallback(s: *Store, task: i64, values: []const FieldValue) !void {
@@ -1840,12 +1872,13 @@ pub const Store = struct {
         try tx.commit();
     }
 
-    pub fn isBlocked(s: *Store, day: []const u8, instance: []const u8, ref: []const u8) Error!bool {
-        var stmt = try s.db.prepare("SELECT 1 FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state IN ('sending','unknown') LIMIT 1");
+    pub fn isBlocked(s: *Store, day: []const u8, instance: []const u8, ref: []const u8, task: i64) Error!bool {
+        var stmt = try s.db.prepare("SELECT 1 FROM postings WHERE " ++ posting_scope ++ " AND state IN ('sending','unknown') LIMIT 1");
         defer stmt.finalize();
         try stmt.bindText(1, day);
         try stmt.bindText(2, instance);
         try stmt.bindText(3, ref);
+        try stmt.bindI64(4, task);
         return try stmt.step() == .row;
     }
 
@@ -1856,13 +1889,14 @@ pub const Store = struct {
     pub fn startPostingChecked(s: *Store, day: []const u8, task: i64, instance: []const u8, ref: []const u8, amount_text: []const u8, amount_micro: i64, now_ms: i64, covered: ?@import("sessions.zig").Span, fingerprint: ?[]const u8) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
-        if (try s.isBlocked(day, instance, ref)) return error.PostingBlocked;
+        if (try s.isBlocked(day, instance, ref, task)) return error.PostingBlocked;
         if (fingerprint) |expected| {
-            var check_fingerprint = try s.db.prepare("SELECT coalesce(sum(CASE WHEN state='confirmed' THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN state='confirmed' THEN amount_micro ELSE 0 END),0),coalesce(max(CASE WHEN state='confirmed' THEN id END),0) FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state IN ('confirmed','sending','unknown')");
+            var check_fingerprint = try s.db.prepare("SELECT coalesce(sum(CASE WHEN state='confirmed' THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN state='confirmed' THEN amount_micro ELSE 0 END),0),coalesce(max(CASE WHEN state='confirmed' THEN id END),0) FROM postings WHERE " ++ posting_scope ++ " AND state IN ('confirmed','sending','unknown')");
             defer check_fingerprint.finalize();
             try check_fingerprint.bindText(1, day);
             try check_fingerprint.bindText(2, instance);
             try check_fingerprint.bindText(3, ref);
+            try check_fingerprint.bindI64(4, task);
             if (try check_fingerprint.step() != .row) return error.Sqlite;
             var buffer: [96]u8 = undefined;
             const current = std.fmt.bufPrint(&buffer, "{d}:{d}:{d}", .{ check_fingerprint.columnI64(0), check_fingerprint.columnI64(1), check_fingerprint.columnI64(2) }) catch return error.PostingBlocked;
@@ -1870,13 +1904,14 @@ pub const Store = struct {
         }
         if (covered) |span| {
             if (span.start_ms >= span.end_ms) return error.PostingBlocked;
-            var check = try s.db.prepare("SELECT 1 FROM postings WHERE day=?1 AND provider_instance=?2 AND external_ref=?3 AND state!='cancelled' AND (covered_start_ms IS NULL OR (covered_start_ms<?5 AND covered_end_ms>?4)) LIMIT 1");
+            var check = try s.db.prepare("SELECT 1 FROM postings WHERE " ++ posting_scope ++ " AND state!='cancelled' AND (covered_start_ms IS NULL OR (covered_start_ms<?6 AND covered_end_ms>?5)) LIMIT 1");
             defer check.finalize();
             try check.bindText(1, day);
             try check.bindText(2, instance);
             try check.bindText(3, ref);
-            try check.bindI64(4, span.start_ms);
-            try check.bindI64(5, span.end_ms);
+            try check.bindI64(4, task);
+            try check.bindI64(5, span.start_ms);
+            try check.bindI64(6, span.end_ms);
             if (try check.step() == .row) return error.PostingBlocked;
         }
         var stmt = try s.db.prepare("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES(?1,?2,?3,?4,'sending',?5,?6,?7,?8,?9) RETURNING id");
@@ -3157,15 +3192,17 @@ test "posting ledger states and blocking" {
     const task = try s.createTask("A", 1);
     const p = try s.startPosting("2026-03-10", task, "fake", "T-1", "1.25", 1_250_000, 10, null);
     try std.testing.expectError(error.InvalidState, s.resolveUnknown(p, true, null, 11));
-    try std.testing.expect(try s.isBlocked("2026-03-10", "fake", "T-1"));
+    try std.testing.expect(try s.isBlocked("2026-03-10", "fake", "T-1", task));
     try std.testing.expectError(error.PostingBlocked, s.startPosting("2026-03-10", task, "fake", "T-1", "1", 1, 13, null));
-    const independent = try s.startPosting("2026-03-10", task, "fake", "T-2", "1", 1, 13, null);
+    try std.testing.expectError(error.PostingBlocked, s.startPosting("2026-03-10", task, "fake", "T-2", "1", 1, 13, null));
+    const other = try s.createTask("B", 1);
+    const independent = try s.startPosting("2026-03-10", other, "fake", "T-2", "1", 1, 13, null);
     try s.postingFailed(independent, 13);
     try s.markUnknown(p, 14);
     try std.testing.expectError(error.PostingBlocked, s.startPosting("2026-03-10", task, "fake", "T-1", "1", 1, 15, null));
     try std.testing.expectError(error.InvalidState, s.markUnknown(p, 15));
     try s.resolveUnknown(p, false, null, 16);
-    try std.testing.expect(!(try s.isBlocked("2026-03-10", "fake", "T-1")));
+    try std.testing.expect(!(try s.isBlocked("2026-03-10", "fake", "T-1", task)));
     const p2 = try s.startPosting("2026-03-10", task, "fake", "T-1", "2", 2_000_000, 17, null);
     try s.confirmPosting(p2, "1.75", 1_750_000, "receipt", 19);
     try testText(&db, "SELECT provider_data FROM postings WHERE id=3", "receipt");
@@ -3208,15 +3245,18 @@ test "late posting success confirms unknown state" {
     try std.testing.expectEqual(@as(i64, 4), try testScalar(&db, "SELECT confirmed_ms FROM postings WHERE id=1"));
 }
 
-test "in-flight posting blocks the same ref but not another ref" {
+test "in-flight posting blocks its task and ref but not another task's ref" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
     var s = try Store.init(&db, std.testing.allocator);
     const task = try s.createTask("A", 1);
+    const other = try s.createTask("B", 1);
     _ = try s.startPosting("2026-03-10", task, "fake", "T-1", "1", 1, 2, null);
     try std.testing.expectError(error.PostingBlocked, s.startPosting("2026-03-10", task, "fake", "T-1", "2", 2, 3, null));
-    _ = try s.startPosting("2026-03-10", task, "fake", "T-2", "2", 2, 3, null);
+    try std.testing.expectError(error.PostingBlocked, s.startPosting("2026-03-10", task, "fake", "T-2", "2", 2, 3, null));
+    try std.testing.expectError(error.PostingBlocked, s.startPosting("2026-03-10", other, "fake", "T-1", "2", 2, 3, null));
+    _ = try s.startPosting("2026-03-10", other, "fake", "T-2", "2", 2, 3, null);
     try std.testing.expectEqual(@as(i64, 2), try testScalar(&db, "SELECT count(*) FROM postings WHERE state='sending'"));
 }
 
