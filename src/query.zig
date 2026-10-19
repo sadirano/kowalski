@@ -525,12 +525,19 @@ pub fn lunchOpen(store: *Store) !bool {
     return try stmt.step() == .row;
 }
 
-/// True when the day's history was edited after its latest confirmed posting.
+/// True when the day's history was edited after its latest confirmation or acceptance.
 pub fn changedAfterPosting(store: *Store, day: []const u8) !bool {
-    var stmt = try store.db.prepare("SELECT 1 FROM day_edits e WHERE e.day=?1 AND e.edited_ms>(SELECT max(confirmed_ms) FROM postings p WHERE p.day=?1 AND p.state='confirmed')");
+    var stmt = try store.db.prepare("SELECT 1 FROM day_edits e WHERE e.day=?1 AND e.edited_ms>(SELECT max(confirmed_ms) FROM postings p WHERE p.day=?1 AND p.state='confirmed') AND (e.accepted_ms IS NULL OR e.edited_ms>e.accepted_ms)");
     defer stmt.finalize();
     try stmt.bindText(1, day);
     return try stmt.step() == .row;
+}
+
+pub fn dayEditedMs(store: *Store, day: []const u8) !?i64 {
+    var stmt = try store.db.prepare("SELECT edited_ms FROM day_edits WHERE day=?1");
+    defer stmt.finalize();
+    try stmt.bindText(1, day);
+    return if (try stmt.step() == .row) stmt.columnI64(0) else null;
 }
 
 /// Tasks with a posting still in effect or awaiting its outcome that day.

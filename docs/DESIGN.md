@@ -140,6 +140,8 @@ existing rules.
   What counts as posted for a task's day is every posting of that task,
   under any ref it was bound to, plus every posting under its current ref.
   So a rebind never makes time posted under the old ref postable again.
+  A day changed after all its postings were confirmed can be accepted as
+  posted without changing its postings; a later edit marks it changed again.
 
 ## Imported history
 

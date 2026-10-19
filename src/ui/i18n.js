@@ -178,7 +178,7 @@ const I18N = {
     set_lock_hint: "Locking the screen inside these windows pauses tracking. Sleep and hibernate stop it at any hour.",
 
     set_day_order: 'Day order', day_oldest: 'Oldest first', day_newest: 'Newest first',
-    st_posted: 'All posted', st_partial: 'Partly posted', st_changed: 'Changed after posting',
+    st_posted: 'All posted', st_partial: 'Partly posted', st_changed: 'Changed after posting', keep_as_posted: 'Keep as posted',
     st_unknown: 'Post outcome unknown', st_unposted: 'Not posted', st_none: 'Nothing to post', st_error: 'Status unavailable',
     parallel: 'parallel', merge_next: "Merge with the next interval", bind_ref: 'Bind to a ref',
     no_provider: 'No provider in this build',
@@ -363,7 +363,7 @@ const I18N = {
     set_lock_hint: "Bloquear a tela nestes períodos pausa o registro. Suspender ou hibernar para o registro a qualquer hora.",
 
     set_day_order: 'Ordem dos dias', day_oldest: 'Mais antigos primeiro', day_newest: 'Mais recentes primeiro',
-    st_posted: 'Tudo lançado', st_partial: 'Parcialmente lançado', st_changed: 'Alterado após o lançamento',
+    st_posted: 'Tudo lançado', st_partial: 'Parcialmente lançado', st_changed: 'Alterado após o lançamento', keep_as_posted: 'Manter como lançado',
     st_unknown: 'Resultado do lançamento desconhecido', st_unposted: 'Não lançado', st_none: 'Nada a lançar', st_error: 'Status indisponível',
     parallel: 'em paralelo', merge_next: 'Mesclar com o próximo bloco', bind_ref: 'Vincular a uma ref',
     no_provider: 'Nenhum provedor nesta versão',
@@ -540,7 +540,7 @@ const I18N = {
     set_lock_hint: "この時間帯に画面をロックすると記録を一時停止します。スリープと休止状態では時間帯に関係なく記録が止まります。",
 
     set_day_order: '日付の並び順', day_oldest: '古い順', day_newest: '新しい順',
-    st_posted: 'すべて登録済み', st_partial: '一部登録済み', st_changed: '登録後に変更',
+    st_posted: 'すべて登録済み', st_partial: '一部登録済み', st_changed: '登録後に変更', keep_as_posted: '登録済みのままにする',
     st_unknown: '登録結果不明', st_unposted: '未登録', st_none: "登録対象なし", st_error: '状態を取得できません',
     parallel: '並行', merge_next: "次の区間と結合", bind_ref: "ref に紐付け",
     no_provider: 'このビルドにはプロバイダーがありません',

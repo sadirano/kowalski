@@ -36,7 +36,7 @@ pub fn ensure(db: *sqlite.Db) !void {
             "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);" ++
             "CREATE TABLE lunches(id INTEGER PRIMARY KEY, out_ms INTEGER NOT NULL, back_ms INTEGER CHECK(back_ms IS NULL OR back_ms>=out_ms));" ++
             "CREATE UNIQUE INDEX one_open_lunch ON lunches(back_ms IS NULL) WHERE back_ms IS NULL;" ++
-            "CREATE TABLE day_edits(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), edited_ms INTEGER NOT NULL);" ++
+            "CREATE TABLE day_edits(day TEXT PRIMARY KEY CHECK(day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'), edited_ms INTEGER NOT NULL, accepted_ms INTEGER);" ++
             "CREATE TABLE provider_trust(id INTEGER PRIMARY KEY CHECK(id=1), sha256 TEXT NOT NULL, how TEXT NOT NULL CHECK(how IN ('compared','accepted')), approved_ms INTEGER NOT NULL, last_good TEXT, loading TEXT);",
     );
     // 2: lunch breaks as recorded, and when each day's history was last edited.
@@ -117,14 +117,18 @@ pub fn ensure(db: *sqlite.Db) !void {
     if (version > 0 and version < 13) try db.exec(
         "ALTER TABLE notes ADD COLUMN starred INTEGER NOT NULL DEFAULT 0 CHECK(starred IN (0,1))",
     );
-    try db.exec("PRAGMA user_version=13");
+    // 14: accepting a changed day keeps its edit history and postings intact.
+    if (version > 0 and version < 14) try db.exec(
+        "ALTER TABLE day_edits ADD COLUMN accepted_ms INTEGER",
+    );
+    try db.exec("PRAGMA user_version=14");
     var check = try db.prepare("PRAGMA foreign_key_check");
     defer check.finalize();
     if (try check.step() != .done) return error.ForeignKeyViolation;
     try tx.commit();
 }
 
-pub const current: i64 = 13;
+pub const current: i64 = 14;
 
 const legacyBase =
         "CREATE TABLE imports(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, source TEXT NOT NULL, report TEXT NOT NULL, events TEXT NOT NULL);" ++
@@ -208,8 +212,9 @@ test "schema constraints and version" {
     defer db.close();
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 13), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM pragma_table_info('notes') WHERE name='starred' AND \"notnull\"=1 AND dflt_value='0'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM pragma_table_info('day_edits') WHERE name='accepted_ms' AND \"notnull\"=0"));
     try db.exec("INSERT INTO projects(label) VALUES('fresh')");
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('FRESH')"));
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO projects(label) VALUES('')"));
@@ -231,7 +236,7 @@ test "schema constraints and version" {
     try std.testing.expectError(error.Sqlite, db.exec("INSERT INTO lunches(out_ms) VALUES(2)"));
     try db.exec("UPDATE lunches SET back_ms=3");
     try db.exec("INSERT INTO lunches(out_ms) VALUES(4)");
-    try db.exec("PRAGMA user_version=14");
+    try db.exec("PRAGMA user_version=15");
     try std.testing.expectError(error.SchemaVersion, ensure(&db));
 }
 
@@ -252,7 +257,7 @@ fn scalar(db: *sqlite.Db, sql: []const u8) !i64 {
 }
 
 fn assertV10(db: *sqlite.Db) !void {
-    try std.testing.expectEqual(@as(i64, 13), try scalar(db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "SELECT count(*) FROM pragma_table_info('capture_runs') WHERE name='provisional_title' AND \"notnull\"=1 AND dflt_value='0'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(db, "PRAGMA foreign_keys"));
     try std.testing.expectEqual(@as(i64, 11), try scalar(db, "SELECT id FROM tasks"));
@@ -396,7 +401,7 @@ test "populated v8 upgrades to v10 in place with one v8 backup" {
             "ALTER TABLE saved_set DROP COLUMN project_id;" ++
             "ALTER TABLE intervals DROP COLUMN posting_span_id;ALTER TABLE intervals DROP COLUMN project_id;" ++
             "ALTER TABLE tasks DROP COLUMN project_fallback_eligible;ALTER TABLE tasks DROP COLUMN project_choice_explicit;ALTER TABLE tasks DROP COLUMN project_id;" ++
-            "DROP TABLE capture_project_keys;DROP TABLE projects;ALTER TABLE notes DROP COLUMN starred;PRAGMA user_version=8;PRAGMA foreign_keys=ON;",
+            "DROP TABLE capture_project_keys;DROP TABLE projects;ALTER TABLE notes DROP COLUMN starred;ALTER TABLE day_edits DROP COLUMN accepted_ms;PRAGMA user_version=8;PRAGMA foreign_keys=ON;",
     );
     try db.exec(
         "INSERT INTO tasks(id,title,created_ms) VALUES(17,'synthetic',100);" ++
@@ -409,7 +414,7 @@ test "populated v8 upgrades to v10 in place with one v8 backup" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 13), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND start_ms=100 AND end_ms=200 AND text='work' AND captured=1 AND project_id IS NULL AND posting_span_id IS NULL"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND project_id IS NULL AND project_choice_explicit=0 AND project_fallback_eligible=0"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=19 AND interval_id=18 AND at_ms=150 AND text='note' AND source='prompt'"));
@@ -448,7 +453,7 @@ test "populated v9 gains a cleared provisional flag and keeps history" {
     try db.open(":memory:");
     defer db.close();
     try ensure(&db);
-    try db.exec("ALTER TABLE capture_runs DROP COLUMN provisional_title; ALTER TABLE notes DROP COLUMN starred; PRAGMA user_version=9");
+    try db.exec("ALTER TABLE capture_runs DROP COLUMN provisional_title; ALTER TABLE notes DROP COLUMN starred; ALTER TABLE day_edits DROP COLUMN accepted_ms; PRAGMA user_version=9");
     try db.exec(
         "INSERT INTO tasks(id,title,created_ms) VALUES(17,'Session',100);" ++
             "INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by,captured) VALUES(18,17,'focus',100,200,'switch','stop',1);" ++
@@ -459,7 +464,7 @@ test "populated v9 gains a cleared provisional flag and keeps history" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 13), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 0), try scalar(&db, "SELECT provisional_title FROM capture_runs WHERE run='run'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM tasks WHERE id=17 AND title='Session'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM intervals WHERE id=18 AND task_id=17 AND captured=1"));
@@ -474,14 +479,14 @@ test "v10 settings take their kind's names and keep their values" {
     try db.open(":memory:");
     defer db.close();
     try ensure(&db);
-    try db.exec("ALTER TABLE notes DROP COLUMN starred; PRAGMA user_version=10");
+    try db.exec("ALTER TABLE notes DROP COLUMN starred; ALTER TABLE day_edits DROP COLUMN accepted_ms; PRAGMA user_version=10");
     try db.exec(
         "INSERT INTO settings(key,value) VALUES('ui_autofill_obs','1'),('ui_open_on_launch','0'),('ui_hide_weekends','1')," ++
             "('ui_chart_engine','compare'),('ui_poll_seconds','5'),('daily_work_minutes','480'),('post_daily_notes','0'),('ui_show_weekends','1');",
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 13), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM settings WHERE key='post_daily_notes' AND value='1'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM settings WHERE key='open_on_launch' AND value='0'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM settings WHERE key='ui_show_weekends' AND value='0'"));
@@ -495,7 +500,7 @@ test "v12 notes gain an unstarred mark without losing history" {
     defer db.close();
     try ensure(&db);
     try db.exec(
-        "ALTER TABLE notes DROP COLUMN starred;" ++
+        "ALTER TABLE notes DROP COLUMN starred;ALTER TABLE day_edits DROP COLUMN accepted_ms;" ++
             "PRAGMA user_version=12;" ++
             "INSERT INTO tasks(id,title,created_ms) VALUES(1,'Task',100);" ++
             "INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by) VALUES(1,1,'focus',100,200,'switch','stop');" ++
@@ -505,11 +510,34 @@ test "v12 notes gain an unstarred mark without losing history" {
     );
     try ensure(&db);
     try ensure(&db);
-    try std.testing.expectEqual(@as(i64, 13), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 14), try scalar(&db, "PRAGMA user_version"));
     try std.testing.expectEqual(@as(i64, 2), try scalar(&db, "SELECT count(*) FROM notes WHERE starred=0"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=1 AND text='first' AND at_ms=120"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE id=2 AND text='second' AND at_ms=180"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM day_summaries WHERE text='summary'"));
     try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM postings WHERE state='confirmed'"));
     try std.testing.expectError(error.Sqlite, db.exec("UPDATE notes SET starred=2"));
+}
+
+test "v13 day edits gain acceptance without losing history" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    try ensure(&db);
+    try db.exec(
+        "ALTER TABLE day_edits DROP COLUMN accepted_ms;PRAGMA user_version=13;" ++
+            "INSERT INTO day_edits(day,edited_ms) VALUES('2026-03-10',1234);" ++
+            "INSERT INTO tasks(id,title,created_ms) VALUES(1,'Task',100);" ++
+            "INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by) VALUES(1,1,'focus',100,200,'switch','stop');" ++
+            "INSERT INTO notes(id,interval_id,at_ms,text) VALUES(1,1,120,'note');" ++
+            "INSERT INTO day_summaries(day,text) VALUES('2026-03-10','summary');" ++
+            "INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms) VALUES('2026-03-10',1,'sample','ref','confirmed','1',1000000,200,200);",
+    );
+    try ensure(&db);
+    try ensure(&db);
+    try std.testing.expectEqual(@as(i64, 14), try scalar(&db, "PRAGMA user_version"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM day_edits WHERE day='2026-03-10' AND edited_ms=1234 AND accepted_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM notes WHERE text='note'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM day_summaries WHERE text='summary'"));
+    try std.testing.expectEqual(@as(i64, 1), try scalar(&db, "SELECT count(*) FROM postings WHERE state='confirmed'"));
 }

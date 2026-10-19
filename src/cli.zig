@@ -69,7 +69,7 @@ pub const usage =
     \\  provider install [--sequence N] [--yes]  install a verified release
     \\  provider login               sign in to the provider (prompts for the details)
     \\  bind <#id> <ref>             bind a task to an external ref (fields come from the provider)
-    \\  postings [<YYYY-MM-DD>]      what can be posted for a day, and what was
+    \\  postings [<YYYY-MM-DD>] [--accept]  list postings or keep a changed day posted
     \\  post [<YYYY-MM-DD>] <task> [-m <text>] [-o <option,...>]
     \\                               post a task's focus time for a day
     \\  resolve <posting> posted|not-posted     settle a posting whose outcome is unknown
@@ -1000,8 +1000,20 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "postings")) {
-        if (args.len > 1) return error.Usage;
-        const target = if (args.len == 1) try std.fmt.allocPrint(ctx.a, "/api/postings?date={s}", .{try pathEscape(ctx, args[0])}) else "/api/postings";
+        var rest: std.ArrayList([]const u8) = .empty;
+        var accept = false;
+        for (args) |arg| {
+            if (eql(u8, arg, "--accept")) accept = true else try rest.append(ctx.a, arg);
+        }
+        if (rest.items.len > 1) return error.Usage;
+        if (accept) {
+            const reply = try call(ctx, "POST", "/api/postings/accept", try jsonBody(ctx, .{ .date = if (rest.items.len == 1) rest.items[0] else @as(?[]const u8, null) }));
+            if (!try settle(ctx, reply)) return .ok;
+            const r = try parse(struct { date: []const u8 }, ctx, reply.body);
+            try ctx.out.print("accepted {s}\n", .{r.date});
+            return .ok;
+        }
+        const target = if (rest.items.len == 1) try std.fmt.allocPrint(ctx.a, "/api/postings?date={s}", .{try pathEscape(ctx, rest.items[0])}) else "/api/postings";
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { date: []const u8, instance: ?[]const u8 = null, sessions_mode: bool = false, offers: []struct { task: Task, total_focus_ms: i64, postable: bool, ref: ?[]const u8 = null, postings: []Posting, sessions: []struct { start: []const u8, end: []const u8 } = &.{}, open_session: bool = false } }, ctx, reply.body);
@@ -1585,6 +1597,33 @@ test "starred note commands and day output use the API" {
     try std.testing.expectEqual(@as(usize, 4), Fake.calls);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "n7  00:00  #1 A  first?line\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "hidden") == null);
+}
+
+test "postings accept flag uses the API" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn request(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            try std.testing.expectEqualStrings("POST", method);
+            try std.testing.expectEqualStrings("/api/postings/accept", target);
+            const parsed = try parse(struct { date: ?[]const u8 }, ctx, body.?);
+            if (calls == 0) try std.testing.expectEqualStrings("2026-03-10", parsed.date.?) else try std.testing.expect(parsed.date == null);
+            calls += 1;
+            return .{ .status = 200, .body = "{\"date\":\"2026-03-10\",\"accepted\":true}" };
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "postings", &.{ "--accept", "2026-03-10" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "postings", &.{"--accept"}));
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+    try std.testing.expectEqualStrings("accepted 2026-03-10\naccepted 2026-03-10\n", out.written());
 }
 
 test "starred day lists only notes within the selected day" {

@@ -564,6 +564,10 @@
   /* Quick-switch chips (Feature 5) */
   /* Post hours dialog */
   .horas-popup{width:min(540px,92vw);max-height:86vh;overflow:auto}
+  .hr-changed{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;padding:7px 10px;border:1px solid var(--warn);border-radius:5px;color:var(--warn);font-size:12px}
+  .hr-changed button{border:1px solid var(--warn);border-radius:4px;background:var(--hover);color:var(--txt);padding:4px 8px;cursor:pointer;white-space:nowrap}
+  .hr-changed button:hover{color:var(--warn)}
+  .hr-changed button:disabled{opacity:.5;cursor:default}
   .horas-table{display:flex;flex-direction:column;gap:6px}
   .horas-row{display:flex;align-items:center;gap:9px;background:var(--bg);border:1px solid var(--brd);border-radius:5px;padding:7px 10px}
   .horas-row.posted{opacity:.55}

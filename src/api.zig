@@ -313,6 +313,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return .{ .status = .ok, .body = "", .followup = .fields };
     }
     if (is(req, .GET, path, "/api/postings")) return offers(app, a, try param(a, params, "date"));
+    if (is(req, .POST, path, "/api/postings/accept")) return acceptChanged(app, a, req.body);
     if (is(req, .POST, path, "/api/postings")) return startPosting(app, a, req.body);
     if (req.method == .POST and std.mem.startsWith(u8, path, "/api/postings/") and std.mem.endsWith(u8, path, "/resolve")) {
         const id = std.fmt.parseInt(i64, path["/api/postings/".len .. path.len - "/resolve".len], 10) catch return notFound(a);
@@ -1313,6 +1314,8 @@ pub const StatusJob = struct {
     rows: []DayRow,
     items: []StatusItem,
     next: usize,
+    accept: ?[]const u8 = null,
+    accept_edit: ?i64 = null,
 
     fn advance(job: *StatusJob, from: usize) ?usize {
         var i = from;
@@ -1320,6 +1323,44 @@ pub const StatusJob = struct {
         return null;
     }
 };
+
+fn appendStatusDate(app: *App, a: std.mem.Allocator, z: *const zone.Zone, now: i64, session_mode: bool, date: Date, rows: *std.ArrayList(DayRow), items: *std.ArrayList(StatusItem)) !void {
+    const bounds = try z.dayBounds(date.year, date.month, date.day);
+    const numbers = try days.dayNumbers(app.store, a, bounds.start_ms, bounds.end_ms, now, try scheduleFor(app, a, bounds));
+    const row = rows.items.len;
+    try rows.append(a, .{ .date = date.text, .total_ms = numbers.total_ms, .paid_break_ms = numbers.paid_break_ms, .changed_after_posting = try query.changedAfterPosting(app.store, date.text) });
+    const instance = app.provider orelse return;
+    for (numbers.tasks) |t| {
+        if (t.focus_ms <= 0) continue;
+        const b = try query.binding(app.store, a, t.task_id) orelse continue;
+        if (!std.mem.eql(u8, b.instance, instance)) continue;
+        const posted = try query.postedOn(app.store, a, date.text, instance, b.ref, t.task_id);
+        const remaining = if (session_mode) try remainingFor(app, a, date, t.task_id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
+        const request = try std.json.Stringify.valueAlloc(a, .{
+            .day = date.text, .ref = b.ref, .day_over = now >= bounds.end_ms, .task_open = try query.taskOpen(app.store, t.task_id),
+            .total_focus_ms = if (session_mode) focusLength(remaining.pieces) else t.focus_ms,
+            .posted = if (session_mode) &.{} else posted,
+        }, .{});
+        try items.append(a, .{ .row = row, .request = request, .in_flight = try app.store.isBlocked(date.text, instance, b.ref, t.task_id), .confirmed = posted.len > 0 });
+    }
+}
+
+fn acceptChanged(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
+    const body = try parseBody(struct { date: ?[]const u8 = null }, a, raw) orelse return badRequest(a, "body");
+    const date = try dateParam(app, a, body.date);
+    const accept_edit = try query.dayEditedMs(app.store, date.text);
+    const z = try loadZone(app, a);
+    var rows: std.ArrayList(DayRow) = .empty;
+    var items: std.ArrayList(StatusItem) = .empty;
+    try appendStatusDate(app, a, &z, app.clock(), try sessionsMode(app), date, &rows, &items);
+    const job = try a.create(StatusJob);
+    job.* = .{ .rows = rows.items, .items = items.items, .next = 0, .accept = date.text, .accept_edit = accept_edit };
+    if (job.advance(0)) |first| {
+        job.next = first;
+        return .{ .status = .ok, .body = "", .followup = .{ .status = job } };
+    }
+    return finishStatus(app, a, job);
+}
 
 /// The last `count` days (work days with `weekends=0`), oldest first, each
 /// with its focus total and posting status. The status asks the provider's
@@ -1343,36 +1384,17 @@ fn dayList(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     const now = app.clock();
     var rows: std.ArrayList(DayRow) = .empty;
     var items: std.ArrayList(StatusItem) = .empty;
-    for (picked.items) |date| {
-        const bounds = try z.dayBounds(date.year, date.month, date.day);
-        const numbers = try days.dayNumbers(app.store, a, bounds.start_ms, bounds.end_ms, now, try scheduleFor(app, a, bounds));
-        const row = rows.items.len;
-        try rows.append(a, .{ .date = date.text, .total_ms = numbers.total_ms, .paid_break_ms = numbers.paid_break_ms, .changed_after_posting = try query.changedAfterPosting(app.store, date.text) });
-        const instance = app.provider orelse continue;
-        for (numbers.tasks) |t| {
-            if (t.focus_ms <= 0) continue;
-            const b = try query.binding(app.store, a, t.task_id) orelse continue;
-            if (!std.mem.eql(u8, b.instance, instance)) continue;
-            const posted = try query.postedOn(app.store, a, date.text, instance, b.ref, t.task_id);
-            const remaining = if (session_mode) try remainingFor(app, a, date, t.task_id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
-            const request = try std.json.Stringify.valueAlloc(a, .{
-                .day = date.text, .ref = b.ref, .day_over = now >= bounds.end_ms, .task_open = try query.taskOpen(app.store, t.task_id),
-                .total_focus_ms = if (session_mode) focusLength(remaining.pieces) else t.focus_ms,
-                .posted = if (session_mode) &.{} else posted,
-            }, .{});
-            try items.append(a, .{ .row = row, .request = request, .in_flight = try app.store.isBlocked(date.text, instance, b.ref, t.task_id), .confirmed = posted.len > 0 });
-        }
-    }
+    for (picked.items) |date| try appendStatusDate(app, a, &z, now, session_mode, date, &rows, &items);
     const job = try a.create(StatusJob);
     job.* = .{ .rows = rows.items, .items = items.items, .next = 0 };
     if (job.advance(0)) |first| {
         job.next = first;
         return .{ .status = .ok, .body = "", .followup = .{ .status = job } };
     }
-    return finishStatus(a, job);
+    return finishStatus(app, a, job);
 }
 
-fn finishStatus(a: std.mem.Allocator, job: *StatusJob) Response {
+fn finishStatus(app: *App, a: std.mem.Allocator, job: *StatusJob) !Response {
     for (job.rows, 0..) |*row, r| {
         var counted: usize = 0;
         var in_flight = false;
@@ -1409,6 +1431,11 @@ fn finishStatus(a: std.mem.Allocator, job: *StatusJob) Response {
             "unposted"
         else
             "partial";
+    }
+    if (job.accept) |date| {
+        if (!std.mem.eql(u8, job.rows[0].status, "changed") or job.accept_edit == null or !try app.store.acceptDayEdit(date, job.accept_edit.?))
+            return fail(a, .{ .status = .conflict, .code = "NotChanged", .message = "day is not changed after posting" });
+        return send(a, .ok, .{ .date = date, .accepted = true });
     }
     return send(a, .ok, .{ .days = job.rows });
 }
@@ -1707,7 +1734,7 @@ fn offers(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
             .open_session = remaining.open_session,
         });
     }
-    return send(a, .ok, .{ .date = date.text, .instance = app.provider, .sessions_mode = mode, .offers = list.items });
+    return send(a, .ok, .{ .date = date.text, .instance = app.provider, .sessions_mode = mode, .changed_after_posting = try query.changedAfterPosting(app.store, date.text), .offers = list.items });
 }
 
 fn startPosting(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
@@ -1971,7 +1998,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
                 job.next = next;
                 return .{ .status = .ok, .body = "", .followup = .{ .status = job } };
             }
-            return finishStatus(a, job);
+            return finishStatus(app, a, job);
         },
         .post => |p| {
             const now = app.clock();
@@ -3859,10 +3886,14 @@ test "day status follows binding posting and reduced history" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
     const bound = try f.get(Days, "/api/days?count=3");
     try std.testing.expectEqualStrings("unposted", bound.days[1].status);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
     const posted = f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-09\"}");
     try std.testing.expectEqual(std.http.Status.created, posted.status);
     const confirmed = try f.get(Days, "/api/days?count=3");
     try std.testing.expectEqualStrings("posted", confirmed.days[1].status);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
     test_now += 60_000;
     const edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 3_660_000, start, start + 1_800_000 }));
     try std.testing.expectEqual(std.http.Status.ok, edit.status);
@@ -3870,6 +3901,88 @@ test "day status follows binding posting and reduced history" {
     try std.testing.expectEqualStrings("changed", changed.days[1].status);
     try std.testing.expect(changed.days[1].changed_after_posting);
     try std.testing.expectEqual(@as(i64, 1_800_000), changed.days[1].total_ms);
+    try std.testing.expect(contains(f.call(.GET, "/api/postings?date=2026-03-09", "").body, "\"changed_after_posting\":true"));
+    const edited_ms = try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'");
+    const posting_count = try apiScalar(&f.db, "SELECT count(*) FROM postings");
+    const interval_count = try apiScalar(&f.db, "SELECT count(*) FROM intervals");
+    const note_count = try apiScalar(&f.db, "SELECT count(*) FROM notes");
+    const accepted = f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}");
+    try std.testing.expectEqual(std.http.Status.ok, accepted.status);
+    try std.testing.expect(contains(accepted.body, "\"date\":\"2026-03-09\""));
+    try std.testing.expectEqual(edited_ms, try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'"));
+    try std.testing.expectEqual(posting_count, try apiScalar(&f.db, "SELECT count(*) FROM postings"));
+    try std.testing.expectEqual(interval_count, try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(note_count, try apiScalar(&f.db, "SELECT count(*) FROM notes"));
+    const accepted_ms = try apiScalar(&f.db, "SELECT accepted_ms FROM day_edits WHERE day='2026-03-09'");
+    const kept = try f.get(Days, "/api/days?count=3");
+    try std.testing.expectEqualStrings("posted", kept.days[1].status);
+    try std.testing.expect(!kept.days[1].changed_after_posting);
+    try std.testing.expect(contains(f.call(.GET, "/api/postings?date=2026-03-09", "").body, "\"changed_after_posting\":false"));
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+    try std.testing.expectEqual(accepted_ms, try apiScalar(&f.db, "SELECT accepted_ms FROM day_edits WHERE day='2026-03-09'"));
+    const later = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 1_800_000, start, start + 1_500_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, later.status);
+    try std.testing.expectEqual(accepted_ms + 1, try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'"));
+    const changed_again = try f.get(Days, "/api/days?count=3");
+    try std.testing.expectEqualStrings("changed", changed_again.days[1].status);
+    try std.testing.expect(changed_again.days[1].changed_after_posting);
+}
+
+test "accept refuses an edit made during the provider follow-up" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_043_200_000;
+    test_now = 1_773_136_800_000;
+    f.app.provider = "fake";
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"A\"}");
+    const added = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 3_660_000 }));
+    try std.testing.expectEqual(std.http.Status.created, added.status);
+    const id = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, added.body, .{})).interval;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-09\"}").status);
+    test_now += 60_000;
+    const first_edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 3_660_000, start, start + 1_800_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, first_edit.status);
+    const snapshot = try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'");
+    const pending = handle(&f.app, a, .{ .method = .POST, .target = "/api/postings/accept", .host = "127.0.0.1:47100", .marker = true, .body = "{\"date\":\"2026-03-09\"}" });
+    try std.testing.expectEqual(std.http.Status.ok, pending.status);
+    try std.testing.expect(pending.followup != null and pending.followup.? == .status);
+    try std.testing.expectEqual(@as(?i64, snapshot), pending.followup.?.status.accept_edit);
+    const second_edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 1_800_000, start, start + 1_500_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, second_edit.status);
+    try std.testing.expectEqual(snapshot + 1, try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'"));
+    const w: worker.Worker = .{ .table = &worker.Fake.table, .io = std.testing.io };
+    const reply = proceed(&f.app, a, pending.followup.?, try w.run(a, pending.followup.?.call(), 5_000));
+    try std.testing.expectEqual(std.http.Status.conflict, reply.status);
+    try std.testing.expect(contains(reply.body, "NotChanged"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+}
+
+test "accepting a partly posted day is refused without storing acceptance" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_043_200_000;
+    test_now = 1_773_136_800_000;
+    f.app.provider = "fake";
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"A\"}");
+    const added = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 900_000 }));
+    try std.testing.expectEqual(std.http.Status.created, added.status);
+    const id = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, added.body, .{})).interval;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-09\"}").status);
+    test_now += 60_000;
+    const edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 900_000, start, start + 1_800_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, edit.status);
+    const days_after = try f.get(struct { days: []struct { date: []const u8, status: []const u8 } }, "/api/days?count=3");
+    try std.testing.expectEqualStrings("partial", days_after.days[1].status);
+    const response = f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}");
+    try std.testing.expectEqual(std.http.Status.conflict, response.status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
 }
 
 test "day status keeps unknown posting while quoting other days" {

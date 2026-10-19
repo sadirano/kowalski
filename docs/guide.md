@@ -361,6 +361,7 @@ kowalski post 2026-10-07 48213
 ```
 
 A task is `#<id>`, an external ref, or a title.
+Use `kowalski postings [<YYYY-MM-DD>] --accept` to keep a changed day posted without posting again.
 
 ### Starred notes
 

@@ -2045,6 +2045,16 @@ pub const Store = struct {
         try tx.commit();
     }
 
+    /// Accepts the current edit without changing the edit or any posting.
+    pub fn acceptDayEdit(s: *Store, day: []const u8, snapshot_ms: i64) Error!bool {
+        var stmt = try s.db.prepare("UPDATE day_edits SET accepted_ms=edited_ms WHERE day=?1 AND edited_ms=?2 AND edited_ms>(SELECT max(confirmed_ms) FROM postings WHERE day=?1 AND state='confirmed') AND (accepted_ms IS NULL OR edited_ms>accepted_ms) AND NOT EXISTS(SELECT 1 FROM postings WHERE day=?1 AND state IN ('sending','unknown'))");
+        defer stmt.finalize();
+        try stmt.bindText(1, day);
+        try stmt.bindI64(2, snapshot_ms);
+        _ = try stmt.step();
+        return s.db.changes() != 0;
+    }
+
     // ------------------------------------------------------------ history
 
     pub const Span = struct { start_ms: i64, end_ms: ?i64 };
@@ -2115,7 +2125,7 @@ pub const Store = struct {
             const d = z.dateOf(at) catch return error.InvalidTime;
             var buffer: [10]u8 = undefined;
             const day = try std.fmt.bufPrint(&buffer, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
-            var stmt = try s.db.prepare("INSERT INTO day_edits(day,edited_ms) VALUES(?1,?2) ON CONFLICT(day) DO UPDATE SET edited_ms=excluded.edited_ms");
+            var stmt = try s.db.prepare("INSERT INTO day_edits(day,edited_ms) VALUES(?1,?2) ON CONFLICT(day) DO UPDATE SET edited_ms=max(excluded.edited_ms,day_edits.edited_ms+1)");
             defer stmt.finalize();
             try stmt.bindText(1, day);
             try stmt.bindI64(2, now_ms);
@@ -2992,7 +3002,7 @@ test "store refuses a future schema version" {
     var db: sqlite.Db = .{};
     try db.open(":memory:");
     defer db.close();
-    try db.exec("PRAGMA user_version=14");
+    try db.exec("PRAGMA user_version=15");
     try std.testing.expectError(error.SchemaVersion, Store.init(&db, std.testing.allocator));
 }
 

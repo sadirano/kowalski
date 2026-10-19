@@ -7,9 +7,10 @@ let _obsEntry = null; // the entry the observation popup edits
 let _obsTok = 0;      // drops an autofill answer meant for an older popup
 let _horasGen = 0;    // a new dialog drops answers meant for the old one
 let _horasSessionsMode = false;
+let _horasChanged = false;
 
 // `drafts` maps a task id to the observation and options typed before a reload.
-async function showHorasDialog(date, drafts = null) {
+async function showHorasDialog(date, drafts = null, acceptRejected = false) {
   _horasDate = date;
   const gen = ++_horasGen;
   id('horas-overlay').classList.add('show');
@@ -33,6 +34,8 @@ async function showHorasDialog(date, drafts = null) {
         const draft = drafts?.get(offer.task.id);
         return { offer, quote: null, refused: null, observation: draft?.observation || '', options: { ...draft?.options } };
       });
+    _horasChanged = !acceptRejected && !!data.changed_after_posting && _horasEntries.length > 0 &&
+      _horasEntries.every(e => !pending(e.offer) && (e.offer.postings || []).some(p => p.state === 'confirmed'));
     renderHorasRows();
     await quoteHoras(gen);
   } catch (err) {
@@ -112,8 +115,9 @@ function horasOptions(e, i) {
 }
 
 function renderHorasRows() {
+  const changed = _horasChanged ? `<div class="hr-changed"><span>${esc(t('st_changed'))}</span><button id="hr-accept-btn" onclick="acceptHoras()">${esc(t('keep_as_posted'))}</button></div>` : '';
   if (!_horasEntries.length) {
-    id('horas-body').innerHTML = `<div class="horas-empty">${t('no_ref_day')}</div>`;
+    id('horas-body').innerHTML = changed + `<div class="horas-empty">${t('no_ref_day')}</div>`;
     return;
   }
   setHorasActions(_horasEntries.some(e => e.offer.postable)); // nothing to post: no Submit
@@ -132,7 +136,28 @@ function renderHorasRows() {
       <span class="hr-status" id="hr-st-${i}">${horasStatus(e)}${horasPostedLine(e)}</span>
     </div>`;
   }).join('');
-  id('horas-body').innerHTML = `<div class="horas-table">${rows}</div>`;
+  id('horas-body').innerHTML = changed + `<div class="horas-table">${rows}</div>`;
+}
+
+async function acceptHoras() {
+  const date = _horasDate;
+  const gen = _horasGen;
+  const drafts = new Map(_horasEntries.map(e => [e.offer.task.id, { observation: e.observation, options: { ...e.options } }]));
+  const button = id('hr-accept-btn');
+  if (button) button.disabled = true;
+  try {
+    await apiJSON('POST', '/api/postings/accept', { date });
+    if (gen === _horasGen) await showHorasDialog(date, drafts);
+    loadDay(selectedDate, { chart: true });
+  } catch (err) {
+    if (gen === _horasGen) {
+      if (err.status === 409) await showHorasDialog(date, drafts, true);
+      else {
+        if (button) button.disabled = false;
+        showError(err.message);
+      }
+    }
+  }
 }
 
 // The provider takes one call at a time, so Submit waits for every quote.
