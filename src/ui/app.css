@@ -832,7 +832,8 @@
   .rd-title-inp{font:inherit;color:var(--txt);background:var(--bg);border:1px solid var(--acc);border-radius:4px;padding:2px 6px;min-width:0;flex:1}
   .rd-ref{font:500 15px var(--mono);margin-right:10px;color:var(--acc)}
   .rd-headline{color:#a8b3c7;margin-top:8px;font-size:15px}
-  .rd-sitting{margin-top:26px;scroll-margin-top:16px}
+  /* A sitting is a <section>: undo the page rule's height and scroll, or each sitting becomes a panel-tall scroller. */
+  .rd-sitting{margin-top:26px;scroll-margin-top:16px;height:auto;overflow:visible}
   .rd-shead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
   .rd-span{font:13px var(--mono);color:#a8b3c7}
   .rd-sitting.cur .rd-span{color:var(--txt)}
