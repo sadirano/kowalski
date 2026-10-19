@@ -127,6 +127,7 @@ function titleOf(rep, taskId) {
 function renderReader(rep, area) {
   const page = area.closest('section');
   const pageScroll = page?.scrollTop ?? 0;
+  const mainScroll = area.querySelector('.rd-main')?.scrollTop ?? 0;
   const tabsScroll = area.querySelector('.rd-tabs')?.scrollTop ?? 0;
   const atScroll = area.querySelector('.rd-at')?.scrollTop ?? 0;
   if (_readerDay !== rep.start_ms) {
@@ -154,7 +155,7 @@ function renderReader(rep, area) {
     <nav class="rd-tabs" role="tablist">${tasks.map(e => `<button class="rd-tab" role="tab" data-t="${e.task.id}" aria-selected="${e.task.id === _readerTask}" onclick="readerPick(${e.task.id})"
         onmouseenter="readerLight(${e.task.id})" onmouseleave="readerLight(null)" onfocus="readerLight(${e.task.id})" onblur="readerLight(null)">
         <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}${liveBadge(e.task.id)}</small></span><span class="rd-t">${durHtml(rep, e)}</span></button>`).join('')}</nav>
-    <div class="rd-main" id="rd-main">${readerMainHtml(rep)}<button class="rd-end" type="button" onclick="readerToEnd()">${icon('chev')}${esc(t('rd_to_end'))}</button></div>
+    <div class="rd-main" id="rd-main" onscroll="readerEndFit()">${readerMainHtml(rep)}<button class="rd-end" type="button" onclick="readerToEnd()">${icon('chev')}${esc(t('rd_to_end'))}</button></div>
     <div class="rd-work">
       <div class="resize-handle" onpointerdown="startRdResize(event)" ondblclick="resetRdWorkWidth()" title="${escAttr(t('rd_resize_hint'))}"></div>
       <div class="rd-workhead"><div class="rd-legend"><span><i class="rd-sw f"></i>${esc(t('rd_legend_you'))}</span><span><i class="rd-sw p"></i>${esc(t('rd_legend_par'))}</span><span><i class="rd-sw o"></i>${esc(t('rd_legend_other'))}</span></div></div>
@@ -167,7 +168,7 @@ function renderReader(rep, area) {
   if (page) page.scrollTop = pageScroll;
   area.querySelector('.rd-tabs').scrollTop = tabsScroll;
   area.querySelector('.rd-at').scrollTop = atScroll;
-  if (page && !page.dataset.rdEnd) { page.dataset.rdEnd = '1'; page.addEventListener('scroll', readerEndFit, { passive: true }); }
+  area.querySelector('.rd-main').scrollTop = mainScroll;
   readerEndFit();
   if (pinned != null) markMoment(rep, pinned, false);
   requestAnimationFrame(() => {
@@ -377,6 +378,7 @@ function openInTimeline(taskId) {
   setTab('timeline');
   const page = id('table-area')?.closest('section');
   if (page) page.scrollTop = 0;
+  if (id('rd-main')) id('rd-main').scrollTop = 0;
 }
 
 function readerPick(taskId, t0 = null) {
@@ -387,7 +389,7 @@ function readerPick(taskId, t0 = null) {
   if (!D) return;
   renderReport(D);
   if (t0 != null) markMoment(D, t0);
-  else { const page = id('rd-main')?.closest('section'); if (page) page.scrollTop = 0; } // a new task always opens at the top, so the page never jumps
+  else if (id('rd-main')) id('rd-main').scrollTop = 0; // a new task always opens at the top, so the page never jumps
 }
 
 function stripTime(ev, el) {
@@ -442,12 +444,12 @@ function readerUnfold(btn) {
 // Long tasks run to hundreds of notes: a button jumps to the latest, hidden
 // once the end is in view.
 function readerToEnd() {
-  const page = id('rd-main')?.closest('section');
-  if (page) page.scrollTo({ top: page.scrollHeight, behavior: 'smooth' });
+  const main = id('rd-main');
+  if (main) main.scrollTo({ top: main.scrollHeight, behavior: 'smooth' });
 }
 function readerEndFit() {
-  const page = id('rd-main')?.closest('section'), btn = document.querySelector('.rd-end');
-  if (page && btn) btn.hidden = page.scrollHeight - page.scrollTop - page.clientHeight < 80;
+  const main = id('rd-main'), btn = document.querySelector('.rd-end');
+  if (main && btn) btn.hidden = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
 }
 
 // J and K step through the sittings.
