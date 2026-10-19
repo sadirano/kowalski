@@ -144,7 +144,7 @@ pub const Capture = struct {
     project_hint: ?[]const u8 = null,
     first_prompt: ?[]const u8 = null,
 };
-pub const CaptureResult = struct { applied: bool, project_id: ?i64, task_id: ?i64 };
+pub const CaptureResult = struct { applied: bool, project_id: ?i64, task_id: ?i64, created_ref: ?[]const u8 = null };
 pub const HistoryNote = struct { event: []const u8, at_ms: i64, text: []const u8 };
 pub const HistoryInterval = struct {
     event: []const u8,
@@ -525,7 +525,12 @@ pub const Store = struct {
         return if (task) |t| try s.taskProject(t) else null;
     }
 
-    fn resolveCaptureTask(s: *Store, text: []const u8, scope: ?i64, now_ms: i64) !i64 {
+    fn numericRef(text: []const u8) bool {
+        for (text) |ch| if (ch < '0' or ch > '9') return false;
+        return text.len > 0;
+    }
+
+    fn resolveCaptureTask(s: *Store, text: []const u8, scope: ?i64, now_ms: i64, created_ref: *?[]const u8) !i64 {
         const title = std.mem.trim(u8, text, " \t");
         if (title.len == 0) return error.EmptyText;
         if (title[0] == '#') {
@@ -564,7 +569,9 @@ pub const Store = struct {
                 if (try stmt.step() != .row) return id;
             }
         }
-        return s.insertTask(title, .{ .selected = scope }, now_ms);
+        const id = try s.insertTask(title, .{ .selected = scope }, now_ms);
+        if (numericRef(title)) created_ref.* = title;
+        return id;
     }
 
     fn weakSessionSeed(seed: []const u8) bool {
@@ -807,6 +814,11 @@ pub const Store = struct {
     /// A new ref drops the old ref's fields first, and is refused while one
     /// of the task's postings is unresolved.
     pub fn bindWithFields(s: *Store, task: i64, instance: []const u8, ref: []const u8, values: []const FieldValue, now_ms: i64) Error!void {
+        return s.bindWithLookup(task, instance, ref, null, values, now_ms);
+    }
+
+    /// A successful lookup may also replace the title while binding.
+    pub fn bindWithLookup(s: *Store, task: i64, instance: []const u8, ref: []const u8, title: ?[]const u8, values: []const FieldValue, now_ms: i64) Error!void {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
         if (try s.taskByBinding(instance, ref)) |bound_task| {
@@ -825,6 +837,14 @@ pub const Store = struct {
         try stmt.bindText(2, instance);
         try stmt.bindText(3, ref);
         _ = try stmt.step();
+        if (title) |value| if (value.len > 0) {
+            var rename = try s.db.prepare("UPDATE tasks SET title=?1 WHERE id=?2");
+            defer rename.finalize();
+            try rename.bindText(1, value);
+            try rename.bindI64(2, task);
+            _ = try rename.step();
+            try s.clearProvisionalTitles(task);
+        };
         for (values) |v| try s.putField(task, v.name, v.value);
         try s.applyProviderProjectFallback(task, values);
         try tx.commit();
@@ -1052,6 +1072,7 @@ pub const Store = struct {
     pub fn captureDetailed(s: *Store, c: Capture, now_ms: i64) Error!CaptureResult {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        var created_ref: ?[]const u8 = null;
         const capture_text = try s.getSetting("capture_text");
         defer if (capture_text) |value| s.allocator.free(value);
         const time_only = if (capture_text) |value| std.mem.eql(u8, value, "time") else false;
@@ -1092,13 +1113,13 @@ pub const Store = struct {
         if (c.kind == .subject) {
             try s.setProvisionalTitle(c, false);
             run.provisional_title = false;
-            target_task = c.task orelse if (c.subject) |subject| try s.resolveCaptureTask(subject, lookup_project, at) else return error.UnknownTask;
+            target_task = c.task orelse if (c.subject) |subject| try s.resolveCaptureTask(subject, lookup_project, at, &created_ref) else return error.UnknownTask;
         } else if (c.task != null or c.subject != null) {
             try s.setProvisionalTitle(c, false);
             run.provisional_title = false;
             // A subject sent with any event names the run's task before the event applies;
             // a prompt or busy then engages it in its own role.
-            const task = c.task orelse try s.resolveCaptureTask(c.subject.?, lookup_project, at);
+            const task = c.task orelse try s.resolveCaptureTask(c.subject.?, lookup_project, at, &created_ref);
             if (run.task != task) {
                 const moved_project = try s.resolveCaptureProject(c.source, key, c.project_hint, task);
                 try s.moveRun(c, run, task, moved_project, at, c.kind != .prompt and c.kind != .busy);
@@ -1106,7 +1127,7 @@ pub const Store = struct {
             }
         } else if (run.task == null) {
             if (c.default_subject) |subject| {
-                const task = try s.resolveCaptureTask(subject, lookup_project, at);
+                const task = try s.resolveCaptureTask(subject, lookup_project, at, &created_ref);
                 try s.setRun(c, task, run.working, run.role, run.lease_until);
                 run.task = task;
             } else if (c.kind == .prompt and c.default_task == null) {
@@ -1197,7 +1218,7 @@ pub const Store = struct {
         try s.heartbeat(at);
         const final = try s.captureRun(c.source, c.run);
         try tx.commit();
-        return .{ .applied = true, .project_id = final.project, .task_id = final.task };
+        return .{ .applied = true, .project_id = final.project, .task_id = final.task, .created_ref = created_ref };
     }
 
     /// Called by the history subject resolver while the batch transaction is open.

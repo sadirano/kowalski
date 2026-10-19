@@ -14,7 +14,8 @@ Settings > Captured text chooses whether to keep prompts and outcomes (the defau
 - `source` and `run` name one run (one session). `event` is a stable id:
   an event sent again is ignored, so a source can retry freely.
 - `subject` names the run's task as `kowalski switch` does (a ref, `#id`
-  or a title; a new title creates the task).
+  or a title; a new title creates the task). A new all-digit `subject` or
+  `default_subject` is bound to that ref when a provider is configured.
 - `project_key` is an opaque stable source identity; `project_hint` is only
   its display hint. Kowalski maps `(source, project_key)` to a project and
   creates one on first sight. A known key can be repointed later. The first

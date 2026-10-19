@@ -83,7 +83,7 @@ const SessionChain = struct {
 pub const Followup = union(enum) {
     fields,
     /// Without a task, only looks the ref up.
-    lookup: struct { task: ?i64, ref: []const u8 },
+    lookup: struct { task: ?i64, ref: []const u8, capture: ?store_mod.CaptureResult = null },
     quote: struct {
         day: []const u8,
         task: i64,
@@ -150,6 +150,10 @@ const Fail = struct {
 fn send(a: std.mem.Allocator, status: std.http.Status, value: anytype) Response {
     const body = std.json.Stringify.valueAlloc(a, value, .{}) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"OutOfMemory\"}" };
     return .{ .status = status, .body = body };
+}
+
+fn captureReply(a: std.mem.Allocator, result: store_mod.CaptureResult) Response {
+    return send(a, .ok, .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id });
 }
 
 fn fail(a: std.mem.Allocator, f: Fail) Response {
@@ -369,7 +373,11 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = if (body.note) |n| try noteText(a, n) else null,
             .subject = body.subject, .default_subject = body.default_subject, .project_key = body.project_key, .project_hint = body.project_hint, .first_prompt = body.first_prompt };
         const result = try app.store.captureDetailed(c, app.clock());
-        return send(a, .ok, result);
+        if (app.provider != null) if (result.created_ref) |ref| return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{
+            .task = result.task_id.?, .ref = try a.dupe(u8, ref),
+            .capture = .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id },
+        } } };
+        return captureReply(a, result);
     }
     if (is(req, .POST, path, "/api/capture/history")) {
         const Interval = store_mod.HistoryInterval;
@@ -1841,6 +1849,25 @@ fn acceptedOutput(a: std.mem.Allocator, out: []const u8) !Accepted {
     return accepted;
 }
 
+fn bindCapturedLookup(app: *App, a: std.mem.Allocator, task: i64, ref: []const u8, outcome: worker.Outcome) void {
+    const instance = app.provider orelse return;
+    if (succeeded(outcome)) {
+        const Found = struct { title: ?[]const u8 = null, fields: std.json.ArrayHashMap([]const u8) = .{} };
+        if (std.json.parseFromSliceLeaky(Found, a, outcome.done.out, .{ .ignore_unknown_fields = true })) |found| {
+            var values: std.ArrayList(Store.FieldValue) = .empty;
+            var it = found.fields.map.iterator();
+            while (it.next()) |e| values.append(a, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch {
+                app.store.bind(task, instance, ref, app.clock()) catch {};
+                return;
+            };
+            app.store.bindWithLookup(task, instance, ref, found.title, values.items, app.clock()) catch {};
+            return;
+        } else |_| {}
+    }
+    // Capture has committed. Keep its reply even when lookup or binding fails.
+    app.store.bind(task, instance, ref, app.clock()) catch {};
+}
+
 fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Outcome) !Response {
     switch (f) {
         .login_prompts => {
@@ -1860,6 +1887,10 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
             return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions, .not_signed_in_code = app.traits.not_signed_in_code, .status = app.provider_status });
         },
         .lookup => |l| {
+            if (l.capture) |result| {
+                if (l.task) |task| bindCapturedLookup(app, a, task, l.ref, outcome);
+                return captureReply(a, result);
+            }
             if (!succeeded(outcome)) {
                 const task = l.task orelse return providerFailure(a, outcome, null);
                 // A bind keeps the ref even when the provider cannot confirm it
@@ -1873,7 +1904,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
             var values: std.ArrayList(Store.FieldValue) = .empty;
             var it = found.fields.map.iterator();
             while (it.next()) |e| try values.append(a, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
-            try app.store.bindWithFields(task, app.provider.?, l.ref, values.items, app.clock());
+            try app.store.bindWithLookup(task, app.provider.?, l.ref, found.title, values.items, app.clock());
             return send(a, .ok, .{ .task = (try query.task(app.store, a, task)).?, .remote_title = found.title, .fields = try query.fields(app.store, a, task) });
         },
         .quote => |r| {
@@ -2358,6 +2389,40 @@ test "task title can change only without a binding" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/tasks/1", "{\"project_id\":null}").status);
     _ = f.call(.POST, "/api/tasks", "{\"title\":\"Other\"}");
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/tasks/2", "{\"title\":\"  \"}").status);
+}
+
+test "binding adopts and refreshes a provider title" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"prompt fragment\"}");
+    const bound = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}");
+    try std.testing.expectEqual(std.http.Status.ok, bound.status);
+    try std.testing.expectEqualStrings("Remote title", (try f.get(struct { task: query.Task }, "/api/tasks/1")).task.title);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.PATCH, "/api/tasks/1", "{\"title\":\"local edit\"}").status);
+    try f.db.exec("UPDATE tasks SET title='stale' WHERE id=1");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try std.testing.expectEqualStrings("Remote title", (try f.get(struct { task: query.Task }, "/api/tasks/1")).task.title);
+
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"prompt fragment\"}");
+    const missing = f.call(.POST, "/api/tasks/2/bind", "{\"ref\":\"missing\"}");
+    try std.testing.expectEqual(std.http.Status.ok, missing.status);
+    try std.testing.expect(contains(missing.body, "\"lookup_error\":\"no such ticket\""));
+    const missing_task = (try f.get(struct { task: query.Task }, "/api/tasks/2")).task;
+    try std.testing.expectEqualStrings("prompt fragment", missing_task.title);
+    try std.testing.expectEqualStrings("missing", missing_task.ref.?);
+
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"keep this title\"}");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/3/bind", "{\"ref\":\"empty-title\"}").status);
+    try std.testing.expectEqualStrings("keep this title", (try f.get(struct { task: query.Task }, "/api/tasks/3")).task.title);
+
+    const provisional = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"provisional\",\"event\":\"p\",\"kind\":\"prompt\"}");
+    try std.testing.expectEqual(std.http.Status.ok, provisional.status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT provisional_title FROM capture_runs WHERE run='provisional'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/4/bind", "{\"ref\":\"T-4\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT provisional_title FROM capture_runs WHERE run='provisional'"));
+    try std.testing.expectEqualStrings("Remote title", (try f.get(struct { task: query.Task }, "/api/tasks/4")).task.title);
 }
 
 test "ambiguous titles ask for an id" {
@@ -3076,7 +3141,7 @@ test "provider settings and post options reach the post request" {
     const r = f.call(.POST, "/api/postings", "{\"task\":\"T-1\",\"options\":{\"internal\":true}}");
     try std.testing.expectEqual(std.http.Status.created, r.status);
     const sent = worker.Fake.last_post[0..worker.Fake.last_post_len];
-    try std.testing.expect(contains(sent, "\"title\":\"Ticket\""));
+    try std.testing.expect(contains(sent, "\"title\":\"Remote title\""));
     try std.testing.expect(contains(sent, "\"settings\":{\"mode\":\"b\",\"note\":\"x\"}"));
     try std.testing.expect(contains(sent, "\"options\":{\"internal\":true}"));
 }
@@ -3115,7 +3180,7 @@ test "posting needs a binding and can post a later difference" {
     try std.testing.expectEqual(std.http.Status.conflict, r.status);
     try std.testing.expect(contains(r.body, "NothingToPost"));
     try std.testing.expectEqual(before + 1, worker.Fake.posted.load(.acquire));
-    _ = f.call(.POST, "/api/switch", "{\"task\":\"Ticket\"}");
+    _ = f.call(.POST, "/api/switch", "{\"task\":\"T-1\"}");
     try f.advance(30 * 60_000);
     _ = f.call(.POST, "/api/switch", "{\"task\":\"Other\"}");
     r = f.call(.POST, "/api/postings", "{\"task\":\"T-1\"}");
@@ -3714,7 +3779,7 @@ test "day totals frequent tasks and charts count focus only" {
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.GET, "/api/daytotals?from=2026-01-01&to=2026-03-10", "").status);
     const frequent = try f.get(struct { tasks: []struct { task: query.Task, fields: []query.Field, focus_ms: i64 } }, "/api/frequent?days=30&limit=8");
     try std.testing.expectEqual(@as(usize, 2), frequent.tasks.len);
-    try std.testing.expectEqualStrings("A", frequent.tasks[0].task.title);
+    try std.testing.expectEqualStrings("Remote title", frequent.tasks[0].task.title);
     try std.testing.expectEqual(@as(i64, 3_600_000), frequent.tasks[0].focus_ms);
     try std.testing.expectEqual(@as(i64, 1_800_000), frequent.tasks[1].focus_ms);
     const Chart = struct { dates: [][]const u8, series: []struct { label: []const u8, total_ms: i64, ms: []i64 } };
@@ -3956,6 +4021,111 @@ test "capture applies an event once and names tasks like switch" {
     defer count.finalize();
     _ = try count.step();
     try std.testing.expectEqual(@as(i64, 0), count.columnI64(0));
+}
+
+test "numeric captured subjects bind once and keep the capture reply" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    const a = f.arena.allocator();
+    const Result = struct { applied: bool, project_id: ?i64, task_id: ?i64 };
+    const before = worker.Fake.lookup_calls.load(.acquire);
+    const first_body = "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"312\",\"project_key\":\"k\",\"project_hint\":\"Work\"}";
+    const first = f.call(.POST, "/api/capture", first_body);
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    const captured = try std.json.parseFromSliceLeaky(Result, a, first.body, .{});
+    try std.testing.expect(captured.applied and captured.project_id != null and captured.task_id != null);
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND title='Remote title'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=1 AND external_ref='312'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND captured=1"));
+
+    const duplicate = handle(&f.app, a, .{ .method = .POST, .target = "/api/capture", .host = "127.0.0.1:47100", .marker = true, .body = first_body });
+    try std.testing.expectEqual(std.http.Status.ok, duplicate.status);
+    try std.testing.expect(duplicate.followup == null);
+    try std.testing.expectEqualStrings("{\"applied\":false}", duplicate.body);
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+
+    const again = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a2\",\"kind\":\"prompt\",\"subject\":\"312\"}");
+    try std.testing.expectEqual(std.http.Status.ok, again.status);
+    const reused = try std.json.parseFromSliceLeaky(Result, a, again.body, .{});
+    try std.testing.expectEqual(captured.task_id, reused.task_id);
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+
+    const defaulted = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b1\",\"kind\":\"prompt\",\"default_subject\":\"399\"}");
+    try std.testing.expectEqual(std.http.Status.ok, defaulted.status);
+    const default_result = try std.json.parseFromSliceLeaky(Result, a, defaulted.body, .{});
+    try std.testing.expectEqual(@as(?i64, 2), default_result.task_id);
+    try std.testing.expectEqual(before + 2, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=2 AND title='Remote title' AND external_ref='399'"));
+
+    const plain = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"c\",\"event\":\"c1\",\"kind\":\"prompt\",\"subject\":\"Readme\"}");
+    try std.testing.expectEqual(std.http.Status.ok, plain.status);
+    try std.testing.expectEqual(before + 2, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=3 AND title='Readme'"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=3"));
+
+    const failed = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"d\",\"event\":\"d1\",\"kind\":\"prompt\",\"subject\":\"404\"}");
+    try std.testing.expectEqual(std.http.Status.ok, failed.status);
+    const failed_result = try std.json.parseFromSliceLeaky(Result, a, failed.body, .{});
+    try std.testing.expectEqual(@as(?i64, 4), failed_result.task_id);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=4 AND title='404' AND external_ref='404'"));
+}
+
+test "capture keeps its reply and time when follow-up binding conflicts" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    const a = f.arena.allocator();
+    const occupied = try f.store.createTask("occupied", test_now);
+    const pending = handle(&f.app, a, .{ .method = .POST, .target = "/api/capture", .host = "127.0.0.1:47100", .marker = true,
+        .body = "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"312\"}" });
+    try std.testing.expectEqual(std.http.Status.ok, pending.status);
+    try std.testing.expect(pending.followup != null);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND captured=1 AND end_ms IS NULL"));
+    try f.store.bind(occupied, "fake", "312", test_now);
+    const w: worker.Worker = .{ .table = &worker.Fake.table, .io = std.testing.io };
+    const reply = proceed(&f.app, a, pending.followup.?, try w.run(a, pending.followup.?.call(), 5_000));
+    try std.testing.expectEqual(std.http.Status.ok, reply.status);
+    const result = try std.json.parseFromSliceLeaky(struct { applied: bool, project_id: ?i64, task_id: ?i64 }, a, reply.body, .{});
+    try std.testing.expect(result.applied);
+    try std.testing.expectEqual(@as(?i64, 2), result.task_id);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND captured=1 AND end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=1 AND external_ref='312'"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=2"));
+}
+
+test "malformed capture lookup keeps its reply and binds without a title" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    const a = f.arena.allocator();
+    const captured = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"422\"}");
+    try std.testing.expectEqual(std.http.Status.ok, captured.status);
+    const result = try std.json.parseFromSliceLeaky(struct { applied: bool, project_id: ?i64, task_id: ?i64 }, a, captured.body, .{});
+    try std.testing.expect(result.applied);
+    try std.testing.expectEqual(@as(?i64, 1), result.task_id);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=1 AND title='422' AND external_ref='422'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND captured=1 AND end_ms IS NULL"));
+
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"manual\"}");
+    try std.testing.expectEqual(std.http.Status.bad_gateway, f.call(.POST, "/api/tasks/2/bind", "{\"ref\":\"garbage\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=2"));
+}
+
+test "numeric capture without a provider stays local" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const captured = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"312\"}");
+    try std.testing.expectEqual(std.http.Status.ok, captured.status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='312'"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings"));
 }
 
 fn historyScalar(db: *sqlite.Db, sql: []const u8) !i64 {

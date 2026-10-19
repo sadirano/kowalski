@@ -201,6 +201,7 @@ fn work(job: *Job) void {
 /// A fake provider for tests: `ref` "slow" blocks until `release` is set.
 pub const Fake = struct {
     pub var release: std.atomic.Value(bool) = .init(true);
+    pub var lookup_calls: std.atomic.Value(u32) = .init(0);
     pub var posted: std.atomic.Value(u32) = .init(0);
     pub var seen_posting: std.atomic.Value(i64) = .init(0);
     pub var fake_policy_past_only: bool = false;
@@ -227,13 +228,22 @@ pub const Fake = struct {
         return .{};
     }
     fn lookup(_: ?*anyopaque, ref: contract.Bytes, out: *contract.Bytes) callconv(.c) contract.Status {
+        _ = lookup_calls.fetchAdd(1, .acq_rel);
         if (std.mem.eql(u8, ref.slice(), "slow")) {
             while (!release.load(.acquire)) std.Thread.yield() catch {};
         }
-        if (std.mem.eql(u8, ref.slice(), "missing")) {
+        if (std.mem.eql(u8, ref.slice(), "missing") or std.mem.eql(u8, ref.slice(), "404")) {
             var message: contract.Bytes = .{};
             give("no such ticket", &message);
             return .{ .code = 404, .retry_safe = 1, .message = message };
+        }
+        if (std.mem.eql(u8, ref.slice(), "empty-title")) {
+            give("{\"title\":\"\",\"fields\":{}}", out);
+            return .{};
+        }
+        if (std.mem.eql(u8, ref.slice(), "garbage") or std.mem.eql(u8, ref.slice(), "422")) {
+            give("not-json", out);
+            return .{};
         }
         give("{\"title\":\"Remote title\",\"fields\":{\"client\":\"Example\"}}", out);
         return .{};
