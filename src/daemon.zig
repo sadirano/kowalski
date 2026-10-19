@@ -127,6 +127,18 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     _ = WriteFile(file, &buffer, @intCast(w.end + 1), null, null);
 }
 
+fn asciiLogText(value: []const u8, buffer: []u8) []const u8 {
+    const len = @min(value.len, buffer.len);
+    for (value[0..len], 0..) |byte, i| buffer[i] = if (byte >= 32 and byte <= 126) byte else '?';
+    return buffer[0..len];
+}
+
+fn logSqliteError(path: []const u8, message: []const u8) void {
+    var path_buffer: [384]u8 = undefined;
+    var message_buffer: [512]u8 = undefined;
+    log("request {s}: SQLite: {s}", .{ asciiLogText(path, &path_buffer), asciiLogText(message, &message_buffer) });
+}
+
 fn openLog(gpa: std.mem.Allocator, path: []const u8) !void {
     const name = try std.unicode.utf8ToUtf16LeAllocZ(gpa, path);
     defer gpa.free(name);
@@ -244,7 +256,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
 
     var traits_arena = std.heap.ArenaAllocator.init(gpa);
     defer traits_arena.deinit();
-    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .db_path = options.db_path, .running_post = worker.runningPost, .trial_nonce = options.trial_nonce } };
+    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .db_path = options.db_path, .running_post = worker.runningPost, .on_sqlite_error = logSqliteError, .trial_nonce = options.trial_nonce } };
     // The tour's sandbox sits next to the database and never outlives a run.
     const tour_path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", tour_mod.file_name });
     defer gpa.free(tour_path);

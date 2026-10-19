@@ -35,6 +35,7 @@ pub const App = struct {
     /// The provider's static traits; empty without one.
     traits: Traits = .{},
     running_post: ?*const fn () ?i64 = null,
+    on_sqlite_error: ?*const fn (path: []const u8, message: []const u8) void = null,
     declared_fields: []const []const u8 = &.{},
     declared_fields_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
 
@@ -236,7 +237,10 @@ pub fn handle(app: *App, a: std.mem.Allocator, req: Request) Response {
         return .{ .status = .ok, .body = "{\"committed\":true}" };
     }
     if (app.trial_nonce != null and req.method != .GET) return .{ .status = .service_unavailable, .body = "{\"error\":\"updating\"}" };
-    return route(app, a, req, path, params) catch |err| errorResponse(a, err);
+    return route(app, a, req, path, params) catch |err| {
+        if (err == error.Sqlite) if (app.on_sqlite_error) |log_sqlite| log_sqlite(path, app.store.db.message());
+        return errorResponse(a, err);
+    };
 }
 
 test "trial gates mutations and commits only matching nonce" {
@@ -2081,6 +2085,10 @@ const Fixture = struct {
 
     fn init(f: *Fixture) !void {
         try f.db.open(":memory:");
+        try f.initOpened();
+    }
+
+    fn initOpened(f: *Fixture) !void {
         f.store = try Store.init(&f.db, std.testing.allocator);
         try f.store.setSetting("reporting_zone", "UTC", 0);
         f.app = .{ .store = &f.store, .port = 47100, .clock = testClock, .running_post = worker.runningPost };
@@ -2385,6 +2393,42 @@ test "state reports active capture runs by activity" {
         if (std.mem.eql(u8, run.run, "idle")) idle = std.mem.eql(u8, run.state, "idle");
     }
     try std.testing.expect(working and quiet and idle);
+}
+
+test "state answers after upgrading an early v7 capture database" {
+    var f: Fixture = .{};
+    try f.db.open(":memory:");
+    try @import("schema.zig").testV7CaptureFixture(&f.db);
+    try f.initOpened();
+    defer f.deinit();
+    const State = struct { capture: struct { runs: []query.CaptureRun } };
+    const state_data = try f.get(State, "/api/state");
+    try std.testing.expectEqual(@as(usize, 1), state_data.capture.runs.len);
+    try std.testing.expectEqualStrings("run", state_data.capture.runs[0].run);
+    try std.testing.expectEqualStrings("Session", state_data.capture.runs[0].task.?.title);
+}
+
+test "SQLite API failure logs the path and SQLite message" {
+    const Probe = struct {
+        var path: []const u8 = "";
+        var message: []const u8 = "";
+        fn record(request_path: []const u8, sqlite_message: []const u8) void {
+            path = request_path;
+            message = sqlite_message;
+        }
+    };
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    Probe.path = "";
+    Probe.message = "";
+    f.app.on_sqlite_error = Probe.record;
+    try f.db.exec("ALTER TABLE capture_runs DROP COLUMN idle_since_ms");
+    const response = f.call(.GET, "/api/state?probe=1", "");
+    try std.testing.expectEqual(std.http.Status.internal_server_error, response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"Sqlite\",\"message\":\"\",\"candidates\":null}", response.body);
+    try std.testing.expectEqualStrings("/api/state", Probe.path);
+    try std.testing.expect(std.mem.indexOf(u8, Probe.message, "idle_since_ms") != null);
 }
 
 test "a task is deleted unless it is running" {
