@@ -15,7 +15,7 @@ function onSearchInput() {
   const q = id('task-search').value.trim();
   id('search-clear').style.display = q ? '' : 'none';
   clearTimeout(_searchTimer);
-  if (!q) { _searchSeq++; _searchedQ = null; _searchHits = []; _searchSel = -1; closeSearch(); return; }
+  if (!q) { clearSearch(); return; }
   _searchTimer = setTimeout(() => runSearch(q), 220); // debounce keystrokes
 }
 
@@ -153,7 +153,7 @@ async function searchGoDay(i, date) {
   const h = _searchHits[i];
   closeSearch();
   if (!h) return goToDate(date);
-  _searchFound = { task: h.task.id, date };
+  _searchFound = { task: h.task.id, date, query: id('task-search').value.trim() };
   _readerTask = h.task.id;
   _readerSitting = 0;
   _readerPin = null;
@@ -189,6 +189,7 @@ function clearSearch() {
   id('task-search').value = '';
   id('search-clear').style.display = 'none';
   closeSearch();
+  if (D && (activeTab === 'report' || activeTab === 'timeline')) renderReport(D);
 }
 
 function focusSearch() {

@@ -6,6 +6,9 @@
 // is the daemon setting ui_lang.
 const I18N = {
   en: {
+    starred_only: 'Starred only', no_starred_notes: 'no starred notes', note_star: 'Star', note_unstar: 'Unstar', note_select: 'Select note',
+    note_selected_n: '{n} notes selected', note_limit: 'Select at most 500 notes for bulk changes.', note_delete_confirm: 'Delete {n} selected notes permanently?',
+    draft_from_starred: 'Draft from starred', use_starred_notes: 'Use starred notes', note_selection_copied: 'Notes copied.',
     sec_day: "Day and time zone", sec_capture: "Capture", sec_service: "Updates and service", set_hold_sources: "Sources that keep the focus", set_hold_sources_hint: "While one of these runs, prompts from other sources count in parallel, such as a game you play.", set_hold_none: "No capture sources yet.", set_post_notes: "Post the day's notes", set_post_notes_hint: "Fill each posting's text with the task's notes for that day.", view_options: "View options", project_provider_field_hint: "A new provider task joins the project its field names.",
     capture_one_session: '{n} session', capture_many_sessions: '{n} sessions', capture_working: 'working', capture_idle: 'idle', capture_quiet: 'quiet', capture_last_activity: 'last activity', end_at_activity: 'End at last activity', take_focus: 'Make this my focus',
     set_bad_hours: 'Set a daily target between 1 minute and 24 hours.',
@@ -186,6 +189,9 @@ const I18N = {
     zone_default: 'Not set (UTC)', project_keys_mixed: 'Sources disagree: choose one', project_capture_sources: 'Capture sources', project_capture_sources_hint: 'Each repository your agents work in, and the project its time goes to.', project_provider_field_hint: 'A new task joins the project named in this field.', project_move_to: 'Move its time to', project_delete: 'Delete', project_none: 'No projects yet.', project_archived_count: 'Archived ({n})', sec_capture: 'Capture', capture_keep_text: 'Keep captured text', capture_keep_hint: 'Save agent prompts and outcomes as notes. Off keeps the time only.', set_bad_day_start: 'Day start must be a time from 00:00 to 12:00.',
   },
   pt: {
+    starred_only: 'Só favoritas', no_starred_notes: 'nenhuma nota favorita', note_star: 'Favoritar', note_unstar: 'Desfavoritar', note_select: 'Selecionar nota',
+    note_selected_n: '{n} notas selecionadas', note_limit: 'Selecione no máximo 500 notas para alterar em lote.', note_delete_confirm: 'Excluir permanentemente {n} notas selecionadas?',
+    draft_from_starred: 'Rascunho das favoritas', use_starred_notes: 'Usar notas favoritas', note_selection_copied: 'Notas copiadas.',
     sec_day: "Dia e fuso horário", sec_capture: "Captura", sec_service: "Atualizações e serviço", set_hold_sources: "Fontes que mantêm o foco", set_hold_sources_hint: "Enquanto uma delas roda, prompts de outras fontes contam em paralelo, como um jogo que você joga.", set_hold_none: "Ainda não há fontes de captura.", set_post_notes: "Lançar as notas do dia", set_post_notes_hint: "Preenche o texto de cada lançamento com as notas da tarefa naquele dia.", view_options: "Opções de exibição", project_provider_field_hint: "Uma nova tarefa do provedor entra no projeto que esse campo indica.",
     capture_one_session: '{n} sessão', capture_many_sessions: '{n} sessões', capture_working: 'em atividade', capture_idle: 'em espera', capture_quiet: 'silenciosa', capture_last_activity: 'última atividade', end_at_activity: 'Encerrar na última atividade', take_focus: 'Tornar meu foco',
     set_bad_hours: 'Defina uma meta diária entre 1 minuto e 24 horas.',
@@ -368,6 +374,9 @@ const I18N = {
     zone_default: 'Não definido (UTC)', project_keys_mixed: 'As origens divergem: escolha um', project_capture_sources: 'Origens de captura', project_capture_sources_hint: 'Cada repositório em que seus agentes trabalham e o projeto que recebe o tempo.', project_provider_field_hint: 'Uma nova tarefa entra no projeto indicado neste campo.', project_move_to: 'Mover o tempo para', project_delete: 'Excluir', project_none: 'Nenhum projeto ainda.', project_archived_count: 'Arquivados ({n})', sec_capture: 'Captura', capture_keep_text: 'Manter texto capturado', capture_keep_hint: 'Salva solicitações e resultados dos agentes como notas. Desligado mantém só o tempo.', set_bad_day_start: 'O início do dia deve ser um horário entre 00:00 e 12:00.',
   },
   ja: {
+    starred_only: 'スター付きのみ', no_starred_notes: 'スター付きのメモはありません', note_star: 'スターを付ける', note_unstar: 'スターを外す', note_select: 'メモを選択',
+    note_selected_n: '{n} 件のメモを選択', note_limit: '一括変更できるメモは最大500件です。', note_delete_confirm: '選択した {n} 件のメモを完全に削除しますか？',
+    draft_from_starred: 'スター付きから下書き', use_starred_notes: 'スター付きメモを使う', note_selection_copied: 'メモをコピーしました。',
     sec_day: "日付とタイムゾーン", sec_capture: "キャプチャ", sec_service: "更新とサービス", set_hold_sources: "フォーカスを保つソース", set_hold_sources_hint: "これらが動いている間、他のソースのプロンプトは並行として数えます（プレイ中のゲームなど）。", set_hold_none: "キャプチャのソースはまだありません。", set_post_notes: "その日のメモを登録する", set_post_notes_hint: "各登録のテキストを、その日のタスクのメモで埋めます。", view_options: "表示オプション", project_provider_field_hint: "新しいプロバイダーのタスクは、このフィールドが示すプロジェクトに入ります。",
     capture_one_session: '{n} セッション', capture_many_sessions: '{n} セッション', capture_working: '作業中', capture_idle: '待機中', capture_quiet: '無応答', capture_last_activity: '最終活動', end_at_activity: '最後の活動時刻で終了', take_focus: 'この作業に集中',
     set_bad_hours: '1日の目標は1分から24時間の間で設定してください。',

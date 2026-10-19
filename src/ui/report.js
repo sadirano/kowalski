@@ -1,6 +1,135 @@
 'use strict';
 let _blockData = [];
 const _openBlocks = new Set();
+let _starredOnly = !!loadLS('starredOnly', false);
+const _selectedNotes = new Set();
+let _selectedNotesDate = null, _noteAnchor = null;
+function dayNotes(rep, taskId = null) {
+  return (rep?.intervals || []).filter(s => taskId == null || s.task.id === taskId)
+    .flatMap(s => (s.notes || []).map(n => ({ ...n, task: s.task })))
+    .sort((a, b) => a.at_ms - b.at_ms || a.id - b.id);
+}
+function dayStarredNotes(rep, taskId = null) {
+  return dayNotes(rep, taskId).filter(n => n.starred && n.at_ms >= rep.start_ms && n.at_ms < rep.end_ms);
+}
+function reconcileNoteSelection(rep) {
+  if (_selectedNotesDate !== rep.date) { _selectedNotes.clear(); _noteAnchor = null; _selectedNotesDate = rep.date; }
+  const exists = new Set(dayNotes(rep).map(n => n.id));
+  for (const noteId of _selectedNotes) if (!exists.has(noteId)) _selectedNotes.delete(noteId);
+  if (_noteAnchor && !exists.has(_noteAnchor.id)) _noteAnchor = null;
+}
+function toggleStarredOnly() {
+  _starredOnly = !_starredOnly;
+  saveLS('starredOnly', _starredOnly);
+  if (D) renderReport(D);
+}
+function starredOnlyButton() {
+  return `<button type="button" class="starred-only-toggle${_starredOnly ? ' active' : ''}" aria-pressed="${_starredOnly}" onclick="toggleStarredOnly()">${icon('star')}${esc(t('starred_only'))}</button>`;
+}
+function noteSearchWords(taskId) {
+  return isSearchFound(taskId) ? (_searchFound.query || '').split(/\s+/).filter(Boolean) : [];
+}
+function noteWordRanges(text, word) {
+  const lowerText = text.toLocaleLowerCase(), lowerWord = word.toLocaleLowerCase(), ranges = [];
+  if (lowerText.length === text.length && lowerWord.length === word.length) {
+    let at = 0, found;
+    while ((found = lowerText.indexOf(lowerWord, at)) !== -1) {
+      ranges.push([found, found + word.length]);
+      at = found + Math.max(1, word.length);
+    }
+  } else {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const match of text.matchAll(new RegExp(escaped, 'giu'))) ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
+}
+function noteHit(n, taskId) {
+  const words = noteSearchWords(taskId);
+  return !!words.length && words.every(word => noteWordRanges(n.text, word).length);
+}
+function noteTextHtml(n, taskId, preview = false) {
+  const hit = noteHit(n, taskId);
+  const text = hit || !preview ? n.text : n.text.split(/\r?\n/, 1)[0];
+  if (!hit) return esc(text) + (preview && text.length < n.text.length ? '<small>...</small>' : '');
+  const ranges = noteSearchWords(taskId).flatMap(word => noteWordRanges(text, word));
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const range of ranges) {
+    if (merged.length && range[0] <= merged[merged.length - 1][1]) merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], range[1]);
+    else merged.push(range.slice());
+  }
+  let html = '', end = 0;
+  for (const [from, to] of merged) {
+    html += esc(text.slice(end, from)) + '<mark>' + esc(text.slice(from, to)) + '</mark>';
+    end = to;
+  }
+  return html + esc(text.slice(end));
+}
+function noteRowClass(n, taskId) {
+  return `note-row${n.starred ? ' starred' : ''}${noteHit(n, taskId) ? ' note-hit' : ''}${_selectedNotes.has(n.id) ? ' selected' : ''}`;
+}
+function noteControls(n, taskId) {
+  if (n.id == null) return '';
+  const label = t(n.starred ? 'note_unstar' : 'note_star');
+  return `<span class="note-controls"><button type="button" class="note-star" title="${escAttr(label)}" aria-label="${escAttr(label)}" aria-pressed="${!!n.starred}" onclick="event.stopPropagation();toggleNoteStar(${n.id},${!n.starred})">${icon('star')}</button><input type="checkbox" class="note-select" aria-label="${escAttr(t('note_select'))}" ${_selectedNotes.has(n.id) ? 'checked' : ''} onclick="selectNote(event,${n.id},${taskId})"></span>`;
+}
+async function toggleNoteStar(noteId, starred) {
+  try { await apiJSON('PATCH', `/api/notes/${noteId}`, { starred }); await loadDay(selectedDate); }
+  catch (err) { showError(err.message); }
+}
+function selectNote(e, noteId, taskId) {
+  e.stopPropagation();
+  const row = e.currentTarget.closest('.note-row');
+  const scope = activeTab === 'timeline' ? id('rd-main')
+    : row.closest('.ep-details') || row.closest('.ep-notes') || row.closest('.slot-grid');
+  const listKey = activeTab === 'timeline' ? `timeline-${taskId}` : scope.dataset.noteList;
+  const ids = [...scope.querySelectorAll('.note-row[data-note-id]')]
+    .filter(item => item.getClientRects().length).map(item => Number(item.dataset.noteId));
+  const from = ids.indexOf(_noteAnchor?.id), to = ids.indexOf(noteId);
+  if (e.shiftKey && _noteAnchor?.taskId === taskId && _noteAnchor.listKey === listKey && from >= 0 && to >= 0) {
+    for (const id of ids.slice(Math.min(from, to), Math.max(from, to) + 1)) _selectedNotes.add(id);
+  } else {
+    if (_selectedNotes.has(noteId)) _selectedNotes.delete(noteId); else _selectedNotes.add(noteId);
+    _noteAnchor = { id: noteId, taskId, listKey };
+  }
+  markNoteSelection();
+}
+function clearNoteSelection() { _selectedNotes.clear(); _noteAnchor = null; markNoteSelection(); }
+function markNoteSelection() {
+  id('table-area')?.querySelectorAll('.note-row[data-note-id]').forEach(row => {
+    const selected = _selectedNotes.has(Number(row.dataset.noteId));
+    row.classList.toggle('selected', selected);
+    const box = row.querySelector('.note-select');
+    if (box) box.checked = selected;
+  });
+  renderNoteSelectionBar();
+}
+function renderNoteSelectionBar() {
+  const area = id('table-area');
+  let bar = id('note-selection-bar');
+  if (!_selectedNotes.size || !['report', 'timeline'].includes(activeTab)) { bar?.remove(); return; }
+  if (!bar) { bar = document.createElement('div'); bar.id = 'note-selection-bar'; bar.className = 'note-selection-bar'; area.appendChild(bar); }
+  const tooMany = _selectedNotes.size > 500;
+  bar.innerHTML = `<strong>${esc(t('note_selected_n', { n: _selectedNotes.size }))}</strong><button type="button" onclick="bulkNoteStar(true)"${tooMany ? ' disabled' : ''}>${esc(t('note_star'))}</button><button type="button" onclick="bulkNoteStar(false)"${tooMany ? ' disabled' : ''}>${esc(t('note_unstar'))}</button><button type="button" onclick="copySelectedNotes()">${esc(t('selection_copy'))}</button><button type="button" class="danger" onclick="deleteSelectedNotes()"${tooMany ? ' disabled' : ''}>${esc(t('selection_delete'))}</button><button type="button" onclick="clearNoteSelection()">${esc(t('selection_clear'))}</button>${tooMany ? `<span>${esc(t('note_limit'))}</span>` : ''}`;
+}
+async function bulkNoteStar(starred) {
+  const ids = [..._selectedNotes];
+  if (!ids.length || ids.length > 500) return;
+  try { await apiJSON('POST', '/api/notes/star', { ids, starred }); await loadDay(selectedDate); }
+  catch (err) { showError(err.message); }
+}
+async function deleteSelectedNotes() {
+  const ids = [..._selectedNotes];
+  if (!ids.length || ids.length > 500 || !await askConfirm(t('note_delete_confirm', { n: ids.length }), t('confirm_delete'), true)) return;
+  try { await apiJSON('POST', '/api/notes/delete', { ids }); for (const noteId of ids) _selectedNotes.delete(noteId); await loadDay(selectedDate); }
+  catch (err) { showError(err.message); }
+}
+async function copySelectedNotes() {
+  const lines = dayNotes(D).filter(n => _selectedNotes.has(n.id))
+    .map(n => `${hhmm24(n.at_ms)}  ${n.task.ref || n.task.title || '#' + n.task.id}  ${n.text.replace(/\s*\r?\n\s*/g, ' ')}`);
+  try { await navigator.clipboard.writeText(lines.join('\n')); showToast(t('note_selection_copied')); }
+  catch (err) { showError(t('selection_copy_failed', { error: err.message || String(err) })); }
+}
 // Episodes whose details are shown, by their first interval's id.
 const _openEpisodes = new Set();
 // Episodes showing all their notes, not just the first few.
@@ -47,6 +176,7 @@ function renderReport(rep) {
   const page = area.closest('section');
   const pageScroll = page?.scrollTop ?? 0;
   const restoreScroll = () => { if (page) page.scrollTop = pageScroll; };
+  reconcileNoteSelection(rep);
   closeSelectionMenu(false);
   closeSelectionPicker(false);
   if (_slotSel && (_slotSelDate !== rep.date || activeTab !== 'report')) {
@@ -59,6 +189,7 @@ function renderReport(rep) {
     area.innerHTML = `<div class="empty">${t('no_sessions')}</div>`;
     restoreScroll();
     markSlotSel();
+    markNoteSelection();
     return;
   }
 
@@ -73,7 +204,7 @@ function renderReport(rep) {
   const grid = _reportLayout === 'grid';
   const allFolded = ordered.every(entry => _foldedTasks.has(entry.task.id));
   const fold = grid ? `<button class="link-btn" onclick="foldAllTasks(${!allFolded})">${esc(t(allFolded ? 'expand_all' : 'collapse_all'))}</button>` : '';
-  const toolbar = `<div class="report-bar">${fold}${prefButton('report')}</div>`;
+  const toolbar = `<div class="report-bar">${fold}${starredOnlyButton()}${prefButton('report')}</div>`;
   area.classList.toggle('grid-report', grid);
   const cards = ordered.map(entry => {
     const task = entry.task;
@@ -91,8 +222,8 @@ function renderReport(rep) {
       const dur      = fmtMs(Math.min(s.end_ms ?? Date.now() + _skew, rep.end_ms) - Math.max(s.start_ms, rep.start_ms));
       const badge    = (isOpen ? `<span class="open-badge">${t('live')}</span>` : '')
                      + (s.role === 'parallel' ? `<span class="open-badge par">${t('parallel')}</span>` : '');
-      const filled   = s.notes.length + (s.text ? 1 : 0);
-      const preview  = filled > 0 ? t('notes_n', { n: filled }) : t('click_notes');
+      const filled   = _starredOnly ? s.notes.filter(n => n.starred).length : s.notes.length + (s.text ? 1 : 0);
+      const preview  = filled > 0 ? t('notes_n', { n: filled }) : _starredOnly ? '' : t('click_notes');
       const blockOpen = _openBlocks.has(s.id) || (!compact && isOpen && !_openBlocks.has(-s.id));
 
       // Merge button: show between this block and the next when:
@@ -131,13 +262,14 @@ function renderReport(rep) {
           </div>
           <div class="block-toggle">${blockOpen ? '▾' : '▸'}</div>
         </div>
-        <div class="slot-grid${blockOpen ? ' open' : ''}">${buildSlotRows(s, bi)}</div>
+        <div class="slot-grid${blockOpen ? ' open' : ''}" data-note-list="slots-${s.id}">${buildSlotRows(s, bi)}</div>
       </div>${mergeBtn}`;
     }).join('');
     const folded = grid && _foldedTasks.has(task.id);
     const spanEnd = Math.max(...sessions.map(x => x.end_ms ?? Date.now() + _skew));
     const span = sessions.length ? `${fmtTime(sessions[0].start_ms)} – ${sessions.some(x => x.end_ms == null) ? t('now') : fmtTime(spanEnd)}` : '';
     const blocks = !grid ? renderBlocks(sessions) : folded ? '' : renderEpisodes(sessions, rep, renderBlocks);
+    const noStars = _starredOnly && !dayNotes(rep, task.id).some(n => n.starred);
 
     // Register task data for the switch button (avoids escaping task data in onclick)
     const taskIdx = _taskData.length;
@@ -178,7 +310,7 @@ function renderReport(rep) {
           </div>
         </div>
       </div>
-      <div class="block-list">${blocks}</div>
+      <div class="block-list">${noStars && !folded ? `<div class="notes-empty">${esc(t('no_starred_notes'))}</div>` : ''}${blocks}</div>
     </div>`;
     // Folded height, roughly in lines: placing cards by it keeps them in
     // their column when one shows more notes.
@@ -187,9 +319,10 @@ function renderReport(rep) {
     return { html: card, weight };
   });
   if (!grid) {
-    patchHTML(area, cards.map(c => c.html).join(''));
+    patchHTML(area, toolbar + cards.map(c => c.html).join(''));
     restoreScroll();
     markSlotSel();
+    markNoteSelection();
     return;
   }
   // Each card goes to the shortest column so far, in task order.
@@ -204,6 +337,7 @@ function renderReport(rep) {
   patchHTML(area, toolbar + `<div class="card-cols">${cols.map(c => `<div class="card-col">${c.html.join('')}</div>`).join('')}</div>`);
   restoreScroll();
   markSlotSel();
+  markNoteSelection();
 }
 
 // The narrowest a grid column gets, in pixels.
@@ -261,11 +395,11 @@ function episodeNotes(ep) {
   return notes.sort((a, b) => a.at_ms - b.at_ms);
 }
 
-function episodeNoteHtml(n) {
+function episodeNoteHtml(n, taskId) {
   const who = n.source === 'prompt' ? `<span class="ep-who you">${esc(t('ep_you'))}</span>`
     : n.source === 'outcome' ? `<span class="ep-who agent">${esc(t('ep_agent'))}</span>` : '';
   const text = n.source === 'outcome' ? n.text.replace(/^->\s*/, '') : n.text;
-  return `<div class="ep-note"><span class="ep-at">${fmtTime(n.at_ms)}</span>${who}<span class="ep-text" title="${escAttr(text)}">${notePreview(text)}</span></div>`;
+  return `<div class="ep-note ${n.id == null ? '' : noteRowClass(n, taskId)}"${n.id == null ? '' : ` data-note-id="${n.id}"`}><span class="ep-at">${fmtTime(n.at_ms)}</span>${who}<span class="ep-text" title="${escAttr(text)}">${n.id == null ? notePreview(text) : noteTextHtml(n.source === 'outcome' && !noteHit(n, taskId) ? { ...n, text } : n, taskId, true)}</span>${noteControls(n, taskId)}</div>`;
 }
 
 function notePreview(text) {
@@ -283,15 +417,18 @@ function episodeHtml(ep, rep, renderBlocks, label) {
   if (focus > 0 || agent === 0) parts.push(`${esc(t('ep_focus'))} ${estimated ? '≈ ' : ''}${fmtMs(focus)}`);
   if (agent > 0) parts.push(`${esc(t('ep_agent_time'))} ${fmtMs(agent)}`);
   const end = live ? `<span style="color:var(--grn)">${t('now')}</span>` : fmtTime(ep.end);
-  const notes = episodeNotes(ep);
+  const taskId = ep.items[0].task.id;
+  const notes = episodeNotes(ep).filter(n => !_starredOnly || n.starred);
+  const shown = notes.filter((n, i) => all || _starredOnly || i < EPISODE_NOTES || n.starred || noteHit(n, taskId) || _selectedNotes.has(n.id));
+  const hidden = notes.length - shown.length;
   const title = estimated ? ` title="${escAttr(t('ep_estimated'))}"` : '';
   return `<div class="episode${open ? ' open' : ''}">
     <div class="ep-hdr" onclick="toggleEpisode(${key})">
       <div class="ep-time">${label ? esc(label) : `${fmtTime(ep.start)} → ${end}`}${live ? `<span class="open-badge">${t('live')}</span>` : ''}</div>
       <div class="ep-dur"${title}>${parts.join(' · ')}</div>
     </div>
-    ${notes.length ? `<div class="ep-notes">${(all ? notes : notes.slice(0, EPISODE_NOTES)).map(episodeNoteHtml).join('')}${notes.length > EPISODE_NOTES ? `<div class="ep-note ep-rest" onclick="toggleAllNotes(${key})">${esc(all ? t('show_less') : t('more_n', { n: notes.length - EPISODE_NOTES }))}</div>` : ''}</div>` : ''}
-    <div class="ep-details${open ? ' open' : ''}">${renderBlocks(ep.items, true)}</div>
+    ${notes.length ? `<div class="ep-notes" data-note-list="preview-${key}">${shown.map(n => episodeNoteHtml(n, taskId)).join('')}${notes.length > EPISODE_NOTES && !_starredOnly && (all || hidden) ? `<div class="ep-note ep-rest" onclick="toggleAllNotes(${key})">${esc(all ? t('show_less') : t('more_n', { n: hidden }))}</div>` : ''}</div>` : ''}
+    <div class="ep-details${open ? ' open' : ''}" data-note-list="details-${key}">${renderBlocks(ep.items, true)}</div>
   </div>`;
 }
 
@@ -341,9 +478,10 @@ function buildSlotRows(s, bi) {
   const { first, count } = slotsOf(s);
   const bySlot = Array.from({ length: count }, () => []);
   const place = at => Math.min(count - 1, Math.max(0, Math.floor((at - first) / SLOT_MS)));
-  if (s.text) bySlot[place(s.start_ms)].push(`<span class="slot-note" title="${escAttr(s.text)}">${notePreview(s.text)}</span>`);
+  if (s.text && !_starredOnly) bySlot[place(s.start_ms)].push(`<span class="slot-note" title="${escAttr(s.text)}">${notePreview(s.text)}</span>`);
   for (const n of s.notes) {
-    bySlot[place(n.at_ms)].push(`<span class="slot-note" id="sn-${n.id}" title="${escAttr(n.text)}" onclick="editNote(${bi},${n.id})">${notePreview(n.text)}</span>`);
+    if (_starredOnly && !n.starred) continue;
+    bySlot[place(n.at_ms)].push(`<span class="slot-note ${noteRowClass(n, s.task.id)}" id="sn-${n.id}" data-note-id="${n.id}" title="${escAttr(n.text)}" onclick="editNote(${bi},${n.id})"><span class="slot-note-text">${noteTextHtml(n, s.task.id, true)}</span>${noteControls(n, s.task.id)}</span>`);
   }
   const closed = s.end_ms != null;
   const hint = closed ? escAttr(t('slot_hint')) : '';
@@ -356,12 +494,12 @@ function buildSlotRows(s, bi) {
       ? ` tabindex="0" onclick="selectSlot(event,${bi},${k})" draggable="true" ondragstart="dragSlots(event,${bi},${k})" ondragend="dragEndBlock()" title="${hint}"`
       : ' tabindex="0"';
     const body = notes.length ? notes.join('')
-      : `<span class="slot-note blank" id="na-${s.id}-${k}" data-ph="${escAttr(t('add_note'))}" onclick="addNoteAt(${bi},${k})"></span>`;
+      : _starredOnly ? '' : `<span class="slot-note blank" id="na-${s.id}-${k}" data-ph="${escAttr(t('add_note'))}" onclick="addNoteAt(${bi},${k})"></span>`;
     return `<div class="slot-row" data-slot="${k}" data-bi="${bi}">
       <div class="slot-time${closed ? ' pick' : ''}"${handle}>${time}</div>
       <div class="slot-note-wrap">${body}</div>
     </div>`;
-  }).join('');
+  }).filter((_, k) => !_starredOnly || bySlot[k].length).join('');
 }
 
 // ── Slot selection ────────────────────────────────────────────────────────────

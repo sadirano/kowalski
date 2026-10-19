@@ -233,7 +233,22 @@ async function openObsPopup(idx) {
   setTimeout(() => id('obs-text').focus(), 50);
 }
 
+async function useStarredNotes() {
+  if (_obsEntryIdx === null || !_obsEntry) return;
+  const entry = _obsEntry, date = _horasDate, tok = ++_obsTok;
+  try {
+    const day = D?.date === date ? D : await apiJSON('GET', '/api/day?date=' + encodeURIComponent(date));
+    if (tok !== _obsTok || _obsEntry !== entry || !id('obs-popup').classList.contains('show')) return;
+    const lines = dayStarredNotes(day, entry.offer.task.id)
+      .map(n => `[${hhmm24(n.at_ms)}] ${n.text.replace(/\s*\r?\n\s*/g, ' ')}`);
+    if (!lines.length) { showToast(t('no_starred_notes')); return; }
+    id('obs-text').value = lines.join('\n');
+    id('obs-text').focus();
+  } catch (err) { if (tok === _obsTok) showError(err.message); }
+}
+
 function closeObsPopup() {
+  ++_obsTok;
   id('obs-overlay').classList.remove('show');
   id('obs-popup').classList.remove('show');
   _obsEntryIdx = null;

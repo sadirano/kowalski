@@ -12,7 +12,7 @@ function buildSummaryWrap(content, isSaved, day) {
     + totals.map(row => `<div class="summary-project-row"><span>${esc(row.project_id == null ? t('project_unassigned') : projectName(row.project_id))}</span><b>${esc(fmtMs(row.focus_ms))}</b></div>`).join('')
     + `</aside>`;
   return `<div class="summary-layout"><div class="summary-wrap">`
-    + `<div class="summary-tools">${prefButton('summary')}<button class="summary-regen" onclick="regenerateSummary()" title="${t('summary_regen')}" aria-label="${t('summary_regen')}">${icon('refresh')}</button></div>`
+    + `<div class="summary-tools">${dayStarredNotes(day).length ? `<button class="summary-regen" onclick="insertStarredSummary()">${icon('star')}${esc(t('draft_from_starred'))}</button>` : ''}${prefButton('summary')}<button class="summary-regen" onclick="regenerateSummary()" title="${escAttr(t('summary_regen'))}" aria-label="${escAttr(t('summary_regen'))}">${icon('refresh')}</button></div>`
     + `<textarea class="summary-area" id="summary-text" oninput="onSummaryInput()">${content}</textarea>`
     + `<span class="summary-status${isSaved ? '' : ' hidden'}" id="summary-status">${statusText}</span>`
     + `</div>${projectsHtml}</div>`;
@@ -38,6 +38,18 @@ function onSummaryInput() {
   _summaryDraft = { date: _summaryDate, text: id('summary-text').value.trim() };
   clearTimeout(_summaryAutoSaveTimer);
   _summaryAutoSaveTimer = setTimeout(flushSummary, 1000);
+}
+function insertStarredSummary() {
+  const editor = id('summary-text');
+  if (!editor || !D || _summaryDate !== D.date) return;
+  const lines = dayStarredNotes(D)
+    .map(n => `- ${hhmm24(n.at_ms)} ${n.task.ref || n.task.title || '#' + n.task.id}: ${n.text.replace(/\s*\r?\n\s*/g, ' ')}`);
+  if (!lines.length) return;
+  const at = editor.selectionStart, before = editor.value.slice(0, at), after = editor.value.slice(at);
+  const insert = (before && !before.endsWith('\n') ? '\n' : '') + lines.join('\n') + (after && !after.startsWith('\n') ? '\n' : '');
+  editor.setRangeText(insert, at, at, 'end');
+  editor.focus();
+  onSummaryInput();
 }
 function flushSummary() {
   clearTimeout(_summaryAutoSaveTimer);
@@ -88,7 +100,7 @@ function renderSummary(day) {
   prepareSummaryDate(day.date || selectedDate);
   const intervals = (day.intervals || []).filter(s => s.role === 'focus')
     .sort((a, b) => a.start_ms - b.start_ms);
-  if (!intervals.length) { area.innerHTML = `<div class="empty">${t('no_sessions')}</div>`; return; }
+  if (!intervals.length && !dayStarredNotes(day).length) { area.innerHTML = `<div class="empty">${t('no_sessions')}</div>`; return; }
 
   const now = Date.now() + _skew; // the daemon's clock
   const tasks = new Map((day.tasks || []).map(entry => [String(entry.task.id), entry]));

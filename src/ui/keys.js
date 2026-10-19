@@ -89,6 +89,9 @@ document.addEventListener('keydown', e => {
     if (_selectionMenu) closeSelectionMenu(); else closeSelectionPicker();
     return;
   }
+  if (e.key === 'Escape' && _selectedNotes.size && !anyPopupOpen() && (activeTab === 'report' || activeTab === 'timeline')) {
+    e.preventDefault(); clearNoteSelection(); return;
+  }
   if (activeTab === 'report' && !anyPopupOpen() && !selectionUiOpen()) {
     const row = e.target.closest?.('.slot-row');
     if ((e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) && row?.classList.contains('sel') && e.target.classList?.contains('slot-time')) {

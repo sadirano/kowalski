@@ -44,8 +44,8 @@ function unionMs(spans) {
 function readerNotes(list) {
   const notes = [];
   for (const s of list) {
-    if (s.text) notes.push({ at_ms: s.start_ms, text: s.text, source: null });
-    for (const n of s.notes) notes.push(n);
+    if (s.text && !_starredOnly) notes.push({ at_ms: s.start_ms, text: s.text, source: null });
+    for (const n of s.notes) if (!_starredOnly || n.starred) notes.push(n);
   }
   return notes.sort((a, b) => a.at_ms - b.at_ms);
 }
@@ -105,7 +105,7 @@ function exchangesOf(notes) {
 function lastNoteBefore(rep, taskId, t) {
   let best = null;
   for (const s of readerIntervals(rep)) if (s.task.id === taskId)
-    for (const n of s.notes) if (n.at_ms <= t && (!best || n.at_ms > best.at_ms)) best = n;
+    for (const n of s.notes) if ((!_starredOnly || n.starred) && n.at_ms <= t && (!best || n.at_ms > best.at_ms)) best = n;
   return best;
 }
 
@@ -117,7 +117,7 @@ function whatAt(rep, t) {
   return { focus, others };
 }
 
-function noteBody(n) { return esc(n.source === 'outcome' ? n.text.replace(/^->\s*/, '') : n.text); }
+function noteBody(n) { return noteTextHtml(n.source === 'outcome' && !noteHit(n, _readerTask) ? { ...n, text: n.text.replace(/^->\s*/, '') } : n, _readerTask); }
 function taskLabel(task) { return task.ref ? task.ref : '#' + task.id; }
 function titleOf(rep, taskId) {
   const e = rep.tasks.find(x => x.task.id === taskId);
@@ -170,6 +170,7 @@ function renderReader(rep, area) {
   area.querySelector('.rd-at').scrollTop = atScroll;
   area.querySelector('.rd-main').scrollTop = mainScroll;
   readerEndFit();
+  markNoteSelection();
   if (pinned != null) markMoment(rep, pinned, false);
   requestAnimationFrame(() => {
     const tab = area.querySelector('.rd-tab:hover');
@@ -253,11 +254,11 @@ function rowsHtml(rep) {
 function readerMainHtml(rep) {
   const entry = rep.tasks.find(e => e.task.id === _readerTask);
   const list = sittingsOf(rep, _readerTask);
-  if (!list.length) return '';
+  if (!list.length) return `<div class="rd-head-controls">${starredOnlyButton()}</div>`;
   const first = list[0].start, last = list[list.length - 1].end;
   const parallel = list.reduce((n, st) => n + st.parallel, 0);
   const vars = { focus: fmtMs(entry.focus_ms), par: fmtMs(parallel), span: fmtMs(last - first), from: fmtTime(first), to: fmtTime(last) };
-  let h = `<h1 class="rd-h1"${entry.task.ref ? ` title="${escAttr(t('rd_provider_title'))}"` : ''}><span class="rd-ref">${entry.task.ref ? refLink(entry.task.ref) : esc('#' + entry.task.id)}</span><span class="rd-title" id="rd-title">${esc(entry.task.title)}</span>${entry.task.ref ? '' : `<button class="rd-title-edit" type="button" onclick="editReaderTitle()" title="${escAttr(t('rd_edit_title'))}" aria-label="${escAttr(t('rd_edit_title'))}">${icon('edit')}</button>`}</h1>
+  let h = `<div class="rd-head-controls">${starredOnlyButton()}</div><h1 class="rd-h1"${entry.task.ref ? ` title="${escAttr(t('rd_provider_title'))}"` : ''}><span class="rd-ref">${entry.task.ref ? refLink(entry.task.ref) : esc('#' + entry.task.id)}</span><span class="rd-title" id="rd-title">${esc(entry.task.title)}</span>${entry.task.ref ? '' : `<button class="rd-title-edit" type="button" onclick="editReaderTitle()" title="${escAttr(t('rd_edit_title'))}" aria-label="${escAttr(t('rd_edit_title'))}">${icon('edit')}</button>`}</h1>
     <p class="rd-headline">${esc(t(parallel >= 60000 ? 'rd_head_par' : 'rd_head', vars))} ${esc(list.length > 1 ? t('rd_back', { n: list.length - 1 }) : t('rd_one'))}</p>`;
   list.forEach((st, k) => {
     if (k > 0) {
@@ -275,9 +276,9 @@ function readerMainHtml(rep) {
       <div class="rd-shead"><span class="rd-span rd-t0">${fmtTime(st.start)}</span>
         <span class="rd-who"><span class="f">${esc(t('rd_you_n', { d: fmtMs(st.focus) }))}</span>${st.parallel >= 60000 ? ` · <span class="p">${esc(t('rd_par_n', { d: fmtMs(st.parallel) }))}</span>` : ''}</span></div>`;
     const ex = exchangesOf(st.notes);
-    if (!ex.length) h += `<p class="rd-empty">${esc(t('rd_no_notes'))}</p>`;
+    if (!ex.length) h += `<p class="rd-empty">${esc(t(_starredOnly ? 'no_starred_notes' : 'rd_no_notes'))}</p>`;
     ex.forEach((e, j) => {
-      if (e.note) { h += `<div class="rd-ex" data-at="${e.note.at_ms}"><div class="rd-at-time">${fmtTime(e.note.at_ms)}</div><p class="rd-note">${noteBody(e.note)}</p></div>`; return; }
+      if (e.note) { h += `<div class="rd-ex ${e.note.id == null ? '' : noteRowClass(e.note, _readerTask)}" data-at="${e.note.at_ms}"${e.note.id == null ? '' : ` data-note-id="${e.note.id}"`}><div class="rd-at-time">${fmtTime(e.note.at_ms)}</div><p class="rd-note">${noteBody(e.note)}</p>${noteControls(e.note, _readerTask)}</div>`; return; }
       const base = e.prompt ? e.prompt.at_ms : e.out[0].at_ms;
       // A prompt that opens a sitting answers what the agent said before the break.
       let ctx = '';
@@ -285,12 +286,17 @@ function readerMainHtml(rep) {
         const prev = lastNoteBefore(rep, _readerTask, e.prompt.at_ms - 1);
         if (prev && prev.source === 'outcome') ctx = `<p class="rd-ctx"><b>${esc(t('rd_replying', { d: rdDur(e.prompt.at_ms - prev.at_ms) }))}</b>${noteBody(prev)}</p>`;
       }
-      h += `<div class="rd-ex" data-at="${base}"><div class="rd-at-time">${fmtTime(base)}</div>${ctx}${e.prompt ? `<p class="rd-prompt">${noteBody(e.prompt)}</p>` : ''}`;
+      h += `<div class="rd-ex" data-at="${base}"><div class="rd-at-time">${fmtTime(base)}</div>${ctx}${e.prompt ? `<div class="rd-prompt-row ${e.prompt.id == null ? '' : noteRowClass(e.prompt, _readerTask)}"${e.prompt.id == null ? '' : ` data-note-id="${e.prompt.id}"`}><p class="rd-prompt">${noteBody(e.prompt)}</p>${noteControls(e.prompt, _readerTask)}</div>` : ''}`;
       if (e.out.length) {
-        const rows = e.out.map(n => `<span class="rd-rel" title="${escAttr(fmtTime(n.at_ms))}">+${Math.max(0, Math.round((n.at_ms - base) / 60000))}m</span><p>${noteBody(n)}</p>`);
-        h += '<div class="rd-out">' + (rows.length > READER_FOLD
-          ? rows[0] + `<button class="rd-fold" onclick="readerUnfold(this)" data-more="${escAttr(encodeURIComponent(rows.slice(1, -1).join('')))}">${esc(t('rd_more', { n: rows.length - 2, from: fmtTime(e.out[1].at_ms), to: fmtTime(e.out[e.out.length - 2].at_ms) }))}</button>` + rows[rows.length - 1]
-          : rows.join('')) + '</div>';
+        const rows = e.out.map(n => `<div class="rd-out-row ${n.id == null ? '' : noteRowClass(n, _readerTask)}"${n.id == null ? '' : ` data-note-id="${n.id}"`}><span class="rd-rel" title="${escAttr(fmtTime(n.at_ms))}">+${Math.max(0, Math.round((n.at_ms - base) / 60000))}m</span><p>${noteBody(n)}</p>${noteControls(n, _readerTask)}</div>`);
+        let out = '';
+        for (let i = 0; i < rows.length;) {
+          if (_starredOnly || rows.length <= READER_FOLD || i === 0 || i === rows.length - 1 || e.out[i].starred || noteHit(e.out[i], _readerTask) || _selectedNotes.has(e.out[i].id)) { out += rows[i++]; continue; }
+          const from = i;
+          while (i < rows.length - 1 && !e.out[i].starred && !noteHit(e.out[i], _readerTask) && !_selectedNotes.has(e.out[i].id)) i++;
+          out += `<button class="rd-fold" onclick="readerUnfold(this)" data-more="${escAttr(encodeURIComponent(rows.slice(from, i).join('')))}">${esc(t('rd_more', { n: i - from, from: fmtTime(e.out[from].at_ms), to: fmtTime(e.out[i - 1].at_ms) }))}</button>`;
+        }
+        h += '<div class="rd-out">' + out + '</div>';
       }
       h += '</div>';
     });

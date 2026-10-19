@@ -46,6 +46,7 @@
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></symbol>
   <symbol id="i-note" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h7M9 17h5"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 2.5 3 6.1 6.7 1-4.9 4.8 1.2 6.7-6-3.2-6 3.2 1.2-6.7-4.9-4.8 6.7-1z"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
   <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
@@ -281,6 +282,7 @@
   <div class="settings-hint" id="obs-hint" style="margin-bottom:8px" data-i18n="obs_hint">This note will be sent to the provider.</div>
   <textarea id="obs-text" style="width:100%;height:120px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);border-radius:4px;padding:8px;font-size:13px;outline:none;resize:vertical;font-family:inherit"
             onkeydown="if(event.key==='Enter' && event.ctrlKey) { event.preventDefault(); applyObsPopup(); }"></textarea>
+  <button type="button" class="set-btn obs-starred" onclick="useStarredNotes()" data-i18n="use_starred_notes">Use starred notes</button>
   <div class="popup-row" style="margin-top:2px">
     <button class="apply-btn" onclick="applyObsPopup()" style="flex:1;background:var(--acc)" data-i18n="set_note">Set Note</button>
     <span class="cancel-link" onclick="closeObsPopup()" style="flex:0;padding:6px 10px" data-i18n="close">Close</span>
