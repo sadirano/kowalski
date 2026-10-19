@@ -768,11 +768,13 @@
   /* One task read top to bottom under a day ribbon; an "At" panel beside it
      lists what else ran at the minute clicked on the ribbon. */
   .rd{--read:Georgia,'Times New Roman',serif}
-  .rd{display:grid;grid-template-columns:280px minmax(0,1fr) var(--rd-work-w, 40%);gap:24px;align-items:start;min-width:1168px;--rd-h:calc(100vh - 96px)}
+  .rd{display:grid;grid-template-columns:280px minmax(0,1fr) var(--rd-work-w, 40%);gap:24px;align-items:start;min-width:1168px;height:100%;grid-template-rows:minmax(0,1fr);--rd-h:100%}
   .rd-tabs{grid-column:1;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;max-height:var(--rd-h);overflow-y:auto}
   /* The task's text scrolls on its own, with a visible scrollbar: long tasks run to hundreds of notes. */
   .rd-main{grid-column:2;padding:0 12px 48px;min-width:0;width:100%;box-sizing:border-box;height:var(--rd-h);overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--brd) transparent}
-  .rd-end{position:sticky;bottom:16px;z-index:2;display:flex;align-items:center;gap:6px;width:max-content;margin:16px 0 0 auto;padding:6px 12px;background:var(--surf);border:1px solid var(--brd);border-radius:16px;color:var(--txt);font:12px system-ui,sans-serif;cursor:pointer;box-shadow:0 6px 16px #0008}
+  /* Zero height, so showing or hiding the button never moves the text under the scroll. */
+  .rd-endwrap{position:sticky;bottom:16px;z-index:2;height:0;display:flex;justify-content:flex-end;align-items:flex-end}
+  .rd-end{display:flex;align-items:center;gap:6px;flex:none;padding:6px 12px;background:var(--surf);border:1px solid var(--brd);border-radius:16px;color:var(--txt);font:12px system-ui,sans-serif;cursor:pointer;box-shadow:0 6px 16px #0008}
   .rd-end:hover{background:var(--hover)}
   .rd-end[hidden]{display:none}
   .rd-end .ico{width:14px;height:14px}
