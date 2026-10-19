@@ -628,9 +628,11 @@
   .task-card.drop-target{outline:2px dashed var(--acc);outline-offset:-2px}
   .sr-sub{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .sr-snip{font-size:11px;color:var(--muted);font-style:italic;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+  .sr-snip mark{background:var(--warn);color:#111;border-radius:2px;font-style:normal}
   .sr-days{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}
   .sr-day{font-family:var(--mono);font-size:10px;color:var(--muted);border:1px solid var(--brd);border-radius:3px;padding:1px 4px}
   .sr-day:hover{border-color:var(--acc);color:var(--acc)}
+  .sr-day.match{border-color:var(--warn);color:var(--warn)}
   .sr-day.more{border-style:dashed;cursor:default}
   .sr-day.more:hover{border-color:var(--brd);color:var(--muted)}
   .sr-msg{padding:11px 10px;font-size:12px;color:var(--muted);text-align:center}

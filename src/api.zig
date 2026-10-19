@@ -1153,6 +1153,8 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
         total_ms: i64,
         day_count: usize,
         last_date: ?[]const u8,
+        match_date: ?[]const u8,
+        match_dates: [][]const u8,
         /// Most recent first, at most 12.
         days: []DayTotal,
     };
@@ -1173,6 +1175,21 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
             i -= 1;
             try list.append(a, .{ .date = keys[i], .total_ms = totals.values()[i] });
         }
+        var match_dates: std.ArrayList([]const u8) = .empty;
+        for (found.match_times) |ms| {
+            const d = try z.dateOf(ms);
+            const date = try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+            var seen = false;
+            for (match_dates.items) |prior| {
+                if (std.mem.eql(u8, prior, date)) { seen = true; break; }
+            }
+            if (!seen) try match_dates.append(a, date);
+            if (match_dates.items.len == 12) break;
+        }
+        const match_date = if (found.match_ms) |ms| blk: {
+            const d = try z.dateOf(ms);
+            break :blk try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+        } else null;
         try results.append(a, .{
             .task = found.task,
             .fields = try query.fields(app.store, a, found.task.id),
@@ -1181,6 +1198,8 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
             .total_ms = total,
             .day_count = keys.len,
             .last_date = if (keys.len > 0) keys[keys.len - 1] else null,
+            .match_date = match_date,
+            .match_dates = match_dates.items,
             .days = list.items,
         });
     }
@@ -3822,6 +3841,34 @@ test "lookup stays unbound while provider fields appear in state and search" {
     try std.testing.expectEqual(@as(usize, 1), by_field.results.len);
     try std.testing.expectEqual(@as(?[]const u8, null), by_field.results[0].snippet);
     try std.testing.expectEqualStrings("Example", by_field.results[0].fields[0].value);
+}
+
+test "search returns the matching note day ahead of the latest focus day" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const newer: i64 = 1_773_129_600_000; // 2026-03-10T08:00Z
+    const older = newer - 86_400_000;
+    test_now = newer + 3_600_000;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"Planning\"}").status);
+    const first = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ older, older + 3_600_000 }));
+    try std.testing.expectEqual(std.http.Status.created, first.status);
+    const interval = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, first.body, .{})).interval;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ newer, newer + 3_600_000 })).status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/notes", try std.fmt.allocPrint(a, "{{\"interval\":{d},\"at_ms\":{d},\"text\":\"older needle note\"}}", .{ interval, older + 900_000 })).status);
+    const Search = struct { results: []struct { snippet: ?[]const u8, last_date: ?[]const u8, match_date: ?[]const u8, match_dates: [][]const u8 } };
+    const by_note = try f.get(Search, "/api/search?q=needle");
+    try std.testing.expectEqual(@as(usize, 1), by_note.results.len);
+    try std.testing.expectEqualStrings("older needle note", by_note.results[0].snippet.?);
+    try std.testing.expectEqualStrings("2026-03-10", by_note.results[0].last_date.?);
+    try std.testing.expectEqualStrings("2026-03-09", by_note.results[0].match_date.?);
+    try std.testing.expectEqual(@as(usize, 1), by_note.results[0].match_dates.len);
+    try std.testing.expectEqualStrings("2026-03-09", by_note.results[0].match_dates[0]);
+    const by_title = try f.get(Search, "/api/search?q=Planning");
+    try std.testing.expectEqual(@as(usize, 1), by_title.results.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), by_title.results[0].match_date);
+    try std.testing.expectEqual(@as(usize, 0), by_title.results[0].match_dates.len);
 }
 
 test "day totals frequent tasks and charts count focus only" {

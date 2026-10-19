@@ -564,7 +564,7 @@ pub fn focusSpans(store: *Store, a: std.mem.Allocator, task_id: i64) ![]OpenSpan
 }
 
 pub const ProjectRef = struct { project_id: ?i64, label: ?[]const u8 };
-pub const Found = struct { task: Task, snippet: ?[]const u8, historical_projects: []ProjectRef };
+pub const Found = struct { task: Task, snippet: ?[]const u8, match_ms: ?i64, match_times: []i64, historical_projects: []ProjectRef };
 
 fn historicalProjects(store: *Store, a: std.mem.Allocator, task_id: i64) ![]ProjectRef {
     var stmt = try store.db.prepare("SELECT DISTINCT i.project_id,p.label FROM intervals i LEFT JOIN projects p ON p.id=i.project_id WHERE i.task_id=?1 ORDER BY i.project_id");
@@ -577,12 +577,9 @@ fn historicalProjects(store: *Store, a: std.mem.Allocator, task_id: i64) ![]Proj
 
 /// Tasks whose title, ref, field values, session text or notes contain `q`
 /// (ASCII case ignored), most recently worked first. `snippet` is the first
-/// matching note or session text.
+/// matching note or session text. `match_times` holds the newest 200 text matches.
 pub fn search(store: *Store, a: std.mem.Allocator, q: []const u8, limit: u32) ![]Found {
-    var stmt = try store.db.prepare("SELECT " ++ task_columns ++ "," ++
-        "(SELECT text FROM (SELECT n.text AS text,n.at_ms AS at FROM notes n JOIN intervals i ON i.id=n.interval_id WHERE i.task_id=t.id AND instr(lower(n.text),lower(?1))>0 " ++
-        "UNION ALL SELECT i.text,i.start_ms FROM intervals i WHERE i.task_id=t.id AND instr(lower(i.text),lower(?1))>0) ORDER BY at DESC LIMIT 1) " ++
-        "FROM tasks t WHERE instr(lower(t.title),lower(?1))>0 " ++
+    var stmt = try store.db.prepare("SELECT " ++ task_columns ++ " FROM tasks t WHERE instr(lower(t.title),lower(?1))>0 " ++
         "OR EXISTS(SELECT 1 FROM task_bindings b WHERE b.task_id=t.id AND instr(lower(b.external_ref),lower(?1))>0) " ++
         "OR EXISTS(SELECT 1 FROM task_fields f WHERE f.task_id=t.id AND instr(lower(f.value),lower(?1))>0) " ++
         "OR EXISTS(SELECT 1 FROM projects p WHERE p.id=t.project_id AND instr(lower(p.label),lower(?1))>0) " ++
@@ -596,7 +593,18 @@ pub fn search(store: *Store, a: std.mem.Allocator, q: []const u8, limit: u32) ![
     var rows: std.ArrayList(Found) = .empty;
     while (try stmt.step() == .row) {
         const t = try readTask(a, &stmt, 0);
-        try rows.append(a, .{ .task = t, .snippet = try dupeOpt(a, stmt.columnText(5)), .historical_projects = try historicalProjects(store, a, t.id) });
+        var matches = try store.db.prepare("SELECT text,at FROM (SELECT n.text AS text,n.at_ms AS at FROM notes n JOIN intervals i ON i.id=n.interval_id WHERE i.task_id=?1 AND instr(lower(n.text),lower(?2))>0 " ++
+            "UNION ALL SELECT i.text,i.start_ms FROM intervals i WHERE i.task_id=?1 AND instr(lower(i.text),lower(?2))>0) ORDER BY at DESC LIMIT 200");
+        defer matches.finalize();
+        try matches.bindI64(1, t.id);
+        try matches.bindText(2, q);
+        var snippet: ?[]const u8 = null;
+        var times: std.ArrayList(i64) = .empty;
+        while (try matches.step() == .row) {
+            if (times.items.len == 0) snippet = try dupeOpt(a, matches.columnText(0));
+            try times.append(a, matches.columnI64(1));
+        }
+        try rows.append(a, .{ .task = t, .snippet = snippet, .match_ms = if (times.items.len > 0) times.items[0] else null, .match_times = times.items, .historical_projects = try historicalProjects(store, a, t.id) });
     }
     return rows.items;
 }

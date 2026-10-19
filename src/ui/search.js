@@ -1,7 +1,7 @@
 'use strict';
 // ── Task search (Feature 7: find a task by any text that identifies it) ────────
 // Type anything that identifies a task — ref, title, field, or note — and the dropdown lists matching tasks
-// with the days they were worked on. Picking a hit opens its most recent day
+// with the days they were worked on. Picking a hit opens its latest matching day
 // (or the day chip clicked) on that task: the Timeline reads it and the report
 // marks its card; ▶ switches the tracker to it. Ctrl+K focuses the field from anywhere.
 let _searchHits  = [];
@@ -54,16 +54,24 @@ function renderSearch() {
   }
   const rows = _searchHits.map((h, i) => {
     const days   = h.days || [];
+    const matchDates = h.match_dates || [];
+    const matches = new Set(matchDates);
+    const shown = new Set(days.map(d => d.date));
     const nDays  = h.day_count || days.length;
     const fields = (h.fields || []).map(f => f.value).filter(Boolean);
     const env    = fields.map(v => `<span class="sr-env">${esc(v)}</span>`).join('');
     const sub    = [...fields, ...(h.task.ref ? [h.task.title] : [])].map(esc).join(' · ');
-    const snip   = h.snippet ? `<div class="sr-snip">${esc(h.snippet)}</div>` : '';
+    const snip   = h.snippet ? `<div class="sr-snip">${searchSnippet(h.snippet, q)}</div>` : '';
     const hidden = nDays - days.length;
-    const chips  = days.map(d =>
-      `<span class="sr-day" title="${escAttr(t('search_open_day', { d: d.date }))} · ${fmtMs(d.total_ms)}"
-             onclick="event.stopPropagation();searchGoDay(${i},'${d.date}')">${esc(shortDate(d.date))}</span>`).join('')
-      + (hidden > 0 ? `<span class="sr-day more">+${hidden}</span>` : '');
+    const chips  = days.map(d => {
+      const match = matches.has(d.date);
+      return `<span class="sr-day${match ? ' match' : ''}" title="${escAttr(t(match ? 'search_match_day' : 'search_open_day', { d: d.date }))} · ${fmtMs(d.total_ms)}"
+             onclick="event.stopPropagation();searchGoDay(${i},'${d.date}')">${esc(shortDate(d.date))}</span>`;
+    }).join('')
+      + (hidden > 0 ? `<span class="sr-day more">+${hidden}</span>` : '')
+      + matchDates.filter(d => !shown.has(d)).map(d =>
+        `<span class="sr-day match" title="${escAttr(t('search_match_day', { d }))}"
+             onclick="event.stopPropagation();searchGoDay(${i},'${d}')">${esc(shortDate(d))}</span>`).join('');
     const start = `<button class="sr-go" title="${escAttr(t('search_switch'))}"
       onclick="event.stopPropagation();searchSwitch(${i})">▶</button>`;
     return `<div class="sr-item${i === _searchSel ? ' sel' : ''}" onclick="searchOpen(${i})" onmousemove="searchHover(${i})">
@@ -78,6 +86,20 @@ function renderSearch() {
     </div>`;
   }).join('');
   box.innerHTML = rows + newTaskRow(q) + `<div class="sr-foot">${esc(t('search_hint'))}</div>`;
+}
+
+function searchSnippet(text, q) {
+  const fold = s => s.replace(/[A-Z]/g, c => c.toLowerCase());
+  const at = fold(text).indexOf(fold(q));
+  let from = 0;
+  if (at > 40) {
+    const boundary = text.slice(at - 40, at).search(/\s/);
+    from = boundary < 0 ? at : at - 40 + boundary + 1;
+    while (from < at && /\s/.test(text[from])) from++;
+  }
+  const lead = from ? '…' : '';
+  return at < 0 ? lead + esc(text.slice(from))
+    : lead + esc(text.slice(from, at)) + `<mark>${esc(text.slice(at, at + q.length))}</mark>` + esc(text.slice(at + q.length));
 }
 
 // Offer a new task when the query does not exactly identify an existing one.
@@ -132,7 +154,7 @@ async function onSearchKey(e) {
       if (newTaskRow(q)) searchNewTask();
       return;
     }
-    // Ctrl/Shift+Enter starts the task; a plain Enter just opens its latest day.
+    // Ctrl/Shift+Enter starts the task; a plain Enter opens its matching day.
     if (e.ctrlKey || e.shiftKey) searchSwitch(_searchSel);
     else searchOpen(_searchSel);
   }
@@ -140,9 +162,8 @@ async function onSearchKey(e) {
 
 function searchOpen(i) {
   const h = _searchHits[i];
-  // The most recent day this task was focused on; a task with only parallel
-  // time opens on the shown day when it is there, else has no day to open.
-  const date = h?.last_date || (h && D?.tasks?.some(e => e.task.id === h.task.id) ? selectedDate : null);
+  // Open the latest text match, then fall back to the most recent focus day.
+  const date = h?.match_date || h?.last_date || (h && D?.tasks?.some(e => e.task.id === h.task.id) ? selectedDate : null);
   if (!date) return;
   return searchGoDay(i, date);
 }
