@@ -360,12 +360,19 @@ function markMoment(rep, t0, scroll = true) {
   if (!sec) return;
   _readerSitting = k;
   const st = list[k];
-  if (t0 >= st.start && t0 <= st.end)
-    sec.querySelector('.rd-bar').insertAdjacentHTML('beforeend', `<i class="now" style="top:${((t0 - st.start) / ((st.end - st.start) || 1) * 100).toFixed(2)}%"></i>`);
-  let hit = null;
-  for (const e of sec.querySelectorAll('.rd-ex')) if (+e.dataset.at <= t0) hit = e;
+  let hit = null, next = null;
+  for (const e of sec.querySelectorAll('.rd-ex')) if (+e.dataset.at <= t0) hit = e; else if (!next) next = e;
   hit = hit || sec.querySelector('.rd-ex') || sec;
   hit.classList.add('hit');
+  // The marker sits beside the highlighted row, moved toward the next row by
+  // the time passed, so it lines up with the text rather than the clock.
+  if (t0 >= st.start && t0 <= st.end) {
+    const bar = sec.querySelector('.rd-bar');
+    const a = hit === sec ? 0 : hit.offsetTop, at = hit === sec ? st.start : +hit.dataset.at;
+    const b = next ? next.offsetTop : sec.querySelector('.rd-t1').offsetTop, bt = next ? +next.dataset.at : st.end;
+    const y = a + (b - a) * Math.max(0, Math.min(1, (t0 - at) / ((bt - at) || 1))) - bar.offsetTop;
+    bar.insertAdjacentHTML('beforeend', `<i class="now" style="top:${Math.max(0, Math.min(bar.clientHeight - 2, y)).toFixed(0)}px"></i>`);
+  }
   if (scroll) hit.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
 
