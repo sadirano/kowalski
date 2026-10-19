@@ -90,10 +90,15 @@ function horasStatus(e) {
   return `<span class="hr-muted">${t('tracked', { t: fmtMs(offer.total_focus_ms) })}</span>`;
 }
 
+// Posted rows read in the tracked h m like the rest of the column; the
+// provider's own figure stays in the amount column and on hover.
+function horasPostedHtml(offer, postings, tag) {
+  return `<${tag} class="hr-ok" title="${escAttr(postings.map(p => p.amount_text).join(' + '))}">${esc(t('posted_amt', { a: t('tracked', { t: fmtMs(offer.total_focus_ms) }) }))}</${tag}>`;
+}
+
 function horasPostedLine(e) {
   const posted = (e.offer.postings || []).filter(p => p.state === 'confirmed');
-  return posted.length
-    ? `<div class="hr-ok">${t('posted_amt', { a: esc(posted.map(p => p.amount_text).join(' + ')) })}</div>` : '';
+  return posted.length ? horasPostedHtml(e.offer, posted, 'div') : '';
 }
 
 // The provider's post options (Internal hours, say) as toggles on a row.
@@ -282,7 +287,7 @@ async function runHoras() {
       entries[s.i].offer.postings.push(...(data.postings || [data.posting]));
       posted = true;
       if (!live()) continue;
-      if (st) st.innerHTML = `<span class="hr-ok">${t('posted_amt', { a: esc((data.postings || [data.posting]).map(p => p.amount_text).join(' + ')) })}</span>`;
+      if (st) st.innerHTML = horasPostedHtml(entries[s.i].offer, data.postings || [data.posting], 'span');
       id(`hr-${s.i}`)?.classList.add('posted');
       const chk = id(`hr-chk-${s.i}`); if (chk) { chk.checked = false; chk.disabled = true; }
       const obs = id(`hr-obs-btn-${s.i}`); if (obs) obs.disabled = true;
