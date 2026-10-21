@@ -219,11 +219,9 @@
   .edit-popup input.t.bad,.newtask-popup input.t.bad{color:var(--warn)}
   .edit-popup input.t:disabled{color:var(--muted)}
   .edit-popup select{background:var(--bg);border:1px solid var(--brd);color:var(--txt);border-radius:4px;padding:6px 8px;font:13px system-ui,sans-serif}
-  .edit-project-current{font-size:12px;color:var(--muted)}
-  .edit-project-current strong{color:var(--txt);font-weight:600}
   .edit-project-actions{display:flex;gap:6px;flex-wrap:wrap}
   .edit-project-actions button:disabled{opacity:.45;cursor:default}
-  .edit-project-hint{font-size:11px;color:var(--muted)}
+  .project-picker-hint{font-size:11px;color:var(--muted)}
   .popup-row{display:flex;gap:8px}
   .edit-popup .apply-btn{background:var(--acc)}
   .newtask-popup .apply-btn{background:var(--grn);color:#000}

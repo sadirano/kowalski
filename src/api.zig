@@ -337,8 +337,9 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             const body = try parseBody(struct { title: ?[]const u8 = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
             const choice = try projectChoice(a, req.body);
             if (body.title == null and choice == .omitted) return badRequest(a, "body");
-            try app.store.updateTask(id, if (body.title) |title| std.mem.trim(u8, title, " \t") else null, choice, app.clock());
-            return send(a, .ok, .{ .task = (try query.task(app.store, a, id)).? });
+            const changed = if (body.title == null) try app.store.setTaskProject(id, choice.selected, app.clock()) else
+                try app.store.updateTask(id, std.mem.trim(u8, body.title.?, " \t"), choice, app.clock());
+            return send(a, .ok, .{ .task = (try query.task(app.store, a, id)).?, .changed = changed });
         }
     }
     if (is(req, .POST, path, "/api/tasks")) {
@@ -1563,8 +1564,7 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         if (choice == .selected) {
             const snapshot = body.snapshot orelse return fail(a, .{ .status = .conflict, .code = "AssignmentPreviewRequired" });
             if (snapshot.intervals.len != 1 or snapshot.intervals[0].id != id or snapshot.project_id != choice.selected) return error.Stale;
-            if (body.start_ms != body.seen.start_ms or body.end_ms != body.seen.end_ms) return badRequest(a, "separate edits from assignment");
-            _ = try app.store.applyProjectAssign(snapshot, snapshot.project_id, app.clock());
+            try app.store.editIntervalProject(id, seenOf(body.seen), body.start_ms, body.end_ms, snapshot, app.clock());
             return send(a, .ok, .{ .interval = id });
         }
         try app.store.editInterval(id, seenOf(body.seen), body.start_ms, body.end_ms, app.clock());
@@ -2481,6 +2481,55 @@ test "task title can change only without a binding" {
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/tasks/2", "{\"title\":\"  \"}").status);
 }
 
+test "task project patch fills only unassigned closed intervals" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const one = try f.store.createProject("One", test_now);
+    const two = try f.store.createProject("Two", test_now);
+    const task_id = try f.store.createTask("Task", test_now);
+    _ = try f.store.addIntervalProject(task_id, .focus, test_now - 120_000, test_now - 100_000, .{ .selected = null }, test_now);
+    _ = try f.store.addIntervalProject(task_id, .focus, test_now - 80_000, test_now - 60_000, .{ .selected = two }, test_now);
+    _ = try f.store.switchToProject(task_id, null, .{ .selected = null }, test_now);
+    const patched = f.call(.PATCH, "/api/tasks/1", "{\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, patched.status);
+    try std.testing.expect(contains(patched.body, "\"changed\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND project_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=1 AND end_ms IS NOT NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id IS NULL AND end_ms IS NULL"));
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.PATCH, "/api/tasks/1", "{\"project_id\":999}").status);
+    try std.testing.expectEqual(one, try apiScalar(&f.db, "SELECT project_id FROM tasks WHERE id=1"));
+}
+
+test "task project patch refuses posted time atomically" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = try f.store.createProject("One", test_now);
+    const task_id = try f.store.createTask("Task", test_now);
+    const start = test_now - 120_000;
+    const end = test_now - 60_000;
+    _ = try f.store.addIntervalProject(task_id, .focus, start, end, .{ .selected = null }, test_now);
+    var posted = try f.db.prepare("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES('2026-03-09',1,'example','R','confirmed','1',1000000,?1,?2,?3)");
+    defer posted.finalize();
+    try posted.bindI64(1, test_now);
+    try posted.bindI64(2, start);
+    try posted.bindI64(3, end);
+    _ = try posted.step();
+    const a = f.arena.allocator();
+    const preview = f.call(.POST, "/api/projects/assign/preview", "{\"scope\":{\"interval_ids\":[1]},\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, preview.status);
+    const parsed = try std.json.parseFromSliceLeaky(store_mod.AssignmentPreview, a, preview.body, .{ .ignore_unknown_fields = true });
+    const apply = try std.json.Stringify.valueAlloc(a, .{ .snapshot = parsed.snapshot }, .{});
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply).status);
+    const result = f.call(.PATCH, "/api/tasks/1", "{\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.conflict, result.status);
+    try std.testing.expect(contains(result.body, "PostingBlocked"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND project_id IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id IS NULL"));
+}
+
 test "binding adopts and refreshes a provider title" {
     var f: Fixture = .{};
     try f.init();
@@ -3009,6 +3058,40 @@ test "project assignment preview is read-only and apply checks task role totals 
     try std.testing.expect(contains(applied.body, "\"changed\":1"));
     try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2"));
     try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+}
+
+test "interval patch saves times and project in one operation" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const project_id = try f.store.createProject("One", test_now);
+    const task_id = try f.store.createTask("Task", test_now);
+    const start = test_now - 120_000;
+    const end = test_now - 60_000;
+    const interval = try f.store.addInterval(task_id, .focus, start, end, test_now);
+    const preview = f.call(.POST, "/api/projects/assign/preview", "{\"scope\":{\"interval_ids\":[1]},\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, preview.status);
+    const parsed = try std.json.parseFromSliceLeaky(store_mod.AssignmentPreview, a, preview.body, .{ .ignore_unknown_fields = true });
+    const path = try std.fmt.allocPrint(a, "/api/intervals/{d}", .{interval});
+    const invalid = try std.json.Stringify.valueAlloc(a, .{
+        .seen = .{ .start_ms = start, .end_ms = end },
+        .start_ms = end + 10_000,
+        .end_ms = start,
+        .project_id = project_id,
+        .snapshot = parsed.snapshot,
+    }, .{});
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, path, invalid).status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE id=1 AND project_id IS NULL AND start_ms=1773099880000"));
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .seen = .{ .start_ms = start, .end_ms = end },
+        .start_ms = start + 10_000,
+        .end_ms = end + 10_000,
+        .project_id = project_id,
+        .snapshot = parsed.snapshot,
+    }, .{});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, path, body).status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE id=1 AND project_id=1 AND start_ms=1773099890000 AND end_ms=1773099950000"));
 }
 
 test "forty seconds split by project posts as one unchanged session" {

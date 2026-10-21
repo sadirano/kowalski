@@ -35,6 +35,59 @@ function projectOptions(value) {
   return choices.join('');
 }
 
+// The edit and task dialogs share this searchable order. The new-task picker
+// keeps its existing options and defaults.
+// isCurrent says whether the dialog still belongs to the caller: a slow
+// answer for a dialog opened earlier must not touch the controls.
+async function setupProjectPicker(filter, select, value, isCurrent) {
+  await loadProjects();
+  if (!isCurrent()) return false;
+  let frequent = [];
+  try { frequent = (await apiJSON('GET', '/api/frequent?limit=50')).tasks || []; } catch {}
+  if (!isCurrent()) return false;
+  const available = projects.filter(p => !p.archived || String(p.id) === String(value));
+  const byId = new Map(available.filter(p => !p.archived).map(p => [p.id, p]));
+  const recent = [];
+  for (const item of frequent) {
+    const p = byId.get(item.task.project_id);
+    if (p && !recent.includes(p)) recent.push(p);
+    if (recent.length === 5) break;
+  }
+  const rest = available.filter(p => !recent.includes(p))
+    .sort((a, b) => a.label.localeCompare(b.label, locale(), { sensitivity: 'base' }) || a.id - b.id);
+  const ordered = [{ id: 'unassigned', label: t('project_unassigned') }, ...recent, ...rest];
+  select.dataset.picked = value == null ? 'unassigned' : String(value);
+  filter.value = '';
+  const render = () => {
+    const query = filter.value.toLocaleLowerCase(locale());
+    select.replaceChildren(...ordered.filter(p => p.label.toLocaleLowerCase(locale()).includes(query)).map(p => {
+      const option = document.createElement('option');
+      option.value = String(p.id);
+      option.textContent = p.label + (p.archived ? ' (' + t('project_archived') + ')' : '');
+      return option;
+    }));
+    const selected = [...select.options].find(option => option.value === select.dataset.picked);
+    select.selectedIndex = selected ? selected.index : -1;
+  };
+  filter.oninput = render;
+  filter.onkeydown = event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (select.options.length) {
+      select.selectedIndex = 0;
+      select.dataset.picked = select.value;
+    }
+  };
+  select.onchange = () => { select.dataset.picked = select.value; };
+  render();
+  return true;
+}
+
+function pickedProject(select) {
+  return select.dataset.picked === 'unassigned' ? null : Number(select.dataset.picked);
+}
+
 function renderSidebar() {
   const nav = id('week-nav');
   const lbl = id('sidebar-head-label');

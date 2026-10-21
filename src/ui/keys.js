@@ -36,7 +36,7 @@ function hideKeys() {
 // shortcuts stay out of the way until the one on top is dismissed, so they never
 // compete with the Enter/Escape handling further down.
 const POPUP_IDS = ['newtask-popup', 'settings-popup', 'horas-popup',
-                   'obs-popup', 'cal-popup', 'edit-popup', 'addentry-popup',
+                   'obs-popup', 'cal-popup', 'edit-popup', 'task-project-popup', 'addentry-popup',
                    'keys-popup', 'login-popup', 'approve-popup', 'source-popup', 'confirm-popup'];
 function anyPopupOpen() { return POPUP_IDS.some(p => id(p) && id(p).classList.contains('show')); }
 function isTyping(e) {
@@ -137,6 +137,8 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && id('horas-popup').classList.contains('show')) hideHoras();
   if (e.key === 'Escape' && id('edit-popup').classList.contains('show')) closeEditTime();
   if (e.key === 'Enter'  && id('edit-popup').classList.contains('show')) { e.preventDefault(); applyEditTime(); }
+  if (e.key === 'Escape' && id('task-project-popup').classList.contains('show')) closeTaskProject();
+  if (e.key === 'Enter' && id('task-project-popup').classList.contains('show')) { e.preventDefault(); saveTaskProject(); }
   if (e.key === 'Escape' && id('addentry-popup').classList.contains('show')) hideAddEntry();
   if (e.key === 'Enter'  && id('addentry-popup').classList.contains('show')) applyAddEntry();
   if (e.key === 'Escape' && id('keys-popup').classList.contains('show')) hideKeys();

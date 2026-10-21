@@ -322,15 +322,24 @@
   <h3 data-i18n="edit_title">Edit session times</h3>
   <label><span data-i18n="lbl_start_time">Start time</span><input type="text" class="t" id="edit-start" inputmode="numeric" autocomplete="off" spellcheck="false" onchange="tidyClock(this)"></label>
   <label><span data-i18n="lbl_end_time">End time</span><input type="text" class="t" id="edit-end" inputmode="numeric" autocomplete="off" spellcheck="false" onchange="tidyClock(this)"></label>
-  <div class="edit-project-current"><span data-i18n="project">Project</span>: <strong id="edit-project-current"></strong></div>
-  <label><span data-i18n="project_to">To</span><select id="edit-project-target" onchange="clearEditProjectPreview()"></select></label>
-  <div class="edit-project-actions"><button type="button" class="set-btn" onclick="previewEditProject()" data-i18n="project_preview">Preview assignment</button><button type="button" class="set-btn" id="edit-project-apply" onclick="applyEditProject()" data-i18n="project_apply" disabled>Apply assignment</button></div>
-  <small class="edit-project-hint" data-i18n="project_edit_hint">Project changes apply separately from time edits.</small>
-  <div id="edit-project-result" class="project-message" role="status"></div>
+  <label><span data-i18n="project">Project</span><input type="text" class="t" id="edit-project-filter" data-i18n-ph="project_filter" placeholder="Filter projects" autocomplete="off"><select id="edit-project-target"></select></label>
+  <small id="edit-project-open-hint" class="project-picker-hint" data-i18n="project_open_hint" hidden>This task's project applies to future sessions.</small>
   <div class="edit-project-actions"><button type="button" class="set-btn" id="edit-end-activity" onclick="applyIntervalAction('end-at-activity')" data-i18n="end_at_activity" style="display:none">End at last activity</button><button type="button" class="set-btn" id="edit-take-focus" onclick="applyIntervalAction('take-focus')" data-i18n="take_focus" style="display:none">Make this my focus</button></div>
   <div class="popup-row">
     <button class="apply-btn" onclick="applyEditTime()" style="flex:1" data-i18n="save">Save</button>
     <span class="cancel-link" onclick="closeEditTime()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
+  </div>
+</div>
+
+<!-- Task project popup -->
+<div class="edit-overlay" id="task-project-overlay" onclick="closeTaskProject()"></div>
+<div class="edit-popup" id="task-project-popup" role="dialog" aria-labelledby="task-project-title">
+  <h3 id="task-project-title" data-i18n="project">Project</h3>
+  <div id="task-project-name" class="project-picker-hint"></div>
+  <label><span data-i18n="project">Project</span><input type="text" class="t" id="task-project-filter" data-i18n-ph="project_filter" placeholder="Filter projects" autocomplete="off"><select id="task-project-target"></select></label>
+  <div class="popup-row">
+    <button type="button" class="apply-btn" onclick="saveTaskProject()" style="flex:1" data-i18n="save">Save</button>
+    <span class="cancel-link" onclick="closeTaskProject()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
   </div>
 </div>
 

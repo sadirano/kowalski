@@ -674,6 +674,7 @@ function openSelectionMenu(e, row, running = false) {
   menu.tabIndex = -1;
   _selectionMenu = menu;
   _selectionMenuReturn = document.activeElement?.closest?.('.slot-time') || row?.querySelector('.slot-time') || document.activeElement;
+  const task = _blockData[Number(row?.dataset.bi)]?.task;
   if (running) {
     const line = document.createElement('div');
     line.className = 'selection-menu-disabled';
@@ -681,12 +682,21 @@ function openSelectionMenu(e, row, running = false) {
     line.setAttribute('aria-disabled', 'true');
     line.textContent = t('selection_running_edit');
     menu.appendChild(line);
+    if (task) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('role', 'menuitem');
+      button.textContent = t('project');
+      button.addEventListener('click', () => { closeSelectionMenu(); openTaskProjectDialog(task); });
+      menu.appendChild(button);
+    }
   } else {
     const hasPieces = selectedPieces().length > 0;
     for (const [key, action, enabled] of [
       ['selection_assign', openSelectionPicker, hasPieces],
       ['selection_delete', deleteSelectedTime, hasPieces],
       ['selection_copy', copySelectedTime, hasPieces],
+      ['project', () => openTaskProjectDialog(task), !!task],
       ['selection_clear', clearSlotSelection, true],
     ]) {
       const button = document.createElement('button');
@@ -717,6 +727,48 @@ function openSelectionMenu(e, row, running = false) {
   menu.style.left = `${Math.max(8, Math.min(x, innerWidth - menu.offsetWidth - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(y, innerHeight - menu.offsetHeight - 8))}px`;
   (menu.querySelector('button:not(:disabled)') || menu).focus();
+}
+
+let _taskProject = null, _taskProjectEpoch = 0, _taskProjectBusy = false;
+
+async function openTaskProjectDialog(task) {
+  const epoch = ++_taskProjectEpoch;
+  // No target until this dialog's picker is ready: Save must not act on the old one.
+  _taskProject = null;
+  const current = () => epoch === _taskProjectEpoch;
+  try { if (!await setupProjectPicker(id('task-project-filter'), id('task-project-target'), task.project_id, current)) return; }
+  catch (e) { if (current()) showError(e.message); return; }
+  if (!current()) return;
+  _taskProject = task;
+  id('task-project-name').textContent = task.ref || task.title || '#' + task.id;
+  id('task-project-overlay').classList.add('show');
+  id('task-project-popup').classList.add('show');
+  id('task-project-filter').focus();
+}
+
+function closeTaskProject() {
+  ++_taskProjectEpoch;
+  _taskProject = null;
+  id('task-project-overlay').classList.remove('show');
+  id('task-project-popup').classList.remove('show');
+}
+
+async function saveTaskProject() {
+  if (!_taskProject || _taskProjectBusy) return;
+  const task = _taskProject;
+  _taskProjectBusy = true;
+  try {
+    const result = await apiJSON('PATCH', '/api/tasks/' + task.id,
+      { project_id: pickedProject(id('task-project-target')) });
+    if (_taskProject === task) closeTaskProject();
+    showToast(t('task_project_saved', { n: result.changed }));
+    loadDay(selectedDate, { chart: true });
+    loadCurrent();
+  } catch (e) {
+    if (_taskProject === task) showError(e.data?.error === 'PostingBlocked' ? t('task_project_posted') : e.message);
+  } finally {
+    _taskProjectBusy = false;
+  }
 }
 
 document.addEventListener('contextmenu', e => {

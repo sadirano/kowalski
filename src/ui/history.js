@@ -76,21 +76,24 @@ async function deleteBlock(i) {
 
 // The block as it was when the popup opened: a reload may reorder _blockData.
 let _editBlock = null;
-let _editProjectSnapshot = null;
 let _editProjectEpoch = 0, _editProjectBusy = false;
 
-function openEditTime(i) {
-  ++_editProjectEpoch;
+async function openEditTime(i) {
+  const epoch = ++_editProjectEpoch;
   const s = _blockData[i];
-  _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, project_id: s.project_id };
+  // No target until this dialog's picker is ready: Save must not act on the old one.
+  _editBlock = null;
   id('edit-end-activity').style.display = s.captured && s.end_ms == null ? '' : 'none';
   id('edit-take-focus').style.display = s.role === 'parallel' ? '' : 'none';
-  _editProjectSnapshot = null;
-  id('edit-project-current').textContent = projectName(s.project_id);
-  id('edit-project-target').innerHTML = projectOptions(s.project_id ?? 'unassigned');
-  id('edit-project-target').value = s.project_id == null ? 'unassigned' : String(s.project_id);
-  id('edit-project-result').innerHTML = '';
-  id('edit-project-apply').disabled = true;
+  const current = () => epoch === _editProjectEpoch;
+  try { if (!await setupProjectPicker(id('edit-project-filter'), id('edit-project-target'), s.project_id, current)) return; }
+  catch (e) { if (current()) showError(e.message); return; }
+  if (!current()) return;
+  _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, project_id: s.project_id };
+  const isOpen = s.end_ms == null;
+  id('edit-project-filter').disabled = isOpen;
+  id('edit-project-target').disabled = isOpen;
+  id('edit-project-open-hint').hidden = !isOpen;
   id('edit-start').value = fmtClock(hhmm24(s.start_ms));
   id('edit-end').value = s.end_ms == null ? '' : fmtClock(hhmm24(s.end_ms));
   for (const el of [id('edit-start'), id('edit-end')]) el.classList.remove('bad');
@@ -115,70 +118,10 @@ function closeEditTime() {
   id('edit-overlay').classList.remove('show');
   id('edit-popup').classList.remove('show');
   _editBlock = null;
-  _editProjectSnapshot = null;
-}
-
-function clearEditProjectPreview() {
-  ++_editProjectEpoch;
-  _editProjectSnapshot = null;
-  id('edit-project-result').innerHTML = '';
-  id('edit-project-apply').disabled = true;
-}
-
-async function previewEditProject() {
-  if (!_editBlock || _editProjectBusy) return;
-  const s = _editBlock;
-  const value = id('edit-project-target').value;
-  const project_id = value === 'unassigned' ? null : Number(value);
-  clearEditProjectPreview();
-  const epoch = _editProjectEpoch;
-  if (project_id === s.project_id) {
-    id('edit-project-result').textContent = t('project_same');
-    return;
-  }
-  try {
-    const result = await apiJSON('POST', '/api/projects/assign/preview', { scope: { interval_ids: [s.id] }, project_id });
-    if (_editBlock !== s || epoch !== _editProjectEpoch || id('edit-project-target').value !== value) return;
-    if (result.skipped.length) {
-      id('edit-project-result').textContent = t('project_skipped', { n: result.skipped.length });
-      return;
-    }
-    if (result.snapshot.intervals.length !== 1) {
-      id('edit-project-result').textContent = t('project_same');
-      return;
-    }
-    _editProjectSnapshot = result.snapshot;
-    id('edit-project-result').textContent = t('project_edit_preview', { from: projectName(s.project_id), to: projectName(project_id) });
-    id('edit-project-apply').disabled = false;
-  } catch (e) {
-    if (_editBlock !== s || epoch !== _editProjectEpoch) return;
-    id('edit-project-result').textContent = e.message;
-  }
-}
-
-async function applyEditProject() {
-  if (!_editBlock || !_editProjectSnapshot || _editProjectBusy) return;
-  const s = _editBlock;
-  const snapshot = _editProjectSnapshot;
-  clearEditProjectPreview();
-  _editProjectBusy = true;
-  const epoch = _editProjectEpoch;
-  try {
-    await apiJSON('PATCH', '/api/intervals/' + s.id, { seen: seenOf(s), start_ms: s.start_ms,
-      end_ms: s.end_ms, project_id: snapshot.project_id, snapshot });
-    if (_editBlock === s) closeEditTime();
-    showToast(t('project_applied', { n: 1 }));
-    loadDay(selectedDate, { chart: true });
-  } catch (e) {
-    if (_editBlock !== s || epoch !== _editProjectEpoch) return;
-    id('edit-project-result').textContent = e.status === 409 ? t('project_stale') : e.message;
-  } finally {
-    _editProjectBusy = false;
-  }
 }
 
 async function applyEditTime() {
-  if (_editBlock == null) return;
+  if (_editBlock == null || _editProjectBusy) return;
   const s = _editBlock;
   const startVal = parseClock(id('edit-start').value); // HH:MM or null
   const endVal   = parseClock(id('edit-end').value);   // HH:MM or null
@@ -188,14 +131,28 @@ async function applyEditTime() {
   }
   const start_ms = typedMs(startVal, s.start_ms);
   const end_ms = s.end_ms == null ? null : typedMs(endVal, s.end_ms);
+  const project_id = s.end_ms == null ? s.project_id : pickedProject(id('edit-project-target'));
   // The dialog stays open until the change is saved, so a refusal keeps what was typed.
+  _editProjectBusy = true;
   try {
-    await apiJSON('PATCH', '/api/intervals/' + s.id, { seen: seenOf(s), start_ms, end_ms });
+    const body = { seen: seenOf(s), start_ms, end_ms };
+    if (s.end_ms != null && project_id !== s.project_id) {
+      const preview = await apiJSON('POST', '/api/projects/assign/preview', { scope: { interval_ids: [s.id] }, project_id });
+      if (_editBlock !== s || pickedProject(id('edit-project-target')) !== project_id ||
+          parseClock(id('edit-start').value) !== startVal || parseClock(id('edit-end').value) !== endVal) return;
+      if (preview.snapshot.intervals.length !== 1) throw { status: 409 };
+      body.project_id = project_id;
+      body.snapshot = preview.snapshot;
+    }
+    if (_editBlock !== s) return;
+    await apiJSON('PATCH', '/api/intervals/' + s.id, body);
     if (_editBlock === s) closeEditTime();
-    showToast(t('times_updated'));
+    showToast(project_id !== s.project_id ? t('project_applied', { n: 1 }) : t('times_updated'));
     loadDay(selectedDate, { chart: true });
   } catch (e) {
-    showError(e.message);
+    if (_editBlock === s) showError(e.status === 409 ? t('project_stale') : e.message);
+  } finally {
+    _editProjectBusy = false;
   }
 }
 
