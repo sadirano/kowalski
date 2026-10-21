@@ -66,6 +66,8 @@ Settings > Captured text chooses whether to keep prompts and outcomes (the defau
 - The setting `capture_hold_sources` lists sources whose working run keeps
   the focus, such as a game being played: other runs' prompts meanwhile
   run in parallel. The holding run gives the focus up when it stops.
+- The setting `capture_origins` lists browser extension origins allowed to
+  post captures. Web pages never are.
 
 A run remembers its project key and re-resolves its mapping for each event.
 A changed effective project while working splits its interval at that

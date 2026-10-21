@@ -747,7 +747,7 @@ fn tourCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Resp
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     const start = std.mem.eql(u8, path, "/api/tour/start");
     if (!start and !std.mem.eql(u8, path, "/api/tour/finish")) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
     if (d.tour) |t| {
         t.destroy(d.io);
@@ -772,7 +772,7 @@ fn tourCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Resp
 fn providerCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     if (!std.mem.eql(u8, path, "/api/provider/approve")) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
     const Body = struct { sha256: []const u8, how: []const u8 };
     const body = std.json.parseFromSliceLeaky(Body, a, request.body, .{ .ignore_unknown_fields = true }) catch
@@ -852,7 +852,7 @@ fn sourceCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
     const checking = std.mem.eql(u8, path, "/api/provider/source/check");
     const installing = std.mem.eql(u8, path, "/api/provider/source/install");
     if (!base and !checking and !installing) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     return sourceCommandInner(d, a, request, base, checking, installing) catch |err|
         api.answer(a, switch (err) {
             error.SourceChanged, error.ReleaseChanged, error.CheckBusy, error.ManifestChangedWithoutSequence, error.IdentityChanged, error.StaleProposal => .conflict,
@@ -1025,7 +1025,7 @@ fn sourceCommandInner(d: *Daemon, a: std.mem.Allocator, request: api.Request, ba
 fn restartCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     if (!std.mem.eql(u8, path, "/api/restart")) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
     const command = launch.backgroundCommand(a, d.db_path, GetCurrentProcessId()) catch |err| {
         log("restart command failed: {s}", .{@errorName(err)});
@@ -1439,7 +1439,7 @@ fn serveRequest(d: *Daemon, req: *std.http.Server.Request, a: std.mem.Allocator)
 
     defer @memset(@constCast(request.body), 0);
     if (d.app.trial_nonce != null and request.method != .GET and !std.mem.eql(u8, request.target, "/api/update/commit")) {
-        if (api.refused(d.app.port, a, request)) |r| return respond(req, r.status, r.body);
+        if (api.refused(d.app.port, a, request, false)) |r| return respond(req, r.status, r.body);
         return respond(req, .service_unavailable, "{\"error\":\"updating\"}");
     }
     if (in_tour) {

@@ -48,6 +48,9 @@ const all = [_]Decl{
     // Sources whose working run keeps the focus against other runs' prompts,
     // such as a game the user plays: "src1,src2"; empty is none.
     .{ .key = "capture_hold_sources", .kind = .setting, .rule = .store },
+    // Origins allowed to post captures, such as a browser extension:
+    // "chrome-extension://<id>,..."; empty is none.
+    .{ .key = "capture_origins", .kind = .setting, .rule = .store },
     // Posting.
     .{ .key = "post_sessions", .kind = .setting, .rule = .flag },
     .{ .key = "post_daily_notes", .kind = .setting, .rule = .flag },

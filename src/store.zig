@@ -2889,6 +2889,24 @@ pub const Store = struct {
             if (val.len > 1000) return error.InvalidSetting;
             var it = std.mem.splitScalar(u8, val, ',');
             while (it.next()) |item| if (std.mem.trim(u8, item, " ").len > 200) return error.InvalidSetting;
+        } else if (std.mem.eql(u8, key, "capture_origins")) {
+            if (val.len > 1000) return error.InvalidSetting;
+            var it = std.mem.splitScalar(u8, val, ',');
+            while (it.next()) |raw| {
+                const item = std.mem.trim(u8, raw, " ");
+                if (item.len == 0) continue;
+                const prefix = if (std.mem.startsWith(u8, item, "chrome-extension://"))
+                    "chrome-extension://"
+                else if (std.mem.startsWith(u8, item, "moz-extension://"))
+                    "moz-extension://"
+                else
+                    return error.InvalidSetting;
+                const id = item[prefix.len..];
+                if (id.len == 0 or id.len > 64) return error.InvalidSetting;
+                for (id) |ch| {
+                    if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-')) return error.InvalidSetting;
+                }
+            }
         }
     }
 

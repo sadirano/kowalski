@@ -193,14 +193,14 @@ fn originAllowed(port: u16, origin: []const u8) bool {
 
 /// The host, header and origin rules every API request passes: the refusal,
 /// or null when the request may go on.
-pub fn refused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
+pub fn refused(port: u16, a: std.mem.Allocator, req: Request, extra_origin_ok: bool) ?Response {
     const host = req.host orelse return fail(a, .{ .status = .forbidden, .code = "host" });
     if (!hostAllowed(port, host)) return fail(a, .{ .status = .forbidden, .code = "host" });
     switch (req.method) {
         .GET => {},
         .POST, .PATCH, .DELETE => {
             if (!req.marker) return fail(a, .{ .status = .forbidden, .code = "header", .message = "changes need X-Kowalski: 1" });
-            if (req.origin) |origin| if (!originAllowed(port, origin)) return fail(a, .{ .status = .forbidden, .code = "origin" });
+            if (req.origin) |origin| if (!originAllowed(port, origin) and !extra_origin_ok) return fail(a, .{ .status = .forbidden, .code = "origin" });
         },
         else => return fail(a, .{ .status = .method_not_allowed, .code = "method" }),
     }
@@ -209,7 +209,7 @@ pub fn refused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
 
 /// Update checks are explicit user actions, so even GET requires the marker.
 pub fn updateRefused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
-    if (refused(port, a, req)) |r| return r;
+    if (refused(port, a, req, false)) |r| return r;
     if (!req.marker) return fail(a, .{ .status = .forbidden, .code = "header", .message = "update requests need X-Kowalski: 1" });
     return null;
 }
@@ -219,11 +219,27 @@ pub fn answer(a: std.mem.Allocator, status: std.http.Status, value: anytype) Res
     return send(a, status, value);
 }
 
+fn captureOriginAllowed(app: *App, origin: []const u8) !bool {
+    if (!std.mem.startsWith(u8, origin, "chrome-extension://") and
+        !std.mem.startsWith(u8, origin, "moz-extension://")) return false;
+    const list = try app.store.getSetting("capture_origins") orelse return false;
+    defer app.store.allocator.free(list);
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |item| {
+        if (std.mem.eql(u8, std.mem.trim(u8, item, " "), origin)) return true;
+    }
+    return false;
+}
+
 pub fn handle(app: *App, a: std.mem.Allocator, req: Request) Response {
-    if (refused(app.port, a, req)) |r| return r;
     const question = std.mem.indexOfScalar(u8, req.target, '?');
     const path = if (question) |at| req.target[0..at] else req.target;
     const params = if (question) |at| req.target[at + 1 ..] else "";
+    const extra_origin_ok = if (is(req, .POST, path, "/api/capture") and req.origin != null and !originAllowed(app.port, req.origin.?))
+        captureOriginAllowed(app, req.origin.?) catch false
+    else
+        false;
+    if (refused(app.port, a, req, extra_origin_ok)) |r| return r;
     if (is(req, .GET, path, "/api/update/ready")) {
         const nonce = app.trial_nonce orelse return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
         if (!app.trial_ready) return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
@@ -2343,6 +2359,43 @@ test "health reports the open database" {
     const health = try std.json.parseFromSliceLeaky(struct { ok: bool, db: []const u8 }, f.arena.allocator(), reply.body, .{});
     try std.testing.expect(health.ok);
     try std.testing.expectEqualStrings(f.app.db_path, health.db);
+}
+
+test "capture origins allow only listed extensions to post captures" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var req: Request = .{
+        .method = .POST,
+        .target = "/api/capture",
+        .host = "127.0.0.1:47100",
+        .origin = "chrome-extension://abc",
+        .marker = true,
+        .body = "{\"source\":\"browser\",\"run\":\"r1\",\"event\":\"e1\",\"kind\":\"prompt\",\"default_subject\":\"work\"}",
+    };
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_origins\":\"chrome-extension://abc\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, req).status);
+    req.host = "evil.test:47100";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.host = "127.0.0.1:47100";
+    req.target = "/api/pause";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.target = "/api/capture";
+    req.origin = "chrome-extension://abd";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.origin = "chrome-extension://ABC";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.origin = "chrome-extension://abc";
+    req.marker = false;
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"capture_origins\":\"https://evil.test\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_origins\":\"chrome-extension://abc, moz-extension://x-1\"}").status);
+    req.marker = true;
+    req.origin = "moz-extension://x-1";
+    try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, req).status);
 }
 
 test "switch creates, resolves and runs parallel work with targeted notes" {
