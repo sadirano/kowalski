@@ -29,6 +29,7 @@ let _sidebarDays   = 7;     // how many days the sidebar shows (work days when _
 let _refLinks      = false; // when true, refs link to the provider's page
 let _showAddEntry    = false; // gate: "Add entry" button (Feature 3/4)
 let _showKeys        = true;  // gate: the shortcuts button in the header
+let _showSummary     = true;  // gate: the Summary tab
 let _singleKeys      = true;  // gate: the one-key shortcuts (N, T, arrows...)
 let _summaryFormat   = 'grouped'; // summary layout format: 'chronological' | 'grouped'
 let _taskOrder       = 'time';    // day task order: 'time' | 'ref' | 'added'

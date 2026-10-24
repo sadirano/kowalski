@@ -152,9 +152,13 @@ function renderReader(rep, area) {
   const liveBadge = id => !live.has(id) ? '' : `<span class="open-badge${live.get(id) === 'parallel' ? ' par' : ''}">${t('live')}</span>`;
   mapRange(rep);
   area.innerHTML = `<div class="rd">
-    <nav class="rd-tabs" role="tablist">${tasks.map(e => `<button class="rd-tab" role="tab" data-t="${e.task.id}" aria-selected="${e.task.id === _readerTask}" onclick="readerPick(${e.task.id})"
-        onmouseenter="readerLight(${e.task.id})" onmouseleave="readerLight(null)" onfocus="readerLight(${e.task.id})" onblur="readerLight(null)">
-        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}${liveBadge(e.task.id)}</small></span><span class="rd-t">${durHtml(rep, e)}</span></button>`).join('')}</nav>
+    <nav class="rd-tabs" role="tablist">${tasks.map(e => `<div class="rd-row" role="presentation" onmouseenter="readerLight(${e.task.id})" onmouseleave="readerLight(null)">
+      <button class="rd-tab" role="tab" data-t="${e.task.id}" aria-selected="${e.task.id === _readerTask}" onclick="readerPick(${e.task.id})"
+        onfocus="readerLight(${e.task.id})" onblur="readerLight(null)">
+        <span class="rd-id">${esc(taskLabel(e.task))}</span><span class="rd-tt">${esc(e.task.title)}<small class="rd-project">${esc(projectName(e.task.project_id))}${liveBadge(e.task.id)}</small></span><span class="rd-t">${durHtml(rep, e)}</span></button>
+      ${e.task.id === _currentTaskId
+        ? `<span class="rd-focused" role="img" aria-label="${escAttr(t('rd_focused'))}" title="${escAttr(t('rd_focused'))}"></span>`
+        : `<button type="button" class="rd-switch" onclick="readerSwitch(event,${e.task.id})" onfocus="readerLight(${e.task.id})" onblur="readerLight(null)" title="${escAttr(t('rd_switch_to', { name: e.task.ref || e.task.title }))}" aria-label="${escAttr(t('rd_switch_to', { name: e.task.ref || e.task.title }))}">${icon('play')}</button>`}</div>`).join('')}</nav>
     <div class="rd-main" id="rd-main" onscroll="readerEndFit()">${readerMainHtml(rep)}<div class="rd-endwrap"><button class="rd-end" type="button" onclick="readerToEnd()">${icon('chev')}${esc(t('rd_to_end'))}</button></div></div>
     <div class="rd-work">
       <div class="resize-handle" onpointerdown="startRdResize(event)" ondblclick="resetRdWorkWidth()" title="${escAttr(t('rd_resize_hint'))}"></div>
@@ -173,7 +177,7 @@ function renderReader(rep, area) {
   markNoteSelection();
   if (pinned != null) markMoment(rep, pinned, false);
   requestAnimationFrame(() => {
-    const tab = area.querySelector('.rd-tab:hover');
+    const tab = area.querySelector('.rd-row:hover .rd-tab');
     readerLight(tab ? +tab.dataset.t : null);
     const strip = area.querySelector('.rd-strip:hover');
     if (strip && _readerPointer) readerHover(_readerPointer, strip);
@@ -403,6 +407,16 @@ function readerPick(taskId, t0 = null) {
   renderReport(D);
   if (t0 != null) markMoment(D, t0);
   else if (id('rd-main')) id('rd-main').scrollTop = 0; // a new task always opens at the top, so the page never jumps
+}
+
+async function readerSwitch(ev, taskId) {
+  ev.stopPropagation();
+  const btn = ev.currentTarget;
+  if (btn.disabled) return;
+  const task = D?.tasks.find(e => e.task.id === taskId)?.task;
+  if (!task) return;
+  btn.disabled = true;
+  if (!await switchToTask(task)) btn.disabled = false;
 }
 
 function stripTime(ev, el) {

@@ -36,6 +36,7 @@
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4"/></symbol>
   <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></symbol>
   <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20h16M7 17v-5M12 17V6M17 17V9"/></symbol>
+  <symbol id="i-timeline" viewBox="0 0 24 24"><path d="M7 3v18M7 5h6M7 12h10M7 19h8"/><circle cx="7" cy="5" r="1.5"/><circle cx="7" cy="12" r="1.5"/><circle cx="7" cy="19" r="1.5"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><path class="fill" d="M8 5.5v13l10.5-6.5z"/></symbol>
   <symbol id="i-pause" viewBox="0 0 24 24"><path class="fill" d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></symbol>
   <symbol id="i-more" viewBox="0 0 24 24"><path d="M5 12h.01M12 12h.01M19 12h.01" stroke-width="3"/></symbol>
@@ -68,9 +69,9 @@
     <button type="button" class="nav-btn icon-btn" onclick="stepDay(1)" title="Next day" aria-label="Next day" data-i18n-title="next_day" data-i18n-aria="next_day">⟩</button>
   </div>
   <div class="tabs" id="main-tabs">
-    <div class="tab" data-tab="report" onclick="setTab('report',this)" data-i18n="tab_report">Report</div>
-    <div class="tab" data-tab="timeline" onclick="setTab('timeline',this)" data-i18n="tab_timeline">Timeline</div>
-    <div class="tab" data-tab="summary" onclick="setTab('summary',this)" data-i18n="tab_summary">Summary</div>
+    <div class="tab" data-tab="report" onclick="setTab('report',this)"><svg class="ico" aria-hidden="true"><use href="#i-chart"/></svg><span data-i18n="tab_report">Report</span></div>
+    <div class="tab" data-tab="timeline" onclick="setTab('timeline',this)"><svg class="ico" aria-hidden="true"><use href="#i-timeline"/></svg><span data-i18n="tab_timeline">Timeline</span></div>
+    <div class="tab" data-tab="summary" onclick="setTab('summary',this)"><svg class="ico" aria-hidden="true"><use href="#i-note"/></svg><span data-i18n="tab_summary">Summary</span></div>
   </div>
   <div class="search-box">
     <input type="text" id="task-search" class="search-input" autocomplete="off" spellcheck="false"
@@ -219,6 +220,8 @@
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-links"></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="set_header_btns">Header buttons</span></div>
         <div class="set-ctl"><label class="set-sw"><input type="checkbox" class="sw" id="set-show-add-entry"><span data-i18n="btn_add_entry">Add entry</span></label><label class="set-sw"><input type="checkbox" class="sw" id="set-show-keys"><span data-i18n="btn_shortcuts">Shortcuts</span></label></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-show-summary"><span data-i18n="set_show_summary">Summary tab</span><small data-i18n="set_show_summary_hint">Timeline covers the same day; hide Summary if you do not use it.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-show-summary"></div></div>
       <div class="set-row"><label class="set-lbl" for="set-single-keys"><span data-i18n="set_single_keys">Single-key shortcuts</span><small data-i18n="set_single_keys_hint">N, T, G, C, A, 1, 2, [, ?, / and the arrows.</small></label>
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-single-keys"></div></div>
     </section>

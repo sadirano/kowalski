@@ -7,6 +7,8 @@ function applyPrefs() {
   _refLinks = pref('ui_links', '0') === '1';
   _showAddEntry = pref('ui_show_add_entry', '0') === '1';
   _showKeys = pref('ui_show_keys', '1') === '1';
+  _showSummary = pref('ui_show_summary', '1') === '1';
+  document.querySelector('#main-tabs [data-tab="summary"]').style.display = _showSummary ? '' : 'none';
   _singleKeys = pref('ui_single_keys', '1') === '1';
   _summaryFormat = pref('ui_summary_format', 'grouped');
   _taskOrder = pref('ui_task_order', 'time');
@@ -106,6 +108,7 @@ async function showSettings() {
     id('set-links').checked = pref('ui_links', '0') === '1';
     id('set-show-add-entry').checked = pref('ui_show_add_entry', '0') === '1';
     id('set-show-keys').checked = pref('ui_show_keys', '1') === '1';
+    id('set-show-summary').checked = pref('ui_show_summary', '1') === '1';
     id('set-single-keys').checked = pref('ui_single_keys', '1') === '1';
     id('set-open-launch').checked = pref('open_on_launch', '1') === '1';
     id('set-post-notes').checked = pref('post_daily_notes', '0') === '1';
@@ -850,6 +853,7 @@ async function applySettings() {
     ui_links: id('set-links').checked ? '1' : '0',
     ui_show_add_entry: id('set-show-add-entry').checked ? '1' : '0',
     ui_show_keys: id('set-show-keys').checked ? '1' : '0',
+    ui_show_summary: id('set-show-summary').checked ? '1' : '0',
     ui_single_keys: id('set-single-keys').checked ? '1' : '0',
     open_on_launch: id('set-open-launch').checked ? '1' : '0',
     post_daily_notes: id('set-post-notes').checked ? '1' : '0',
@@ -872,6 +876,10 @@ async function applySettings() {
     settings = Object.fromEntries(data.settings.map(({ key, value }) => [key, value]));
     saveLS('settingsCache', settings);
     applyPrefs();
+    if (!_showSummary && activeTab === 'summary') {
+      applyActiveTab(activeTab);
+      saveLS('activeTab', activeTab);
+    }
     hideSettings();
     showToast(t('settings_saved'));
     applyFeatureToggles();

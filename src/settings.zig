@@ -66,6 +66,7 @@ const all = [_]Decl{
     .{ .key = "ui_links", .kind = .preference, .rule = .flag },
     .{ .key = "ui_single_keys", .kind = .preference, .rule = .flag },
     .{ .key = "ui_show_keys", .kind = .preference, .rule = .flag },
+    .{ .key = "ui_show_summary", .kind = .preference, .rule = .flag },
     .{ .key = "ui_show_add_entry", .kind = .preference, .rule = .flag },
     // Sidebar.
     .{ .key = "ui_day_order", .kind = .preference, .rule = .{ .choice = &.{ "oldest", "newest" } } },

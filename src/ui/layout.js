@@ -152,7 +152,8 @@ function onLayoutResize() {
 }
 
 function applyActiveTab(tab) {
-  activeTab = ['report', 'timeline', 'summary'].includes(tab) ? tab : 'report';
+  activeTab = tab === 'summary' && !_showSummary ? 'timeline'
+    : ['report', 'timeline', 'summary'].includes(tab) ? tab : 'report';
   document.querySelectorAll('#main-tabs .tab').forEach(t =>
     t.classList.toggle('active', t.dataset.tab === activeTab));
   updateChartToggleBtn();

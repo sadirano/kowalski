@@ -15,8 +15,10 @@ async function switchToTask(task, projectId) {
     await loadCurrent();
     loadSchedule();
     loadDay(selectedDate, { chart: true });
+    return true;
   } catch (e) {
     showError(e.message);
+    return false;
   }
 }
 
