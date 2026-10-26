@@ -42,7 +42,7 @@ pub const usage =
     \\  unstar n<id>...             clear notes' starred marks
     \\  capture <kind> --source <s> --run <r> [--event <id>] [--subject <task>]
     \\          [--default <task>] [--project-key <key>] [--project-hint <hint>]
-    \\          [--first-prompt <text>] [--unattended]
+    \\          [--first-prompt <text>] [--unattended] [--focus]
     \\                               record an outside run (start|subject|prompt|busy|stop|end)
     \\  tasks [<filter>] [--project-key <key>]  tasks by recent use
     \\  new [--project-key <key> [--project-hint <h>]] <title>  create a task without opening it
@@ -728,8 +728,9 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
     if (eql(u8, command, "capture")) {
         var rest: std.ArrayList([]const u8) = .empty;
         var attended = true;
+        var focus = false;
         for (args) |arg| {
-            if (eql(u8, arg, "--unattended")) attended = false else try rest.append(ctx.a, arg);
+            if (eql(u8, arg, "--unattended")) attended = false else if (eql(u8, arg, "--focus")) focus = true else try rest.append(ctx.a, arg);
         }
         const o = try options(ctx, rest.items, &.{ "--source", "--run", "--event", "--subject", "--default", "--project-key", "--project-hint", "--first-prompt" });
         if (o.words.len != 1 or o.values[0] == null or o.values[1] == null) return error.Usage;
@@ -744,6 +745,7 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
             .project_hint = o.values[6],
             .first_prompt = o.values[7],
             .attended = attended,
+            .focus = focus,
         }));
         if (!try settle(ctx, reply)) return .failed;
         return .ok;

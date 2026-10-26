@@ -135,6 +135,10 @@ pub const Capture = struct {
     default_task: ?i64 = null,
     /// False for a run nobody watches; holding sources still take focus.
     attended: bool = true,
+    /// The user chose this task: an attended `prompt` or `subject` switches
+    /// the focus to the run's task as `switchTo` does, unless a holding
+    /// source keeps it.
+    focus: bool = false,
     /// A note for the run's open interval: the prompt's text on `prompt`,
     /// what came of the turn on `stop`. Written once per event id.
     note: ?[]const u8 = null,
@@ -144,7 +148,8 @@ pub const Capture = struct {
     project_hint: ?[]const u8 = null,
     first_prompt: ?[]const u8 = null,
 };
-pub const CaptureResult = struct { applied: bool, project_id: ?i64, task_id: ?i64, created_ref: ?[]const u8 = null };
+/// `focus_taken` answers a `focus` request: whether the run's task holds the focus.
+pub const CaptureResult = struct { applied: bool, project_id: ?i64, task_id: ?i64, created_ref: ?[]const u8 = null, focus_taken: ?bool = null };
 pub const HistoryNote = struct { event: []const u8, at_ms: i64, text: []const u8 };
 pub const HistoryInterval = struct {
     event: []const u8,
@@ -1013,6 +1018,13 @@ pub const Store = struct {
     pub fn switchToProject(s: *Store, task: i64, text: ?[]const u8, choice: ProjectChoice, now_ms: i64) Error!i64 {
         var tx = try s.begin(now_ms, false);
         defer tx.deinit();
+        const id = try s.switchOpen(task, text, choice, now_ms);
+        try tx.commit();
+        return id;
+    }
+
+    /// Caller owns the transaction.
+    fn switchOpen(s: *Store, task: i64, text: ?[]const u8, choice: ProjectChoice, now_ms: i64) !i64 {
         const project = try s.chosenProject(task, choice);
         var split_span: ?i64 = null;
         var split_id: ?i64 = null;
@@ -1022,10 +1034,7 @@ pub const Store = struct {
             if (try focus.step() == .row and focus.columnI64(1) == task) {
                 const id = focus.columnI64(0);
                 const current_project: ?i64 = if (focus.columnIsNull(2)) null else focus.columnI64(2);
-                if (choice == .omitted or current_project == project) {
-                    try tx.commit();
-                    return id;
-                }
+                if (choice == .omitted or current_project == project) return id;
                 split_span = if (focus.columnIsNull(3)) id else focus.columnI64(3);
                 split_id = id;
             }
@@ -1056,7 +1065,6 @@ pub const Store = struct {
         }
         try s.db.exec("DELETE FROM saved_set");
         try s.heartbeat(at);
-        try tx.commit();
         return id;
     }
 
@@ -1194,6 +1202,31 @@ pub const Store = struct {
         const project = try s.resolveCaptureProject(c.source, key, c.project_hint, target_task);
         try s.setRunProject(c, project);
         const holding = try s.isHoldingSource(c.source);
+        const wants_focus = c.focus and c.attended and (c.kind == .prompt or c.kind == .subject);
+        if (wants_focus and !holding) if (target_task) |task| if (!try s.focusHeld(c, task)) {
+            // Stated intent needs no sustained prompts: switch as by hand, so
+            // the focus stays when the run stops or its lease runs out.
+            var previous: ?i64 = null;
+            var previous_project: ?i64 = null;
+            {
+                var stmt = try s.db.prepare("SELECT task_id,project_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+                defer stmt.finalize();
+                if (try stmt.step() == .row) {
+                    previous = stmt.columnI64(0);
+                    previous_project = if (stmt.columnIsNull(1)) null else stmt.columnI64(1);
+                }
+            }
+            _ = try s.switchOpen(task, null, if (project) |p| .{ .selected = p } else .omitted, at);
+            run.role = .focus;
+            // A run still mid-turn on the old focus carries on in parallel.
+            if (previous) |p| if (p != task and try s.otherRunWorking(c, p)) {
+                try s.continueOrOpen(p, .parallel, previous_project, at);
+                var stmt = try s.db.prepare("UPDATE capture_runs SET role='parallel' WHERE (working=1 OR idle_since_ms IS NOT NULL) AND task_id=?1");
+                defer stmt.finalize();
+                try stmt.bindI64(1, p);
+                _ = try stmt.step();
+            };
+        };
         switch (c.kind) {
             .start => if (holding and run.task != null) {
                 try s.setRun(c, run.task, true, .focus, at + capture_lease_ms);
@@ -1251,8 +1284,14 @@ pub const Store = struct {
         if (!time_only) if (c.note) |text| if (c.kind != .start and c.kind != .end) try s.captureNote(c, at, text);
         try s.heartbeat(at);
         const final = try s.captureRun(c.source, c.run);
+        const focus_taken: ?bool = if (!c.focus) null else if (final.task) |task| blk: {
+            var stmt = try s.db.prepare("SELECT 1 FROM intervals WHERE task_id=?1 AND end_ms IS NULL AND role='focus'");
+            defer stmt.finalize();
+            try stmt.bindI64(1, task);
+            break :blk try stmt.step() == .row;
+        } else false;
         try tx.commit();
-        return .{ .applied = true, .project_id = final.project, .task_id = final.task, .created_ref = created_ref };
+        return .{ .applied = true, .project_id = final.project, .task_id = final.task, .created_ref = created_ref, .focus_taken = focus_taken };
     }
 
     /// Called by the history subject resolver while the batch transaction is open.

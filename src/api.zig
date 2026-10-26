@@ -84,7 +84,8 @@ const SessionChain = struct {
 pub const Followup = union(enum) {
     fields,
     /// Without a task, only looks the ref up.
-    lookup: struct { task: ?i64, ref: []const u8, capture: ?store_mod.CaptureResult = null },
+    /// `capture` or `switched` is the reply already decided; the lookup only binds.
+    lookup: struct { task: ?i64, ref: []const u8, capture: ?store_mod.CaptureResult = null, switched: ?i64 = null },
     quote: struct {
         day: []const u8,
         task: i64,
@@ -154,6 +155,7 @@ fn send(a: std.mem.Allocator, status: std.http.Status, value: anytype) Response 
 }
 
 fn captureReply(a: std.mem.Allocator, result: store_mod.CaptureResult) Response {
+    if (result.focus_taken) |taken| return send(a, .ok, .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id, .focus_taken = taken });
     return send(a, .ok, .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id });
 }
 
@@ -375,6 +377,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             project_hint: ?[]const u8 = null,
             first_prompt: ?[]const u8 = null,
             attended: bool = true,
+            focus: bool = false,
             note: ?[]const u8 = null,
         };
         // Fields a newer source sends are skipped, so an updated hook never breaks an older daemon.
@@ -392,12 +395,12 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         if (body.project_key) |key| if (key.len == 0 or key.len > 2048) return badRequest(a, "project_key");
         if (body.project_hint) |hint| if (hint.len > 200) return badRequest(a, "project_hint");
         if (body.first_prompt) |seed| if (seed.len > 2000) return badRequest(a, "first_prompt");
-        const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .note = if (body.note) |n| try noteText(a, n) else null,
+        const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .focus = body.focus, .note = if (body.note) |n| try noteText(a, n) else null,
             .subject = body.subject, .default_subject = body.default_subject, .project_key = body.project_key, .project_hint = body.project_hint, .first_prompt = body.first_prompt };
         const result = try app.store.captureDetailed(c, app.clock());
         if (app.provider != null) if (result.created_ref) |ref| return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{
             .task = result.task_id.?, .ref = try a.dupe(u8, ref),
-            .capture = .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id },
+            .capture = .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id, .focus_taken = result.focus_taken },
         } } };
         return captureReply(a, result);
     }
@@ -430,6 +433,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         const choice = try keyChoice(app, a, req.body);
         const scope = try choiceScope(app, choice);
         var created = false;
+        var created_ref: ?[]const u8 = null;
         const id = switch (try query.resolve(app.store, a, body.task, scope)) {
             .found => |id| id,
             .ambiguous => |list| return ambiguous(a, list),
@@ -437,6 +441,8 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
                 const title = std.mem.trim(u8, body.task, " \t");
                 if (title.len > 0 and title[0] == '#') return error.UnknownTask;
                 created = true;
+                // A new all-digit task is the provider's ref, as for capture.
+                if (numericRef(title)) created_ref = title;
                 break :blk try app.store.createTaskWithProject(title, if (choice == .omitted and scope == null) .omitted else .{ .selected = scope }, app.clock());
             },
         };
@@ -448,7 +454,10 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             try app.store.switchToProject(id, text, choice, app.clock())
         else
             try app.store.openParallelProject(id, text, choice, app.clock());
-        return send(a, .ok, .{ .interval = interval, .task = (try query.task(app.store, a, id)).?, .created = created });
+        if (app.provider != null) if (created_ref) |ref| return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{
+            .task = id, .ref = try a.dupe(u8, ref), .switched = interval,
+        } } };
+        return switchReply(app, a, interval, id, created);
     }
     if (is(req, .POST, path, "/api/stop")) {
         const body = try parseBody(struct { task: []const u8 }, a, req.body) orelse return badRequest(a, "body");
@@ -1915,7 +1924,16 @@ fn acceptedOutput(a: std.mem.Allocator, out: []const u8) !Accepted {
     return accepted;
 }
 
-fn bindCapturedLookup(app: *App, a: std.mem.Allocator, task: i64, ref: []const u8, outcome: worker.Outcome) void {
+fn switchReply(app: *App, a: std.mem.Allocator, interval: i64, task: i64, created: bool) !Response {
+    return send(a, .ok, .{ .interval = interval, .task = (try query.task(app.store, a, task)).?, .created = created });
+}
+
+fn numericRef(text: []const u8) bool {
+    for (text) |ch| if (ch < '0' or ch > '9') return false;
+    return text.len > 0;
+}
+
+fn bindLookup(app: *App, a: std.mem.Allocator, task: i64, ref: []const u8, outcome: worker.Outcome) void {
     const instance = app.provider orelse return;
     if (succeeded(outcome)) {
         const Found = struct { title: ?[]const u8 = null, fields: std.json.ArrayHashMap([]const u8) = .{} };
@@ -1930,7 +1948,7 @@ fn bindCapturedLookup(app: *App, a: std.mem.Allocator, task: i64, ref: []const u
             return;
         } else |_| {}
     }
-    // Capture has committed. Keep its reply even when lookup or binding fails.
+    // Capture or the switch has committed. Keep its reply even when lookup or binding fails.
     app.store.bind(task, instance, ref, app.clock()) catch {};
 }
 
@@ -1954,8 +1972,12 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
         },
         .lookup => |l| {
             if (l.capture) |result| {
-                if (l.task) |task| bindCapturedLookup(app, a, task, l.ref, outcome);
+                if (l.task) |task| bindLookup(app, a, task, l.ref, outcome);
                 return captureReply(a, result);
+            }
+            if (l.switched) |interval| {
+                bindLookup(app, a, l.task.?, l.ref, outcome);
+                return switchReply(app, a, interval, l.task.?, true);
             }
             if (!succeeded(outcome)) {
                 const task = l.task orelse return providerFailure(a, outcome, null);
@@ -4413,6 +4435,103 @@ test "numeric captured subjects bind once and keep the capture reply" {
     const failed_result = try std.json.parseFromSliceLeaky(Result, a, failed.body, .{});
     try std.testing.expectEqual(@as(?i64, 4), failed_result.task_id);
     try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=4 AND title='404' AND external_ref='404'"));
+}
+
+test "a capture focus request switches as by hand unless held" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Current\"}").status);
+    test_now += 60_000;
+    // Without focus, a prompt for another task starts in parallel and says nothing of the focus.
+    const plain = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t1\",\"event\":\"e1\",\"kind\":\"prompt\",\"subject\":\"Other\"}");
+    try std.testing.expectEqual(std.http.Status.ok, plain.status);
+    try std.testing.expect(!contains(plain.body, "focus_taken"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Other' AND i.end_ms IS NULL AND i.role='parallel'"));
+    test_now += 60_000;
+    const taken = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t1\",\"event\":\"e2\",\"kind\":\"prompt\",\"subject\":\"Other\",\"focus\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, taken.status);
+    try std.testing.expect(contains(taken.body, "\"focus_taken\":true"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Other' AND i.end_ms IS NULL AND i.role='focus' AND i.captured=0"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Current' AND i.end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    // The focus is the user's now: the run's lease running out leaves it open.
+    try f.advance(30 * 60_000);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t2\",\"event\":\"e3\",\"kind\":\"start\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Other' AND i.end_ms IS NULL AND i.role='focus'"));
+    // A subject event takes the focus too, opening a task no run works on.
+    test_now += 60_000;
+    const subject = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t2\",\"event\":\"e4\",\"kind\":\"subject\",\"subject\":\"Third\",\"focus\":true}");
+    try std.testing.expect(contains(subject.body, "\"focus_taken\":true"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Third' AND i.end_ms IS NULL AND i.role='focus'"));
+    // Unattended runs and other kinds never take it.
+    test_now += 60_000;
+    const unattended = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t3\",\"event\":\"e5\",\"kind\":\"prompt\",\"subject\":\"Other\",\"attended\":false,\"focus\":true}");
+    try std.testing.expect(contains(unattended.body, "\"focus_taken\":false"));
+    test_now += 60_000;
+    const busy = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t4\",\"event\":\"e6\",\"kind\":\"busy\",\"subject\":\"Fourth\",\"focus\":true}");
+    try std.testing.expect(contains(busy.body, "\"focus_taken\":false"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Third' AND i.end_ms IS NULL AND i.role='focus'"));
+    // A working holding source keeps the focus.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_hold_sources\":\"game\"}").status);
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"game\",\"run\":\"g\",\"event\":\"g1\",\"kind\":\"prompt\",\"subject\":\"Game\"}").status);
+    test_now += 60_000;
+    const held = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t5\",\"event\":\"e7\",\"kind\":\"prompt\",\"subject\":\"Third\",\"focus\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, held.status);
+    try std.testing.expect(contains(held.body, "\"applied\":true"));
+    try std.testing.expect(contains(held.body, "\"focus_taken\":false"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Game' AND i.end_ms IS NULL AND i.role='focus'"));
+}
+
+test "a capture focus request keeps a run mid-turn on the old focus in parallel" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"Agent work\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND role='focus'"));
+    test_now += 60_000;
+    const taken = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t\",\"event\":\"t1\",\"kind\":\"prompt\",\"subject\":\"Picked\",\"focus\":true}");
+    try std.testing.expect(contains(taken.body, "\"focus_taken\":true"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND role='parallel'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM capture_runs WHERE run='a' AND role='parallel'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Picked' AND i.end_ms IS NULL AND i.role='focus'"));
+}
+
+test "switch and parallel bind a new numeric task to the provider ref" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    test_now = 1_773_129_600_000;
+    const before = worker.Fake.lookup_calls.load(.acquire);
+    const switched = f.call(.POST, "/api/switch", "{\"task\":\"312\"}");
+    try std.testing.expectEqual(std.http.Status.ok, switched.status);
+    try std.testing.expect(contains(switched.body, "\"created\":true"));
+    try std.testing.expect(contains(switched.body, "Remote title"));
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=1 AND title='Remote title' AND external_ref='312'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND role='focus'"));
+    // The bound task is found again by its ref.
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Other\"}").status);
+    test_now += 60_000;
+    const again = f.call(.POST, "/api/switch", "{\"task\":\"312\"}");
+    try std.testing.expect(contains(again.body, "\"created\":false"));
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    // A failed lookup keeps the bind.
+    test_now += 60_000;
+    const parallel = f.call(.POST, "/api/parallel", "{\"task\":\"404\"}");
+    try std.testing.expectEqual(std.http.Status.ok, parallel.status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE title='404' AND external_ref='404'"));
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+    // Without a provider a numeric task stays a plain one.
+    f.app.provider = null;
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"777\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE external_ref='777'"));
 }
 
 test "capture keeps its reply and time when follow-up binding conflicts" {
