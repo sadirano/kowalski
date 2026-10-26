@@ -23,6 +23,14 @@ Settings > Captured text chooses whether to keep prompts and outcomes (the defau
   (trimmed to about 60 characters); `subject`/`track` can name another task
   later. Legacy `default_subject` remains accepted for older sources.
 - `attended: false` marks a run nobody watches; it never takes the focus.
+- `focus: true` on an attended `prompt` or `subject` says the user chose
+  this task, for example by answering a prompt in a browser extension:
+  the run's task takes the focus now, as `kowalski switch` would, instead
+  of waiting for the 10-minute rule. The focus is then the user's, so it
+  stays when the run stops or goes quiet. It is ignored on other kinds and
+  on unattended runs. A request with `focus` gets `focus_taken` in its
+  reply: whether the run's task holds the focus afterwards (false while a
+  holding source keeps it).
 - `note` (on `prompt`, `busy` or `stop`, up to 2000 characters) records a
   line on the run's interval: what was asked, a report along the way, or
   what came of the turn.
@@ -58,7 +66,8 @@ Settings > Captured text chooses whether to keep prompts and outcomes (the defau
 - A working run that sends nothing for 20 minutes is taken as gone: its
   task closes where that lease ran out, marked `recovered`.
 - Switching tasks in kowalski takes the focus immediately. Capture prompts
-  for another task begin in parallel and follow the 10-minute rule above.
+  for another task begin in parallel and follow the 10-minute rule above,
+  unless they carry `focus: true`.
   Capture never closes or carries on an interval you opened by hand.
 - When another task takes the focus while a run sits in its grace, that
   task's focus ends where the run's turn ended: the grace counts only when

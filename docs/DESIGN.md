@@ -11,8 +11,9 @@ The data model and behavior of kowalski. Contributor rules are in
   external ref)`, both opaque strings. The provider describes its extra
   fields (label, type, order) and kowalski displays them; it never knows
   what they mean.
-  Binding takes the provider's title; a numeric captured subject with no
-  matching task is bound to that ref when a provider is configured.
+  Binding takes the provider's title; a numeric captured subject, or a
+  numeric `switch` or `parallel` text, with no matching task is bound to
+  that ref when a provider is configured.
 - Binding a task to a different ref drops the old ref's fields, and waits
   while any of the task's postings is `sending` or `unknown`.
 - A task without a provider is a complete local task.

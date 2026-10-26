@@ -360,7 +360,9 @@ kowalski day 2026-10-07
 kowalski post 2026-10-07 48213
 ```
 
-A task is `#<id>`, an external ref, or a title.
+A task is `#<id>`, an external ref, or a title. With a provider configured,
+a new all-digit task is bound to that ref and gets the provider's title; use
+`#<id>` or a non-numeric title for a plain local task.
 Use `kowalski postings [<YYYY-MM-DD>] --accept` to keep a changed day posted without posting again.
 
 ### Starred notes
