@@ -240,13 +240,17 @@ function renderReport(rep) {
         const nextIsOpen   = next.end_ms == null;
         const withinWindow = gapMs >= 0 && gapMs <= 60000;
         if (nextIsOpen || withinWindow) {
-          const bigGap  = gapMs > 600000;
-          const label = `${t('merge_next')} (gap ${gapStr})`;
-          mergeBtn = `<div class="merge-row">
-            <button class="merge-btn${bigGap?' warn':''}" onclick="mergeBlocks(${bi},${bi + 1},${gapMs})" title="${escAttr(label)}">
-              ${esc(label)}
-            </button>
-          </div>`;
+          if (s.project_id != null && next.project_id != null && s.project_id !== next.project_id) {
+            mergeBtn = `<div class="merge-row"><span class="merge-note">${esc(t('merge_diff_project'))}</span></div>`;
+          } else {
+            const bigGap  = gapMs > 600000;
+            const label = `${t('merge_next')} (gap ${gapStr})`;
+            mergeBtn = `<div class="merge-row">
+              <button class="merge-btn${bigGap?' warn':''}" onclick="mergeBlocks(${bi},${bi + 1},${gapMs})" title="${escAttr(label)}">
+                ${esc(label)}
+              </button>
+            </div>`;
+          }
         }
       }
 

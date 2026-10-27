@@ -1560,6 +1560,24 @@ pub const Store = struct {
         return if (try stmt.step() == .row) stmt.columnI64(0) else null;
     }
 
+    fn projectsConflict(a: ?i64, b: ?i64) bool {
+        return a != null and b != null and a.? != b.?;
+    }
+
+    fn reconcileOpenProject(s: *Store, id: i64, task: i64, role: Role, old_project: ?i64, project: ?i64, captured: bool, at: i64) !void {
+        if (projectsConflict(old_project, project)) {
+            if (captured) try s.splitCapturedProject(id, task, role, project, at);
+        } else if (old_project == null) {
+            if (project) |known| {
+                var stmt = try s.db.prepare("UPDATE intervals SET project_id=?1 WHERE id=?2");
+                defer stmt.finalize();
+                try stmt.bindI64(1, known);
+                try stmt.bindI64(2, id);
+                _ = try stmt.step();
+            }
+        }
+    }
+
     /// Opens the task in this role. Taking the focus moves the task that
     /// had it to parallel when another run still works on it.
     fn engage(s: *Store, c: Capture, task: ?i64, role: Role, project: ?i64, at: i64) !Role {
@@ -1582,8 +1600,7 @@ pub const Store = struct {
         }
         if (holding and open_role == .parallel) {
             try s.promoteFocusInterval(open_id.?, at);
-            if (open_captured and open_project != project)
-                try s.splitCapturedProject(open_id.?, t, .focus, project, at);
+            try s.reconcileOpenProject(open_id.?, t, .focus, open_project, project, open_captured, at);
             return .focus;
         }
         var focus_task: ?i64 = null;
@@ -1609,15 +1626,14 @@ pub const Store = struct {
         const held = if (holding) false else try s.focusHeld(c, t);
         if (!holding and (role == .parallel or held or (focus_task != null and focus_task.? != t))) {
             if (open_role == null) try s.continueOrOpen(t, .parallel, project, at)
-            else if (open_role == .parallel and open_captured and open_project != project)
-                try s.splitCapturedProject(open_id.?, t, .parallel, project, at);
+            else if (open_role == .parallel)
+                try s.reconcileOpenProject(open_id.?, t, .parallel, open_project, project, open_captured, at);
             if (role == .focus and !held and focus_task != null and focus_task.? != t)
                 if (try s.sustainFocus(t, focus_task.?, focus_start, at)) return .focus;
             return .parallel;
         }
         if (open_role == .focus) {
-            if (open_captured and open_project != project)
-                try s.splitCapturedProject(open_id.?, t, .focus, project, at);
+            try s.reconcileOpenProject(open_id.?, t, .focus, open_project, project, open_captured, at);
             return .focus;
         }
         var previous: ?i64 = null;
@@ -1816,7 +1832,7 @@ pub const Store = struct {
         try stmt.bindI64(4, at);
         try stmt.bindText(5, @tagName(role));
         if (try stmt.step() == .row) return s.openCaptured(task, role, desired_project, at);
-        if (old_project != desired_project) {
+        if (projectsConflict(old_project, desired_project)) {
             var extend = try s.db.prepare("UPDATE intervals SET end_ms=?1,posting_span_id=?2 WHERE id=?3");
             defer extend.finalize();
             try extend.bindI64(1, at);
@@ -1831,9 +1847,10 @@ pub const Store = struct {
             _ = try mark.step();
             return;
         }
-        var reopen = try s.db.prepare("UPDATE intervals SET end_ms=NULL,closed_by=NULL WHERE id=?1");
+        var reopen = try s.db.prepare("UPDATE intervals SET end_ms=NULL,closed_by=NULL,project_id=coalesce(project_id,?2) WHERE id=?1");
         defer reopen.finalize();
         try reopen.bindI64(1, id);
+        if (desired_project) |known| try reopen.bindI64(2, known) else try reopen.bindNull(2);
         _ = try reopen.step();
     }
 
@@ -2356,7 +2373,7 @@ pub const Store = struct {
         defer s.freeRow(b);
         try checkSeen(a, first_seen);
         try checkSeen(b, second_seen);
-        if (first == second or a.task != b.task or a.role != b.role or a.project != b.project) return error.NotMergeable;
+        if (first == second or a.task != b.task or a.role != b.role or projectsConflict(a.project, b.project)) return error.NotMergeable;
         const a_end = a.end_ms orelse return error.NotMergeable;
         if (a_end > b.start_ms) return error.NotMergeable;
         try s.checkFree(&.{ first, second }, a.task, a.role, a_end, b.start_ms);
@@ -2382,11 +2399,12 @@ pub const Store = struct {
             try del.bindI64(1, second);
             _ = try del.step();
         }
-        var stmt = try s.db.prepare("UPDATE intervals SET end_ms=?1,closed_by=?2 WHERE id=?3");
+        var stmt = try s.db.prepare("UPDATE intervals SET end_ms=?1,closed_by=?2,project_id=coalesce(project_id,?4) WHERE id=?3");
         defer stmt.finalize();
         if (b.end_ms) |e| try stmt.bindI64(1, e) else try stmt.bindNull(1);
         try stmt.bindOptionalText(2, b.closed_by);
         try stmt.bindI64(3, first);
+        if (b.project) |known| try stmt.bindI64(4, known) else try stmt.bindNull(4);
         _ = try stmt.step();
         try s.markEdited(a.start_ms, b.end_ms orelse now_ms, now_ms);
         try tx.commit();
@@ -4785,6 +4803,68 @@ test "holding source promotes its open parallel interval" {
     try std.testing.expectEqual(id, try testScalar(&db, "SELECT id FROM intervals WHERE task_id=2 AND end_ms IS NULL AND role='focus'"));
     try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE task_id=2 AND role='parallel'"));
     try std.testing.expectEqual(background, try testScalar(&db, "SELECT task_id FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+}
+
+test "capture fills an unknown project without splitting the focus interval" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("task", 0);
+    var run: Capture = .{ .source = "agent", .run = "a", .kind = .prompt, .default_task = task };
+    _ = try s.capture(run, 1_000);
+    const id = try testScalar(&db, "SELECT id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals WHERE project_id IS NULL"));
+    run.kind = .busy;
+    run.project_key = "P";
+    run.project_hint = "P";
+    _ = try s.capture(run, 2_000);
+    const p = try testScalar(&db, "SELECT id FROM projects WHERE label='P'");
+    try std.testing.expectEqual(id, try testScalar(&db, "SELECT id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(p, try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL"));
+    const unknown_run: Capture = .{ .source = "agent", .run = "b", .kind = .prompt, .default_task = task };
+    _ = try s.capture(unknown_run, 3_000);
+    try std.testing.expectEqual(p, try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try testScalar(&db, "SELECT count(*) FROM intervals WHERE end_ms IS NOT NULL"));
+}
+
+test "grace continuation fills an unknown project on the old interval" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("task", 0);
+    var first: Capture = .{ .source = "agent", .run = "a", .kind = .prompt, .default_task = task };
+    _ = try s.capture(first, 1_000);
+    const id = try testScalar(&db, "SELECT id FROM intervals WHERE end_ms IS NULL");
+    first.kind = .end;
+    _ = try s.capture(first, 2_000);
+    try std.testing.expectEqual(id, try testScalar(&db, "SELECT id FROM intervals WHERE end_ms=2000 AND project_id IS NULL"));
+    const next: Capture = .{ .source = "agent", .run = "b", .kind = .prompt, .default_task = task, .project_key = "P", .project_hint = "P" };
+    _ = try s.capture(next, 3_000);
+    const p = try testScalar(&db, "SELECT id FROM projects WHERE label='P'");
+    try std.testing.expectEqual(id, try testScalar(&db, "SELECT id FROM intervals WHERE end_ms IS NULL AND role='focus'"));
+    try std.testing.expectEqual(p, try testScalar(&db, "SELECT project_id FROM intervals WHERE end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals"));
+}
+
+test "merge adopts a known project and rejects different known projects" {
+    var db: sqlite.Db = .{};
+    try db.open(":memory:");
+    defer db.close();
+    var s = try Store.init(&db, std.testing.allocator);
+    const task = try s.createTask("task", 0);
+    const p = try s.createProject("P", 0);
+    const q = try s.createProject("Q", 0);
+    const unknown = try s.addInterval(task, .focus, 1_000, 2_000, 7_000);
+    const known = try s.addIntervalProject(task, .focus, 2_000, 3_000, .{ .selected = p }, 7_000);
+    try s.mergeIntervals(unknown, .{ .start_ms = 1_000, .end_ms = 2_000 }, known, .{ .start_ms = 2_000, .end_ms = 3_000 }, 7_000);
+    try std.testing.expectEqual(@as(i64, 1), try testScalar(&db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(p, try testScalar(&db, "SELECT project_id FROM intervals WHERE start_ms=1000 AND end_ms=3000"));
+    const p_interval = try s.addIntervalProject(task, .focus, 4_000, 5_000, .{ .selected = p }, 7_000);
+    const q_interval = try s.addIntervalProject(task, .focus, 5_000, 6_000, .{ .selected = q }, 7_000);
+    try std.testing.expectError(error.NotMergeable, s.mergeIntervals(p_interval, .{ .start_ms = 4_000, .end_ms = 5_000 }, q_interval, .{ .start_ms = 5_000, .end_ms = 6_000 }, 7_000));
 }
 
 test "holding promotion splits a simultaneous project change" {

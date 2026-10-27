@@ -512,6 +512,7 @@
   /* Merge button between blocks */
   .merge-row{display:flex;justify-content:center;padding:3px 0;background:rgba(79,142,247,.04);border-bottom:1px solid var(--brd)}
   .merge-btn{background:none;border:1px dashed var(--brd);color:var(--muted);font-size:11px;padding:2px 12px;border-radius:99px;cursor:pointer;transition:all .15s}
+  .merge-note{color:var(--muted);font-size:11px}
   .merge-btn:hover{border-color:var(--acc);color:var(--acc);background:rgba(79,142,247,.08)}
   .merge-btn.warn{border-color:var(--warn);color:var(--warn)}
   .merge-btn.warn:hover{border-color:var(--warn);color:var(--warn);background:rgba(245,158,11,.1)}
