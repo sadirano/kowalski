@@ -288,6 +288,35 @@ test "journal recovery restores both executables and eligible snapshot" {
     }
 }
 
+test "failed launch rollback is abandoned and keeps its snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const db_path = try std.fs.path.join(a, &.{ root, "work.db" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "work.db", .data = "history" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "snapshot.db", .data = "snapshot history" });
+    try tmp.dir.createDirPath(io, "kowalski.exe");
+    try tmp.dir.writeFile(io, .{ .sub_path = "kowalski.exe.old", .data = "old executable" });
+    var value: journal_mod.Journal = .{
+        .id = "0123456789abcdef0123456789abcdef", .from = "1", .to = "2", .phase = .swapped,
+        .nonce = "abcdef0123456789abcdef0123456789", .snapshot = "snapshot.db", .exe_dir = ".", .started_ms = 1,
+    };
+    try journal_mod.write(a, io, db_path, value);
+    try std.testing.expectError(error.ExeRestore, rollback(a, io, db_path, root, &value, "interrupted update"));
+    const interrupted = (try journal_mod.read(a, io, db_path)).?;
+    try std.testing.expectEqual(journal_mod.Phase.rolling_back, interrupted.phase);
+    _ = try journal_mod.abandon(a, io, db_path, interrupted, "rollback failed", 20);
+    try std.testing.expectEqual(journal_mod.Phase.abandoned, (try journal_mod.read(a, io, db_path)).?.phase);
+    try std.testing.expectEqualStrings("snapshot history", try tmp.dir.readFileAlloc(io, "snapshot.db", a, .limited(100)));
+    try std.testing.expectEqualStrings("history", try tmp.dir.readFileAlloc(io, "work.db", a, .limited(100)));
+    _ = try tmp.dir.statFile(io, "update.json.failed-20", .{});
+}
+
 const Fake = struct {
     const Mode = enum { healthy, never_ready, exits, wrong_nonce };
     mode: Mode,

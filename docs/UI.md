@@ -24,9 +24,9 @@ rules behind it.
   open its slots; notes can be added, edited and deleted.
 - **Only focus counts** toward totals, hops, clock-out, the chart and
   posting. Parallel intervals are shown with a badge and never added in.
-- **Preferences live in kowalski** (daemon settings): day order (oldest
-  first by default, today at the bottom), days shown, collapsed panels,
-  language and the rest of Settings.
+- **Preferences live in kowalski** (daemon settings), beside the view they
+  change: the sidebar, report, chart and Summary each have a view options
+  button. docs/settings.md holds the rules.
 - **Languages:** English, Portuguese and Japanese, chosen in the ⋯ menu or
   in Settings.
 

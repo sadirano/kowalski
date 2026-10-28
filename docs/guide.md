@@ -11,6 +11,11 @@ in Settings turns the browser part off); `kowalski open` does the same from
 a terminal. `kowalski start` and `kowalski autostart on` (start at logon)
 run it quietly. The dashboard can be installed as an app from the browser.
 
+If the dashboard does not open, run `kowalski doctor` to see the database,
+update, port, process and log checks. Run `kowalski doctor --fix` to try a safe
+restart; `--json` prints the findings for scripts. The doctor never changes
+the dashboard port automatically.
+
 Every screenshot here shows made-up data (see
 [Making these screenshots](#making-these-screenshots)).
 
@@ -74,7 +79,11 @@ One bar across the top holds everything you use all day, from left to right:
 
 - **Date and arrows:** the day being shown. The arrows step one day; `←` and
   `→` do the same, and `T` jumps to today.
-- **Report / Summary:** the two views of a day (`1` and `2`).
+- **Report / Timeline / Summary:** the three views of a day (`1`, `2`, `3`).
+  Timeline shows one task at a time, read top to bottom: its sittings, each
+  prompt with what came of it, and the breaks between them; click a minute
+  on the day ribbon to see what you and anything else were doing then. It
+  only reads; edit in Report.
 - **Search:** finds a task by ref, title, provider field or note text
   (`Ctrl+K` or `/`).
 - **Current task:** the round button starts, pauses and resumes tracking
@@ -287,6 +296,11 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 **Display**
 
 - Language, 12- or 24-hour time, days in the sidebar, day order, weekends.
+- Report layout: Classic (one card per task, listing its intervals) or Grid
+  (cards in columns; each task's work in blocks with their notes; click a
+  task to fold it).
+- Task order within a day: most time first, by task ID, or in the order
+  they were first worked on that day.
 - Which optional buttons the command bar shows (add entry, shortcuts).
 - Chart tabs: the provider fields offered as chart groupings.
 - Summary format, and whether refs link to the provider's page.
@@ -299,8 +313,11 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 
 **Advanced**
 
-- The reporting time zone (a Windows zone name; days start and end at its
-  midnight) and the HTTP port, which is changed with `kowalski set
+- The reporting time zone (a Windows zone name) and **Day starts at**
+  (`00:00` to `12:00`, default `00:00`): work before that time belongs to the
+  previous day, everywhere, past days included. Hours already posted keep
+  the day they were posted on.
+- The HTTP port, which is changed with `kowalski set
   http_port <n>`.
 - **Restart kowalski** stops and starts the background service.
 
@@ -316,11 +333,12 @@ Signing in to the provider is in the ⋯ menu, or `kowalski provider login` (the
 | `Ctrl+K`, `/` | search |
 | `←` `→` | previous / next day |
 | `T` | today |
-| `1` `2` | report / summary |
+| `1` `2` `3` | report / timeline / summary |
 | `G` | calendar |
 | `C` | show or hide the chart |
 | `A` | add a past entry |
 | `[` | sidebar |
+| `J` `K` | next or previous sitting, in Timeline |
 | `?` | the shortcut list |
 
 Keys are the same in every language and follow the character your layout
@@ -342,7 +360,41 @@ kowalski day 2026-10-07
 kowalski post 2026-10-07 48213
 ```
 
-A task is `#<id>`, an external ref, or a title.
+A task is `#<id>`, an external ref, or a title. With a provider configured,
+a new all-digit task is bound to that ref and gets the provider's title; use
+`#<id>` or a non-numeric title for a plain local task.
+Use `kowalski postings [<YYYY-MM-DD>] --accept` to keep a changed day posted without posting again.
+
+### Starred notes
+
+Use `kowalski note --star "important detail"` to save a starred note. Run
+`kowalski day --starred` (or add a date) to list only starred notes with
+their time and task. Each line starts with an id such as `n7`; use
+`kowalski star n7 n8` or `kowalski unstar n7` to change saved marks.
+
+### Project keys for launchers
+
+A launcher (a shell alias, an editor task, a directory tool) can name the
+project by a stable key of its own instead of an id:
+
+```
+kowalski track --project-key repo:gaze --project-hint gaze "fix login"
+kowalski day --project-key repo:gaze
+kowalski project bind #4 --key repo:gaze-old
+```
+
+The key is opaque. One key names one project, whichever source sent it, so
+a launcher and an agent capture hook that use the same key share the
+project. A write with an unknown key makes the project from the hint (or
+reuses an unclaimed project of that name); a read with an unknown key is an
+error, never a new project. `project bind` points a key at a project, for
+example after a rename.
+
+### For agents
+
+`kowalski --agent [<command>]` describes each command for an agent: whether
+it only reads, writes the live tracker (and what else it closes), sends
+something outside, or runs the daemon. `--json` gives the same as data.
 
 ## Making these screenshots
 

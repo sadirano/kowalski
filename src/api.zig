@@ -5,6 +5,7 @@
 //! caller runs that provider call without the database lock, then passes the
 //! outcome to `proceed`, which may ask for another call.
 const std = @import("std");
+const settings_decl = @import("settings.zig");
 const store_mod = @import("store.zig");
 const days = @import("days.zig");
 const zone = @import("zone.zig");
@@ -17,24 +18,13 @@ const Store = store_mod.Store;
 
 pub const default_port: u16 = 47100;
 
-/// Settings the API may change; anything else is refused.
-pub const setting_keys = [_][]const u8{
-    "reporting_zone",  "daily_work_minutes", "lunch_minutes",     "http_port",
-    "post_sessions",
-    // Dashboard preferences.
-    "ui_day_order",    "ui_sidebar_days",    "ui_hide_weekends",  "ui_show_keys",      "ui_show_add_entry", "ui_chart_visible", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch",
-    "ui_chart_days",   "ui_left_collapsed",  "ui_lang",           "ui_summary_format", "ui_autofill_obs",   "ui_links",
-    "ui_time_format",  "ui_chart_view",      "ui_chart_hidden",
-    // Paid break windows, overriding the provider's: "08:00-12:00=15,13:00-18:00=15"; empty is none.
-    "paid_breaks",
-    // Windows where a screen lock pauses: "17:00-23:59"; empty is none.
-    "lock_pause",
-};
 
 pub const App = struct {
     store: *Store,
     port: u16,
     clock: *const fn () i64,
+    /// The database this daemon has open; empty in tests.
+    db_path: []const u8 = "",
     trial_nonce: ?[]const u8 = null,
     trial_ready: bool = false,
     /// Set by POST /api/shutdown; the daemon stops after answering.
@@ -45,6 +35,27 @@ pub const App = struct {
     /// The provider's static traits; empty without one.
     traits: Traits = .{},
     running_post: ?*const fn () ?i64 = null,
+    on_sqlite_error: ?*const fn (path: []const u8, message: []const u8) void = null,
+    declared_fields: []const []const u8 = &.{},
+    declared_fields_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+
+    pub fn clearDeclaredFields(app: *App) void {
+        app.declared_fields_arena.deinit();
+        app.declared_fields_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        app.declared_fields = &.{};
+    }
+
+    pub fn loadDeclaredFields(app: *App, json: []const u8) !void {
+        var replacement = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer replacement.deinit();
+        const a = replacement.allocator();
+        const parsed = try std.json.parseFromSliceLeaky([]const struct { name: []const u8 }, a, json, .{ .ignore_unknown_fields = true });
+        var names: std.ArrayList([]const u8) = .empty;
+        for (parsed) |field| if (field.name.len > 0) try names.append(a, field.name);
+        app.clearDeclaredFields();
+        app.declared_fields_arena = replacement;
+        app.declared_fields = names.items;
+    }
 };
 
 pub const ProviderStatus = struct {
@@ -73,7 +84,8 @@ const SessionChain = struct {
 pub const Followup = union(enum) {
     fields,
     /// Without a task, only looks the ref up.
-    lookup: struct { task: ?i64, ref: []const u8 },
+    /// `capture` or `switched` is the reply already decided; the lookup only binds.
+    lookup: struct { task: ?i64, ref: []const u8, capture: ?store_mod.CaptureResult = null, switched: ?i64 = null },
     quote: struct {
         day: []const u8,
         task: i64,
@@ -142,19 +154,25 @@ fn send(a: std.mem.Allocator, status: std.http.Status, value: anytype) Response 
     return .{ .status = status, .body = body };
 }
 
+fn captureReply(a: std.mem.Allocator, result: store_mod.CaptureResult) Response {
+    if (result.focus_taken) |taken| return send(a, .ok, .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id, .focus_taken = taken });
+    return send(a, .ok, .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id });
+}
+
 fn fail(a: std.mem.Allocator, f: Fail) Response {
     return send(a, f.status, .{ .@"error" = f.code, .message = f.message, .candidates = f.candidates });
 }
 
 fn errorResponse(a: std.mem.Allocator, err: anyerror) Response {
+    if (err == error.TaskBound) return fail(a, .{ .status = .conflict, .code = "TaskBound", .message = "title comes from the provider" });
     const status: std.http.Status = switch (err) {
-        error.UnknownTask, error.UnknownInterval, error.UnknownNote => .not_found,
-        error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen => .conflict,
-        error.InvalidRange => .bad_request,
+        error.UnknownTask, error.UnknownInterval, error.UnknownNote, error.UnknownProject => .not_found,
+        error.Stale, error.Overlap, error.NoteOutside, error.OpenEnd, error.NotMergeable, error.TaskHasPostings, error.TaskOpen, error.DuplicateProject, error.AmbiguousTask, error.ReviewChanged => .conflict,
+        error.InvalidRange, error.InvalidSelection => .bad_request,
         error.NoFocus, error.NoOpenInterval, error.AlreadyOpen, error.SomethingOpen, error.BindingConflict, error.PostingBlocked, error.PostingInFlight, error.InvalidState, error.NoProvider, error.NotBound, error.NothingToPost, error.SessionOpen => .conflict,
         error.UnknownPosting => .not_found,
         error.ProviderOutput => .bad_gateway,
-        error.EmptyText, error.InvalidSetting, error.UnknownZone, error.InvalidTime, error.InvalidDate, error.InvalidSchedule => .bad_request,
+        error.EmptyText, error.InvalidSetting, error.UnknownZone, error.InvalidTime, error.InvalidDate, error.InvalidSchedule, error.InvalidProjectLabel, error.InvalidProjectKey => .bad_request,
         else => .internal_server_error,
     };
     return fail(a, .{ .status = status, .code = @errorName(err) });
@@ -177,14 +195,14 @@ fn originAllowed(port: u16, origin: []const u8) bool {
 
 /// The host, header and origin rules every API request passes: the refusal,
 /// or null when the request may go on.
-pub fn refused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
+pub fn refused(port: u16, a: std.mem.Allocator, req: Request, extra_origin_ok: bool) ?Response {
     const host = req.host orelse return fail(a, .{ .status = .forbidden, .code = "host" });
     if (!hostAllowed(port, host)) return fail(a, .{ .status = .forbidden, .code = "host" });
     switch (req.method) {
         .GET => {},
         .POST, .PATCH, .DELETE => {
             if (!req.marker) return fail(a, .{ .status = .forbidden, .code = "header", .message = "changes need X-Kowalski: 1" });
-            if (req.origin) |origin| if (!originAllowed(port, origin)) return fail(a, .{ .status = .forbidden, .code = "origin" });
+            if (req.origin) |origin| if (!originAllowed(port, origin) and !extra_origin_ok) return fail(a, .{ .status = .forbidden, .code = "origin" });
         },
         else => return fail(a, .{ .status = .method_not_allowed, .code = "method" }),
     }
@@ -193,7 +211,7 @@ pub fn refused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
 
 /// Update checks are explicit user actions, so even GET requires the marker.
 pub fn updateRefused(port: u16, a: std.mem.Allocator, req: Request) ?Response {
-    if (refused(port, a, req)) |r| return r;
+    if (refused(port, a, req, false)) |r| return r;
     if (!req.marker) return fail(a, .{ .status = .forbidden, .code = "header", .message = "update requests need X-Kowalski: 1" });
     return null;
 }
@@ -203,11 +221,27 @@ pub fn answer(a: std.mem.Allocator, status: std.http.Status, value: anytype) Res
     return send(a, status, value);
 }
 
+fn captureOriginAllowed(app: *App, origin: []const u8) !bool {
+    if (!std.mem.startsWith(u8, origin, "chrome-extension://") and
+        !std.mem.startsWith(u8, origin, "moz-extension://")) return false;
+    const list = try app.store.getSetting("capture_origins") orelse return false;
+    defer app.store.allocator.free(list);
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |item| {
+        if (std.mem.eql(u8, std.mem.trim(u8, item, " "), origin)) return true;
+    }
+    return false;
+}
+
 pub fn handle(app: *App, a: std.mem.Allocator, req: Request) Response {
-    if (refused(app.port, a, req)) |r| return r;
     const question = std.mem.indexOfScalar(u8, req.target, '?');
     const path = if (question) |at| req.target[0..at] else req.target;
     const params = if (question) |at| req.target[at + 1 ..] else "";
+    const extra_origin_ok = if (is(req, .POST, path, "/api/capture") and req.origin != null and !originAllowed(app.port, req.origin.?))
+        captureOriginAllowed(app, req.origin.?) catch false
+    else
+        false;
+    if (refused(app.port, a, req, extra_origin_ok)) |r| return r;
     if (is(req, .GET, path, "/api/update/ready")) {
         const nonce = app.trial_nonce orelse return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
         if (!app.trial_ready) return .{ .status = .not_found, .body = "{\"error\":\"not_found\"}" };
@@ -221,7 +255,10 @@ pub fn handle(app: *App, a: std.mem.Allocator, req: Request) Response {
         return .{ .status = .ok, .body = "{\"committed\":true}" };
     }
     if (app.trial_nonce != null and req.method != .GET) return .{ .status = .service_unavailable, .body = "{\"error\":\"updating\"}" };
-    return route(app, a, req, path, params) catch |err| errorResponse(a, err);
+    return route(app, a, req, path, params) catch |err| {
+        if (err == error.Sqlite) if (app.on_sqlite_error) |log_sqlite| log_sqlite(path, app.store.db.message());
+        return errorResponse(a, err);
+    };
 }
 
 test "trial gates mutations and commits only matching nonce" {
@@ -253,8 +290,9 @@ fn is(req: Request, method: std.http.Method, path: []const u8, want: []const u8)
 }
 
 fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !Response {
-    if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true });
+    if (is(req, .GET, path, "/api/health")) return send(a, .ok, .{ .ok = true, .db = app.db_path });
     if (is(req, .GET, path, "/api/version")) return send(a, .ok, .{ .version = @import("build_options").version, .pid = GetCurrentProcessId(), .update_repo = @import("build_options").update_repo });
+    if (try projectsRoute(app, a, req, path, params)) |response| return response;
     if (try history(app, a, req, path)) |r| return r;
     if (is(req, .GET, path, "/api/search")) return search(app, a, params);
     if (is(req, .GET, path, "/api/daytotals")) return dayTotals(app, a, params);
@@ -297,6 +335,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return .{ .status = .ok, .body = "", .followup = .fields };
     }
     if (is(req, .GET, path, "/api/postings")) return offers(app, a, try param(a, params, "date"));
+    if (is(req, .POST, path, "/api/postings/accept")) return acceptChanged(app, a, req.body);
     if (is(req, .POST, path, "/api/postings")) return startPosting(app, a, req.body);
     if (req.method == .POST and std.mem.startsWith(u8, path, "/api/postings/") and std.mem.endsWith(u8, path, "/resolve")) {
         const id = std.fmt.parseInt(i64, path["/api/postings/".len .. path.len - "/resolve".len], 10) catch return notFound(a);
@@ -313,35 +352,112 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             return send(a, .ok, .{ .task = t, .fields = try query.fields(app.store, a, id) });
         }
         if (req.method == .PATCH) {
-            const body = try parseBody(struct { title: []const u8 }, a, req.body) orelse return badRequest(a, "body");
-            try app.store.setTitle(id, std.mem.trim(u8, body.title, " \t"), app.clock());
-            return send(a, .ok, .{ .task = (try query.task(app.store, a, id)).? });
+            const body = try parseBody(struct { title: ?[]const u8 = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+            const choice = try projectChoice(a, req.body);
+            if (body.title == null and choice == .omitted) return badRequest(a, "body");
+            const changed = if (body.title == null) try app.store.setTaskProject(id, choice.selected, app.clock()) else
+                try app.store.updateTask(id, std.mem.trim(u8, body.title.?, " \t"), choice, app.clock());
+            return send(a, .ok, .{ .task = (try query.task(app.store, a, id)).?, .changed = changed });
         }
     }
     if (is(req, .POST, path, "/api/tasks")) {
-        const body = try parseBody(struct { title: []const u8 }, a, req.body) orelse return badRequest(a, "body");
-        const id = try app.store.createTask(std.mem.trim(u8, body.title, " \t"), app.clock());
+        const body = try parseBody(struct { title: []const u8, project_id: ?i64 = null, project_key: ?[]const u8 = null, project_hint: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
+        const id = try app.store.createTaskWithProject(std.mem.trim(u8, body.title, " \t"), try keyChoice(app, a, req.body), app.clock());
         return send(a, .created, .{ .task = (try query.task(app.store, a, id)).? });
     }
+    if (is(req, .POST, path, "/api/capture")) {
+        const Body = struct {
+            source: []const u8,
+            run: []const u8,
+            event: ?[]const u8 = null,
+            kind: []const u8,
+            subject: ?[]const u8 = null,
+            default_subject: ?[]const u8 = null,
+            project_key: ?[]const u8 = null,
+            project_hint: ?[]const u8 = null,
+            first_prompt: ?[]const u8 = null,
+            attended: bool = true,
+            focus: bool = false,
+            note: ?[]const u8 = null,
+        };
+        // Fields a newer source sends are skipped, so an updated hook never breaks an older daemon.
+        const body = std.json.parseFromSliceLeaky(Body, a, req.body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return badRequest(a, "body"),
+        };
+        const kind = std.meta.stringToEnum(store_mod.CaptureKind, body.kind) orelse return badRequest(a, "kind");
+        for ([_]?[]const u8{ body.source, body.run, body.event, body.subject, body.default_subject }) |field| {
+            if (field) |f| if (f.len == 0 or f.len > 200) return badRequest(a, "length");
+        }
+        if (kind == .subject and body.subject == null) return badRequest(a, "subject");
+        if (body.note) |n| if (n.len > 2000) return badRequest(a, "note");
+        if (body.event) |event| if (try app.store.captureEventSeen(body.source, event)) return send(a, .ok, .{ .applied = false });
+        if (body.project_key) |key| if (key.len == 0 or key.len > 2048) return badRequest(a, "project_key");
+        if (body.project_hint) |hint| if (hint.len > 200) return badRequest(a, "project_hint");
+        if (body.first_prompt) |seed| if (seed.len > 2000) return badRequest(a, "first_prompt");
+        const c: store_mod.Capture = .{ .source = body.source, .run = body.run, .event = body.event, .kind = kind, .attended = body.attended, .focus = body.focus, .note = if (body.note) |n| try noteText(a, n) else null,
+            .subject = body.subject, .default_subject = body.default_subject, .project_key = body.project_key, .project_hint = body.project_hint, .first_prompt = body.first_prompt };
+        const result = try app.store.captureDetailed(c, app.clock());
+        if (app.provider != null) if (result.created_ref) |ref| return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{
+            .task = result.task_id.?, .ref = try a.dupe(u8, ref),
+            .capture = .{ .applied = result.applied, .project_id = result.project_id, .task_id = result.task_id, .focus_taken = result.focus_taken },
+        } } };
+        return captureReply(a, result);
+    }
+    if (is(req, .POST, path, "/api/capture/history")) {
+        const Interval = store_mod.HistoryInterval;
+        const Body = struct { source: []const u8, run: []const u8, attended: bool = true, intervals: []const Interval };
+        const body = try parseBody(Body, a, req.body) orelse return badRequest(a, "body");
+        if (!historyLength(body.source, 200) or !historyLength(body.run, 200) or body.intervals.len > 500) return badRequest(a, "length");
+        const now_ms = app.clock();
+        var note_count: usize = 0;
+        for (body.intervals) |interval| {
+            if (!historyLength(interval.event, 200) or !historyLength(interval.subject, 200)) return badRequest(a, "length");
+            if (interval.start_ms < 0 or interval.start_ms >= interval.end_ms or interval.end_ms > now_ms) return badRequest(a, "range");
+            note_count += interval.notes.len;
+            if (note_count > 5000) return badRequest(a, "notes");
+            for (interval.notes) |note| {
+                if (!historyLength(note.event, 200) or !historyLength(note.text, 2000)) return badRequest(a, "length");
+                if (note.at_ms < interval.start_ms or note.at_ms > interval.end_ms) return badRequest(a, "note time");
+            }
+        }
+        const result = try app.store.captureHistory(a, body.source, body.run, body.attended, body.intervals, now_ms, resolveHistorySubject);
+        return switch (result) {
+            .applied => |counts| send(a, .ok, counts),
+            .conflict => |c| send(a, .conflict, .{ .@"error" = "HistoryConflict", .interval = c.index, .reason = c.reason }),
+            .invalid_subject => badRequest(a, "subject"),
+        };
+    }
     if (is(req, .POST, path, "/api/switch") or is(req, .POST, path, "/api/parallel")) {
-        const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { task: []const u8, text: ?[]const u8 = null, project_id: ?i64 = null, project_key: ?[]const u8 = null, project_hint: ?[]const u8 = null }, a, req.body) orelse return badRequest(a, "body");
+        const choice = try keyChoice(app, a, req.body);
+        const scope = try choiceScope(app, choice);
         var created = false;
-        const id = switch (try query.resolve(app.store, a, body.task)) {
+        var created_ref: ?[]const u8 = null;
+        const id = switch (try query.resolve(app.store, a, body.task, scope)) {
             .found => |id| id,
             .ambiguous => |list| return ambiguous(a, list),
             .none => blk: {
                 const title = std.mem.trim(u8, body.task, " \t");
                 if (title.len > 0 and title[0] == '#') return error.UnknownTask;
                 created = true;
-                break :blk try app.store.createTask(title, app.clock());
+                // A new all-digit task is the provider's ref, as for capture.
+                if (numericRef(title)) created_ref = title;
+                break :blk try app.store.createTaskWithProject(title, if (choice == .omitted and scope == null) .omitted else .{ .selected = scope }, app.clock());
             },
         };
-        const text = if (body.text) |t| if (std.mem.trim(u8, t, " \t").len == 0) null else t else null;
+        const text = if (body.text) |t| blk: {
+            if (t.len > 2000) return badRequest(a, "text");
+            break :blk if (std.mem.trim(u8, t, " \t\r\n").len == 0) null else try noteText(a, t);
+        } else null;
         const interval = if (std.mem.eql(u8, path, "/api/switch"))
-            try app.store.switchTo(id, text, app.clock())
+            try app.store.switchToProject(id, text, choice, app.clock())
         else
-            try app.store.openParallel(id, text, app.clock());
-        return send(a, .ok, .{ .interval = interval, .task = (try query.task(app.store, a, id)).?, .created = created });
+            try app.store.openParallelProject(id, text, choice, app.clock());
+        if (app.provider != null) if (created_ref) |ref| return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{
+            .task = id, .ref = try a.dupe(u8, ref), .switched = interval,
+        } } };
+        return switchReply(app, a, interval, id, created);
     }
     if (is(req, .POST, path, "/api/stop")) {
         const body = try parseBody(struct { task: []const u8 }, a, req.body) orelse return badRequest(a, "body");
@@ -361,10 +477,12 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         return state(app, a);
     }
     if (is(req, .POST, path, "/api/notes")) {
-        const body = try parseBody(struct { task: ?[]const u8 = null, text: []const u8, interval: ?i64 = null, at_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { task: ?[]const u8 = null, text: []const u8, interval: ?i64 = null, at_ms: ?i64 = null, starred: bool = false }, a, req.body) orelse return badRequest(a, "body");
+        if (body.text.len > 2000) return badRequest(a, "text");
+        const text = if (std.mem.trim(u8, body.text, " \t\r\n").len == 0) "" else try noteText(a, body.text);
         if (body.interval) |interval| {
             const at = body.at_ms orelse return badRequest(a, "at_ms");
-            const note = try app.store.addNoteAt(interval, at, std.mem.trim(u8, body.text, " \t\r\n"), app.clock());
+            const note = try app.store.addNoteAtWithStar(interval, at, text, body.starred, app.clock());
             return send(a, .created, .{ .note = note });
         }
         var target: ?i64 = null;
@@ -372,9 +490,19 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
             .id => |id| target = id,
             .response => |r| return r,
         };
-        const text = std.mem.trim(u8, body.text, " \t\r\n");
-        const note = try app.store.addNote(target, text, app.clock());
+        const note = try app.store.addNoteWithStar(target, text, body.starred, app.clock());
         return send(a, .created, .{ .note = note });
+    }
+    if (is(req, .POST, path, "/api/notes/captured")) {
+        const body = try parseBody(struct { from: []const u8, to: []const u8, apply: bool }, a, req.body) orelse return badRequest(a, "body");
+        const from = parseDate(a, body.from) catch return badRequest(a, "from");
+        const to = parseDate(a, body.to) catch return badRequest(a, "to");
+        if (dayIndex(from) > dayIndex(to)) return badRequest(a, "range");
+        const z = try loadZone(app, a);
+        const first = try z.dayBounds(from.year, from.month, from.day);
+        const last = try z.dayBounds(to.year, to.month, to.day);
+        const count = try app.store.removeCapturedText(first.start_ms, last.end_ms, body.apply, app.clock());
+        return if (body.apply) send(a, .ok, .{ .deleted = count }) else send(a, .ok, .{ .count = count });
     }
     if (is(req, .GET, path, "/api/day")) return day(app, a, try param(a, params, "date"));
     if (is(req, .GET, path, "/api/summary")) {
@@ -387,6 +515,7 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
         try app.store.setDaySummary(date.text, std.mem.trim(u8, body.text, " \t\r\n"), app.clock());
         return send(a, .ok, .{ .date = date.text, .text = try summaryOf(app, a, date.text) });
     }
+    if (is(req, .GET, path, "/api/zones")) return send(a, .ok, .{ .zones = try zone.names(a) });
     if (is(req, .GET, path, "/api/settings")) return send(a, .ok, .{ .settings = try query.settings(app.store, a) });
     if (is(req, .PATCH, path, "/api/settings")) {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req.body, .{}) catch return badRequest(a, "body");
@@ -414,8 +543,77 @@ fn route(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params
     return notFound(a);
 }
 
+fn projectsRoute(app: *App, a: std.mem.Allocator, req: Request, path: []const u8, params: []const u8) !?Response {
+    if (is(req, .GET, path, "/api/projects")) {
+        const archived = try param(a, params, "archived") orelse "0";
+        if (!std.mem.eql(u8, archived, "0") and !std.mem.eql(u8, archived, "1")) return badRequest(a, "archived");
+        return send(a, .ok, .{ .projects = try query.projects(app.store, a, std.mem.eql(u8, archived, "1")) });
+    }
+    if (is(req, .POST, path, "/api/projects")) {
+        const body = try parseBody(struct { label: []const u8 }, a, req.body) orelse return badRequest(a, "body");
+        const id = try app.store.createProject(body.label, app.clock());
+        return send(a, .created, .{ .project = (try query.project(app.store, a, id)).? });
+    }
+    if (is(req, .GET, path, "/api/project-keys")) return send(a, .ok, .{ .keys = try query.captureProjectKeys(app.store, a) });
+    if (is(req, .PATCH, path, "/api/project-keys")) {
+        const body = try parseBody(struct { source: ?[]const u8 = null, project_key: []const u8, project_id: i64 }, a, req.body) orelse return badRequest(a, "body");
+        if (body.project_id <= 0) return badRequest(a, "project_id");
+        // Without a source, every source's mapping of the key moves together;
+        // a key nobody sent yet is bound for the CLI.
+        const source = body.source orelse {
+            try app.store.bindKey(key_source, body.project_key, body.project_id, app.clock());
+            return send(a, .ok, .{ .keys = try query.captureProjectKeys(app.store, a) });
+        };
+        var hint: ?[]const u8 = null;
+        for (try query.captureProjectKeys(app.store, a)) |key| if (std.mem.eql(u8, key.source, source) and std.mem.eql(u8, key.project_key, body.project_key)) { hint = key.project_hint; break; };
+        if (hint == null) return error.UnknownProject;
+        try app.store.setCaptureProjectKey(source, body.project_key, hint.?, body.project_id, app.clock());
+        return send(a, .ok, .{ .mapping = query.CaptureProjectKey{ .source = source, .project_key = body.project_key, .project_hint = hint.?, .project_id = body.project_id } });
+    }
+    if (is(req, .POST, path, "/api/projects/assign/preview")) {
+        const Scope = struct { task_id: ?i64 = null, interval_ids: ?[]const i64 = null, unassigned_suggestions: bool = false };
+        const body = try parseBody(struct { scope: Scope, project_id: ?i64 }, a, req.body) orelse return badRequest(a, "body");
+        const count: u8 = @intFromBool(body.scope.task_id != null) + @as(u8, @intFromBool(body.scope.interval_ids != null)) + @as(u8, @intFromBool(body.scope.unassigned_suggestions));
+        if (count != 1) return badRequest(a, "scope");
+        if (body.project_id) |id| if (id <= 0) return badRequest(a, "project_id");
+        var scope: store_mod.AssignmentScope = .unassigned_suggestions;
+        if (body.scope.task_id) |id| {
+            if (id <= 0 or try query.task(app.store, a, id) == null) return error.UnknownTask;
+            scope = .{ .task_id = id };
+        }
+        if (body.scope.interval_ids) |ids| {
+            if (ids.len == 0) return badRequest(a, "interval_ids");
+            for (ids) |id| if (id <= 0) return badRequest(a, "interval_ids");
+            scope = .{ .interval_ids = ids };
+        }
+        return send(a, .ok, try query.projectAssignmentPreview(app.store, a, scope, body.project_id));
+    }
+    if (is(req, .POST, path, "/api/projects/assign/apply")) {
+        const body = try parseBody(struct { snapshot: store_mod.AssignmentSnapshot }, a, req.body) orelse return badRequest(a, "body");
+        return send(a, .ok, try app.store.applyProjectAssign(body.snapshot, body.snapshot.project_id, app.clock()));
+    }
+    if (req.method == .PATCH) if (idBetween(path, "/api/projects/", "")) |id| {
+        if (id <= 0) return badRequest(a, "id");
+        const body = try parseBody(struct { label: ?[]const u8 = null, archived: ?bool = null }, a, req.body) orelse return badRequest(a, "body");
+        if ((body.label == null) == (body.archived == null)) return badRequest(a, "body");
+        if (body.label) |label| try app.store.renameProject(id, label, app.clock()) else try app.store.archiveProject(id, body.archived.?, app.clock());
+        return send(a, .ok, .{ .project = (try query.project(app.store, a, id)).? });
+    };
+    if (req.method == .DELETE) if (idBetween(path, "/api/projects/", "")) |id| {
+        if (id <= 0) return badRequest(a, "id");
+        // The target rides in the query: the HTTP server reads no DELETE body.
+        const raw = try param(a, params, "into") orelse return badRequest(a, "into");
+        const into: ?i64 = if (std.mem.eql(u8, raw, "none")) null else std.fmt.parseInt(i64, raw, 10) catch return badRequest(a, "into");
+        if (into) |target| if (target <= 0) return badRequest(a, "into");
+        try app.store.deleteProject(id, into, app.clock());
+        return send(a, .ok, .{ .deleted = id });
+    };
+    return null;
+}
+
+/// Declared in settings.zig, or a setting the loaded provider declares.
 fn knownSetting(app: *const App, key: []const u8) bool {
-    for (setting_keys) |k| if (std.mem.eql(u8, k, key)) return true;
+    if (settings_decl.find(key) != null) return true;
     return providerSetting(app, key) != null;
 }
 
@@ -434,8 +632,34 @@ fn ambiguous(a: std.mem.Allocator, list: []const query.Task) Response {
 const Existing = union(enum) { id: i64, response: Response };
 
 /// An existing task, or the response to send instead (ambiguous match).
+/// A captured subject names a task as `switch` does, and is created when
+/// nothing matches. Null when it is ambiguous or names a missing `#id`.
+fn captureTask(app: *App, a: std.mem.Allocator, text: []const u8, scope: ?i64) !?i64 {
+    return switch (try query.resolve(app.store, a, text, scope)) {
+        .found => |id| id,
+        .ambiguous => null,
+        .none => null,
+    };
+}
+
+fn historyLength(text: []const u8, max: usize) bool {
+    return text.len > 0 and text.len <= max;
+}
+
+fn resolveHistorySubject(s: *Store, a: std.mem.Allocator, text: []const u8, now_ms: i64) anyerror!?i64 {
+    return switch (try query.resolve(s, a, text, null)) {
+        .found => |id| id,
+        .ambiguous => null,
+        .none => blk: {
+            const title = std.mem.trim(u8, text, " \t");
+            if (title.len == 0 or title[0] == '#') break :blk null;
+            break :blk try s.createHistoryTask(title, now_ms);
+        },
+    };
+}
+
 fn resolveExisting(app: *App, a: std.mem.Allocator, text: []const u8) !Existing {
-    return switch (try query.resolve(app.store, a, text)) {
+    return switch (try query.resolve(app.store, a, text, try focusProject(app))) {
         .found => |id| .{ .id = id },
         .none => error.UnknownTask,
         .ambiguous => |list| .{ .response = ambiguous(a, list) },
@@ -447,6 +671,47 @@ fn parseBody(comptime T: type, a: std.mem.Allocator, body: []const u8) !?T {
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
+}
+
+fn projectChoice(a: std.mem.Allocator, body: []const u8) !store_mod.ProjectChoice {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return error.InvalidProjectLabel;
+    if (value != .object) return error.InvalidProjectLabel;
+    const raw = value.object.get("project_id") orelse return .omitted;
+    return switch (raw) {
+        .null => .{ .selected = null },
+        .integer => |id| if (id > 0) .{ .selected = id } else error.InvalidProjectLabel,
+        else => error.InvalidProjectLabel,
+    };
+}
+
+/// The source the CLI and other launchers map their project keys under.
+const key_source = "cli";
+
+/// `project_key` (with an optional `project_hint`) names a project the way
+/// capture does, made on first sight; otherwise `project_id` as usual.
+fn keyChoice(app: *App, a: std.mem.Allocator, body: []const u8) !store_mod.ProjectChoice {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return error.InvalidProjectLabel;
+    if (value != .object) return error.InvalidProjectLabel;
+    const raw = value.object.get("project_key") orelse return projectChoice(a, body);
+    if (raw == .null) return projectChoice(a, body);
+    if (raw != .string or value.object.get("project_id") != null) return error.InvalidProjectKey;
+    const hint = if (value.object.get("project_hint")) |h| switch (h) {
+        .string => |text| text,
+        .null => raw.string,
+        else => return error.InvalidProjectLabel,
+    } else raw.string;
+    return .{ .selected = try app.store.projectForKey(key_source, raw.string, hint, app.clock()) };
+}
+
+fn focusProject(app: *App) !?i64 {
+    var stmt = try app.store.db.prepare("SELECT project_id FROM intervals WHERE end_ms IS NULL AND role='focus'");
+    defer stmt.finalize();
+    if (try stmt.step() != .row) return null;
+    return if (stmt.columnIsNull(0)) null else stmt.columnI64(0);
+}
+
+fn choiceScope(app: *App, choice: store_mod.ProjectChoice) !?i64 {
+    return switch (choice) { .omitted => try focusProject(app), .selected => |id| id };
 }
 
 fn param(a: std.mem.Allocator, params: []const u8, name: []const u8) !?[]const u8 {
@@ -473,10 +738,8 @@ pub fn parseDate(a: std.mem.Allocator, text: []const u8) !Date {
 }
 
 fn loadZone(app: *App, a: std.mem.Allocator) !zone.Zone {
-    const id = try app.store.reportingZone() orelse return zone.Zone.load("UTC");
-    defer app.store.allocator.free(id);
     _ = a;
-    return zone.Zone.load(id);
+    return app.store.loadZone();
 }
 
 fn dateParam(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Date {
@@ -502,7 +765,7 @@ fn lunchesOf(app: *App, a: std.mem.Allocator, bounds: zone.Zone.Bounds) ![]query
     const least: i64 = @as(i64, @max(10, (try app.store.lunchMinutes()) / 2)) * 60_000;
     var best: ?query.Span = null;
     var reach: ?i64 = null;
-    for (try query.intervalsBetween(app.store, a, bounds.start_ms, bounds.end_ms)) |i| {
+    for (try query.spansBetween(app.store, a, bounds.start_ms, bounds.end_ms)) |i| {
         const end = i.end_ms orelse now;
         if (reach) |r| {
             if (i.start_ms - r >= least) {
@@ -582,6 +845,7 @@ fn state(app: *App, a: std.mem.Allocator) !Response {
     return send(a, .ok, .{
         .now_ms = now,
         .zone = try zoneName(app, a),
+        .day_start_min = z.day_start_min,
         .date = today.text,
         .provider = app.provider,
         .link = app.traits.link,
@@ -591,9 +855,11 @@ fn state(app: *App, a: std.mem.Allocator) !Response {
         .focus = focus,
         .focus_fields = if (focus) |f| try query.fields(app.store, a, f.task.id) else &.{},
         .parallel = parallel.items,
+        .capture = .{ .runs = try query.captureRuns(app.store, a, now) },
         .saved = try query.savedSet(app.store, a),
         .numbers = numbersOf(n),
         .daily_work_minutes = try app.store.dailyWorkMinutes(),
+        .projects_rev = try std.fmt.allocPrint(a, "{d}-{d}-{d}", .{ GetCurrentProcessId(), app.store.incarnation, app.store.projects_rev }),
     });
 }
 
@@ -611,6 +877,7 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
         }
     }.lessThan);
     const intervals = try query.intervalsBetween(app.store, a, bounds.start_ms, bounds.end_ms);
+    const project_totals = try query.projectTotalsBetween(app.store, a, bounds.start_ms, bounds.end_ms, app.clock());
     // Tasks seen only in parallel still get their fields, for the report.
     var others: std.ArrayList(TaskTotal) = .empty;
     for (intervals) |i| {
@@ -633,16 +900,19 @@ fn day(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
     return send(a, .ok, .{
         .date = date.text,
         .zone = try zoneName(app, a),
+        .day_start_min = z.day_start_min,
         .start_ms = bounds.start_ms,
         .end_ms = bounds.end_ms,
         .numbers = numbersOf(n),
         .tasks = totals.items,
         .intervals = intervals,
+        .project_totals = project_totals,
         .summary = try summaryOf(app, a, date.text),
         .lunch_out_ms = if (lunches.len > 0) lunches[0].start_ms else null,
         .lunch_back_ms = if (lunches.len > 0 and !(lunch_open and lunches[lunches.len - 1].end_ms >= app.clock())) lunches[lunches.len - 1].end_ms else null,
         .last_end_ms = last_end,
         .changed_after_posting = try query.changedAfterPosting(app.store, date.text),
+        .posted_tasks = try query.postedTasks(app.store, a, date.text),
     });
 }
 
@@ -905,9 +1175,12 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
         task: query.Task,
         fields: []query.Field,
         snippet: ?[]const u8,
+        historical_projects: []query.ProjectRef,
         total_ms: i64,
         day_count: usize,
         last_date: ?[]const u8,
+        match_date: ?[]const u8,
+        match_dates: [][]const u8,
         /// Most recent first, at most 12.
         days: []DayTotal,
     };
@@ -928,13 +1201,31 @@ fn search(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
             i -= 1;
             try list.append(a, .{ .date = keys[i], .total_ms = totals.values()[i] });
         }
+        var match_dates: std.ArrayList([]const u8) = .empty;
+        for (found.match_times) |ms| {
+            const d = try z.dateOf(ms);
+            const date = try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+            var seen = false;
+            for (match_dates.items) |prior| {
+                if (std.mem.eql(u8, prior, date)) { seen = true; break; }
+            }
+            if (!seen) try match_dates.append(a, date);
+            if (match_dates.items.len == 12) break;
+        }
+        const match_date = if (found.match_ms) |ms| blk: {
+            const d = try z.dateOf(ms);
+            break :blk try std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day });
+        } else null;
         try results.append(a, .{
             .task = found.task,
             .fields = try query.fields(app.store, a, found.task.id),
             .snippet = found.snippet,
+            .historical_projects = found.historical_projects,
             .total_ms = total,
             .day_count = keys.len,
             .last_date = if (keys.len > 0) keys[keys.len - 1] else null,
+            .match_date = match_date,
+            .match_dates = match_dates.items,
             .days = list.items,
         });
     }
@@ -970,11 +1261,13 @@ fn frequentTasks(app: *App, a: std.mem.Allocator, params: []const u8) !Response 
     return send(a, .ok, .{ .tasks = list.items });
 }
 
-/// Focus per day over the last `days` days, one series per task or per
-/// value of a provider field.
+/// Focus per day over the last `days` days, one series per task, per
+/// project (`@project`, a name no provider field can take) or per value of a
+/// provider field.
 fn chart(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     const day_count = try intParam(a, params, "days", 14, 90) orelse return badRequest(a, "days");
     const group = try param(a, params, "group") orelse "task";
+    if (std.mem.eql(u8, group, "@project")) return projectChart(app, a, day_count);
     const z = try loadZone(app, a);
     const today = dayIndex(try dateParam(app, a, null));
     var dates: std.ArrayList([]const u8) = .empty;
@@ -1014,6 +1307,35 @@ fn chart(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     return send(a, .ok, .{ .dates = dates.items, .series = list });
 }
 
+fn projectChart(app: *App, a: std.mem.Allocator, day_count: u32) !Response {
+    const z = try loadZone(app, a);
+    const today = dayIndex(try dateParam(app, a, null));
+    const Series = struct { project_id: ?i64, label: []const u8, total_ms: i64 = 0, ms: []i64 };
+    var dates: std.ArrayList([]const u8) = .empty;
+    var series: std.StringArrayHashMapUnmanaged(Series) = .empty;
+    for (0..day_count) |col| {
+        const date = try fromCivilDays(a, today - @as(i64, @intCast(day_count - 1 - col)));
+        try dates.append(a, date.text);
+        const bounds = try z.dayBounds(date.year, date.month, date.day);
+        for (try query.projectTotalsBetween(app.store, a, bounds.start_ms, bounds.end_ms, app.clock())) |t| {
+            const key = if (t.project_id) |id| try std.fmt.allocPrint(a, "#{d}", .{id}) else "unassigned";
+            const slot = try series.getOrPut(a, key);
+            if (!slot.found_existing) {
+                const ms = try a.alloc(i64, day_count);
+                @memset(ms, 0);
+                slot.value_ptr.* = .{ .project_id = t.project_id, .label = t.label, .ms = ms };
+            }
+            slot.value_ptr.ms[col] += t.focus_ms;
+            slot.value_ptr.total_ms += t.focus_ms;
+        }
+    }
+    const list = try a.dupe(Series, series.values());
+    std.mem.sort(Series, list, {}, struct {
+        fn lessThan(_: void, l: Series, r: Series) bool { return l.total_ms > r.total_ms; }
+    }.lessThan);
+    return send(a, .ok, .{ .dates = dates.items, .series = list });
+}
+
 // ---------------------------------------------------------------- day status
 
 /// One bound task with focus time on one listed day.
@@ -1041,6 +1363,8 @@ pub const StatusJob = struct {
     rows: []DayRow,
     items: []StatusItem,
     next: usize,
+    accept: ?[]const u8 = null,
+    accept_edit: ?i64 = null,
 
     fn advance(job: *StatusJob, from: usize) ?usize {
         var i = from;
@@ -1048,6 +1372,44 @@ pub const StatusJob = struct {
         return null;
     }
 };
+
+fn appendStatusDate(app: *App, a: std.mem.Allocator, z: *const zone.Zone, now: i64, session_mode: bool, date: Date, rows: *std.ArrayList(DayRow), items: *std.ArrayList(StatusItem)) !void {
+    const bounds = try z.dayBounds(date.year, date.month, date.day);
+    const numbers = try days.dayNumbers(app.store, a, bounds.start_ms, bounds.end_ms, now, try scheduleFor(app, a, bounds));
+    const row = rows.items.len;
+    try rows.append(a, .{ .date = date.text, .total_ms = numbers.total_ms, .paid_break_ms = numbers.paid_break_ms, .changed_after_posting = try query.changedAfterPosting(app.store, date.text) });
+    const instance = app.provider orelse return;
+    for (numbers.tasks) |t| {
+        if (t.focus_ms <= 0) continue;
+        const b = try query.binding(app.store, a, t.task_id) orelse continue;
+        if (!std.mem.eql(u8, b.instance, instance)) continue;
+        const posted = try query.postedOn(app.store, a, date.text, instance, b.ref, t.task_id);
+        const remaining = if (session_mode) try remainingFor(app, a, date, t.task_id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
+        const request = try std.json.Stringify.valueAlloc(a, .{
+            .day = date.text, .ref = b.ref, .day_over = now >= bounds.end_ms, .task_open = try query.taskOpen(app.store, t.task_id),
+            .total_focus_ms = if (session_mode) focusLength(remaining.pieces) else t.focus_ms,
+            .posted = if (session_mode) &.{} else posted,
+        }, .{});
+        try items.append(a, .{ .row = row, .request = request, .in_flight = try app.store.isBlocked(date.text, instance, b.ref, t.task_id), .confirmed = posted.len > 0 });
+    }
+}
+
+fn acceptChanged(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
+    const body = try parseBody(struct { date: ?[]const u8 = null }, a, raw) orelse return badRequest(a, "body");
+    const date = try dateParam(app, a, body.date);
+    const accept_edit = try query.dayEditedMs(app.store, date.text);
+    const z = try loadZone(app, a);
+    var rows: std.ArrayList(DayRow) = .empty;
+    var items: std.ArrayList(StatusItem) = .empty;
+    try appendStatusDate(app, a, &z, app.clock(), try sessionsMode(app), date, &rows, &items);
+    const job = try a.create(StatusJob);
+    job.* = .{ .rows = rows.items, .items = items.items, .next = 0, .accept = date.text, .accept_edit = accept_edit };
+    if (job.advance(0)) |first| {
+        job.next = first;
+        return .{ .status = .ok, .body = "", .followup = .{ .status = job } };
+    }
+    return finishStatus(app, a, job);
+}
 
 /// The last `count` days (work days with `weekends=0`), oldest first, each
 /// with its focus total and posting status. The status asks the provider's
@@ -1071,36 +1433,17 @@ fn dayList(app: *App, a: std.mem.Allocator, params: []const u8) !Response {
     const now = app.clock();
     var rows: std.ArrayList(DayRow) = .empty;
     var items: std.ArrayList(StatusItem) = .empty;
-    for (picked.items) |date| {
-        const bounds = try z.dayBounds(date.year, date.month, date.day);
-        const numbers = try days.dayNumbers(app.store, a, bounds.start_ms, bounds.end_ms, now, try scheduleFor(app, a, bounds));
-        const row = rows.items.len;
-        try rows.append(a, .{ .date = date.text, .total_ms = numbers.total_ms, .paid_break_ms = numbers.paid_break_ms, .changed_after_posting = try query.changedAfterPosting(app.store, date.text) });
-        const instance = app.provider orelse continue;
-        for (numbers.tasks) |t| {
-            if (t.focus_ms <= 0) continue;
-            const b = try query.binding(app.store, a, t.task_id) orelse continue;
-            if (!std.mem.eql(u8, b.instance, instance)) continue;
-            const posted = try query.postedOn(app.store, a, date.text, instance, b.ref);
-            const remaining = if (session_mode) try remainingFor(app, a, date, t.task_id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
-            const request = try std.json.Stringify.valueAlloc(a, .{
-                .day = date.text, .ref = b.ref, .day_over = now >= bounds.end_ms, .task_open = try query.taskOpen(app.store, t.task_id),
-                .total_focus_ms = if (session_mode) focusLength(remaining.pieces) else t.focus_ms,
-                .posted = if (session_mode) &.{} else posted,
-            }, .{});
-            try items.append(a, .{ .row = row, .request = request, .in_flight = try app.store.isBlocked(date.text, instance, b.ref), .confirmed = posted.len > 0 });
-        }
-    }
+    for (picked.items) |date| try appendStatusDate(app, a, &z, now, session_mode, date, &rows, &items);
     const job = try a.create(StatusJob);
     job.* = .{ .rows = rows.items, .items = items.items, .next = 0 };
     if (job.advance(0)) |first| {
         job.next = first;
         return .{ .status = .ok, .body = "", .followup = .{ .status = job } };
     }
-    return finishStatus(a, job);
+    return finishStatus(app, a, job);
 }
 
-fn finishStatus(a: std.mem.Allocator, job: *StatusJob) Response {
+fn finishStatus(app: *App, a: std.mem.Allocator, job: *StatusJob) !Response {
     for (job.rows, 0..) |*row, r| {
         var counted: usize = 0;
         var in_flight = false;
@@ -1138,6 +1481,11 @@ fn finishStatus(a: std.mem.Allocator, job: *StatusJob) Response {
         else
             "partial";
     }
+    if (job.accept) |date| {
+        if (!std.mem.eql(u8, job.rows[0].status, "changed") or job.accept_edit == null or !try app.store.acceptDayEdit(date, job.accept_edit.?))
+            return fail(a, .{ .status = .conflict, .code = "NotChanged", .message = "day is not changed after posting" });
+        return send(a, .ok, .{ .date = date, .accepted = true });
+    }
     return send(a, .ok, .{ .days = job.rows });
 }
 
@@ -1154,15 +1502,30 @@ fn idBetween(path: []const u8, prefix: []const u8, suffix: []const u8) ?i64 {
     return std.fmt.parseInt(i64, path[prefix.len .. path.len - suffix.len], 10) catch null;
 }
 
+fn noteText(a: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, input, "\r\n") == null) return input;
+    const output = try a.alloc(u8, input.len);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == '\r' and i + 1 < input.len and input[i + 1] == '\n') continue;
+        output[j] = input[i];
+        j += 1;
+    }
+    return output[0..j];
+}
+
 fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Response {
     if (is(req, .POST, path, "/api/intervals")) {
-        const body = try parseBody(struct { task: []const u8, role: []const u8 = "focus", start_ms: i64, end_ms: i64 }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { task: []const u8, role: []const u8 = "focus", start_ms: i64, end_ms: i64, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
         const role = std.meta.stringToEnum(store_mod.Role, body.role) orelse return badRequest(a, "role");
-        const id = switch (try resolveExisting(app, a, body.task)) {
-            .id => |id| id,
-            .response => |r| return r,
+        const choice = try projectChoice(a, req.body);
+        const id = switch (try query.resolve(app.store, a, body.task, try choiceScope(app, choice))) {
+            .found => |found| found,
+            .none => return error.UnknownTask,
+            .ambiguous => |list| return ambiguous(a, list),
         };
-        const interval = try app.store.addInterval(id, role, body.start_ms, body.end_ms, app.clock());
+        const interval = try app.store.addIntervalProject(id, role, body.start_ms, body.end_ms, choice, app.clock());
         return send(a, .created, .{ .interval = interval });
     }
     if (is(req, .POST, path, "/api/intervals/merge")) {
@@ -1171,11 +1534,35 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         try app.store.mergeIntervals(body.first.id, .{ .start_ms = body.first.start_ms, .end_ms = body.first.end_ms }, body.second.id, .{ .start_ms = body.second.start_ms, .end_ms = body.second.end_ms }, app.clock());
         return send(a, .ok, .{ .interval = body.first.id });
     }
+    if (is(req, .POST, path, "/api/intervals/selection")) {
+        const SourceBody = struct { id: i64, seen: SeenBody, ranges: []const [2]i64 };
+        const body = try parseBody(struct {
+            op: Store.SelectionOp,
+            task: ?i64 = null,
+            sources: []const SourceBody,
+            lost: ?Store.Lost = null,
+        }, a, req.body) orelse return badRequest(a, "body");
+        const raw = try parseBody(std.json.Value, a, req.body) orelse return badRequest(a, "body");
+        if (raw != .object) return badRequest(a, "body");
+        const has_task = raw.object.get("task") != null;
+        const has_lost = raw.object.get("lost") != null;
+        if ((body.op == .assign and (!has_task or has_lost)) or (body.op == .delete and has_task)) return badRequest(a, "body");
+        const sources = try a.alloc(Store.SelectionSource, body.sources.len);
+        for (body.sources, sources) |source, *target| {
+            const ranges = try a.alloc(Store.Part, source.ranges.len);
+            for (source.ranges, ranges) |range, *part| part.* = .{ .from = range[0], .to = range[1] };
+            target.* = .{ .id = source.id, .seen = seenOf(source.seen), .ranges = ranges };
+        }
+        const result = try app.store.applySelection(body.op, body.task, sources, body.lost, app.clock());
+        defer app.store.allocator.free(result.pieces);
+        return send(a, .ok, .{ .op = body.op, .pieces = result.pieces, .ms = result.ms });
+    }
     if (req.method == .POST) if (idBetween(path, "/api/tasks/", "/delete")) |id| {
         try app.store.deleteTask(id, app.clock());
         return send(a, .ok, .{ .deleted = id });
     };
     if (req.method == .POST) if (idBetween(path, "/api/intervals/", "/move")) |id| {
+        if (try projectChoice(a, req.body) == .selected) return fail(a, .{ .status = .conflict, .code = "AssignmentPreviewRequired" });
         const body = try parseBody(struct { seen: SeenBody, task: i64, from_ms: ?i64 = null, to_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
         const part: ?Store.Part = if (body.from_ms != null and body.to_ms != null) .{ .from = body.from_ms.?, .to = body.to_ms.? } else null;
         const moved = try app.store.moveInterval(id, seenOf(body.seen), body.task, part, app.clock());
@@ -1186,58 +1573,73 @@ fn history(app: *App, a: std.mem.Allocator, req: Request, path: []const u8) !?Re
         try app.store.deleteInterval(id, seenOf(body.seen), app.clock());
         return send(a, .ok, .{ .deleted = id });
     };
+    if (req.method == .POST) if (idBetween(path, "/api/intervals/", "/end-at-activity")) |id| {
+        const body = try parseBody(struct { seen: SeenBody }, a, req.body) orelse return badRequest(a, "body");
+        try app.store.endAtLastActivity(id, seenOf(body.seen), app.clock());
+        return send(a, .ok, .{ .interval = id });
+    };
+    if (req.method == .POST) if (idBetween(path, "/api/intervals/", "/take-focus")) |id| {
+        const body = try parseBody(struct { seen: SeenBody }, a, req.body) orelse return badRequest(a, "body");
+        try app.store.takeFocus(id, seenOf(body.seen), app.clock());
+        return send(a, .ok, .{ .interval = id });
+    };
     if (req.method == .PATCH) if (idBetween(path, "/api/intervals/", "")) |id| {
-        const body = try parseBody(struct { seen: SeenBody, start_ms: i64, end_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const body = try parseBody(struct { seen: SeenBody, start_ms: i64, end_ms: ?i64 = null, snapshot: ?store_mod.AssignmentSnapshot = null, project_id: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
+        const choice = try projectChoice(a, req.body);
+        if (choice == .selected) {
+            const snapshot = body.snapshot orelse return fail(a, .{ .status = .conflict, .code = "AssignmentPreviewRequired" });
+            if (snapshot.intervals.len != 1 or snapshot.intervals[0].id != id or snapshot.project_id != choice.selected) return error.Stale;
+            try app.store.editIntervalProject(id, seenOf(body.seen), body.start_ms, body.end_ms, snapshot, app.clock());
+            return send(a, .ok, .{ .interval = id });
+        }
         try app.store.editInterval(id, seenOf(body.seen), body.start_ms, body.end_ms, app.clock());
         return send(a, .ok, .{ .interval = id });
     };
+    if (is(req, .POST, path, "/api/notes/star")) {
+        const body = try parseBody(struct { ids: []const i64, starred: bool }, a, req.body) orelse return badRequest(a, "body");
+        if (body.ids.len > 500) return badRequest(a, "ids");
+        try app.store.starNotes(body.ids, body.starred, app.clock());
+        return send(a, .ok, .{ .updated = body.ids.len, .starred = body.starred });
+    }
+    if (is(req, .POST, path, "/api/notes/delete")) {
+        const body = try parseBody(struct { ids: []const i64 }, a, req.body) orelse return badRequest(a, "body");
+        if (body.ids.len > 500) return badRequest(a, "ids");
+        try app.store.deleteNotes(body.ids, app.clock());
+        return send(a, .ok, .{ .deleted = body.ids.len });
+    }
     if (req.method == .POST) if (idBetween(path, "/api/notes/", "/delete")) |id| {
         try app.store.deleteNote(id, app.clock());
         return send(a, .ok, .{ .deleted = id });
     };
     if (req.method == .PATCH) if (idBetween(path, "/api/notes/", "")) |id| {
-        const body = try parseBody(struct { text: []const u8, at_ms: ?i64 = null }, a, req.body) orelse return badRequest(a, "body");
-        try app.store.editNote(id, std.mem.trim(u8, body.text, " \t\r\n"), body.at_ms, app.clock());
+        const body = try parseBody(struct { text: ?[]const u8 = null, at_ms: ?i64 = null, starred: ?bool = null }, a, req.body) orelse return badRequest(a, "body");
+        if (body.text == null and body.starred == null) return badRequest(a, "body");
+        const text = if (body.text) |input| blk: {
+            if (input.len > 2000) return badRequest(a, "text");
+            break :blk if (std.mem.trim(u8, input, " \t\r\n").len == 0) "" else try noteText(a, input);
+        } else null;
+        try app.store.updateNote(id, text, body.at_ms, body.starred, app.clock());
         return send(a, .ok, .{ .note = id });
     };
     return null;
 }
 
-const ui_flags = [_][]const u8{ "ui_hide_weekends", "ui_show_keys", "ui_show_add_entry", "ui_chart_visible", "ui_left_collapsed", "ui_autofill_obs", "ui_links", "ui_tour_offered", "ui_single_keys", "ui_open_on_launch", "post_sessions" };
-
-/// Dashboard preferences: checked here, since the store does not know them.
+/// A value's own rule from settings.zig, then the checks that need the
+/// provider or a parser; the store checks the rest.
 fn validUi(app: *const App, key: []const u8, value: ?[]const u8) bool {
     const v = value orelse return true;
-    if (providerSetting(app, key)) |s| return validProviderValue(s, v);
-    for (ui_flags) |f| if (std.mem.eql(u8, key, f)) return std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "1");
-    const Choice = struct { key: []const u8, values: []const []const u8 };
-    const choices = [_]Choice{
-        .{ .key = "ui_day_order", .values = &.{ "oldest", "newest" } },
-        .{ .key = "ui_lang", .values = &.{ "en", "pt", "ja" } },
-        .{ .key = "ui_summary_format", .values = &.{ "grouped", "chronological" } },
-        .{ .key = "ui_time_format", .values = &.{ "system", "24", "12" } },
-        .{ .key = "ui_chart_view", .values = &.{ "bars", "lanes" } },
-    };
-    for (choices) |c| if (std.mem.eql(u8, key, c.key)) {
-        for (c.values) |allowed| if (std.mem.eql(u8, v, allowed)) return true;
+    if (std.mem.eql(u8, key, "project_provider_field")) {
+        if (v.len == 0) return true;
+        if (v.len > 200) return false;
+        for (app.declared_fields) |name| if (std.mem.eql(u8, v, name)) return true;
         return false;
-    };
+    }
+    if (providerSetting(app, key)) |s| return validProviderValue(s, v);
+    if (settings_decl.find(key)) |d| if (!settings_decl.valid(d, v)) return false;
     if (std.mem.eql(u8, key, "paid_breaks")) {
         var buffer: [2048]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buffer);
         return (parsePaidBreaks(fba.allocator(), v) catch return false) != null;
-    }
-    // Provider fields kept off the chart tabs, as a JSON list of names.
-    if (std.mem.eql(u8, key, "ui_chart_hidden")) {
-        if (v.len > 1024) return false;
-        var buffer: [4096]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buffer);
-        _ = std.json.parseFromSliceLeaky([]const []const u8, fba.allocator(), v, .{}) catch return false;
-        return true;
-    }
-    if (std.mem.eql(u8, key, "ui_sidebar_days") or std.mem.eql(u8, key, "ui_chart_days")) {
-        const n = std.fmt.parseInt(u16, v, 10) catch return false;
-        return n >= 1 and n <= 90;
     }
     return true;
 }
@@ -1251,6 +1653,9 @@ fn bindTask(app: *App, a: std.mem.Allocator, id: i64, raw: []const u8) !Response
     if (ref.len == 0) return badRequest(a, "ref");
     _ = try query.task(app.store, a, id) orelse return error.UnknownTask;
     if (try app.store.taskByBinding(instance, ref)) |bound| if (bound != id) return error.BindingConflict;
+    // A new ref waits for the task's unresolved postings, which keep the old one.
+    if (try app.store.hasUnresolvedPosting(id)) if (try query.binding(app.store, a, id)) |b|
+        if (!std.mem.eql(u8, b.instance, instance) or !std.mem.eql(u8, b.ref, ref)) return error.PostingInFlight;
     return .{ .status = .ok, .body = "", .followup = .{ .lookup = .{ .task = id, .ref = try a.dupe(u8, ref) } } };
 }
 
@@ -1279,12 +1684,20 @@ fn remainingFor(app: *App, a: std.mem.Allocator, date: Date, task: i64, instance
     const z = try loadZone(app, a);
     const bounds = try z.dayBounds(date.year, date.month, date.day);
     const focus = try query.focusOnDay(app.store, a, task, bounds.start_ms, bounds.end_ms);
-    const coverage = try query.coverageOn(app.store, a, date.text, instance, ref);
-    const focus_spans = try a.alloc(sessions.Span, focus.spans.len);
-    for (focus.spans, 0..) |span, i| focus_spans[i] = .{ .start_ms = span.start_ms, .end_ms = span.end_ms };
+    const coverage = try query.coverageOn(app.store, a, date.text, instance, ref, task);
+    var focus_spans: std.ArrayList(sessions.Span) = .empty;
+    var prior_span: ?i64 = null;
+    for (focus.spans) |span| {
+        if (span.posting_span_id != null and span.posting_span_id == prior_span and focus_spans.items.len > 0 and focus_spans.items[focus_spans.items.len - 1].end_ms == span.start_ms) {
+            focus_spans.items[focus_spans.items.len - 1].end_ms = span.end_ms;
+        } else {
+            try focus_spans.append(a, .{ .start_ms = span.start_ms, .end_ms = span.end_ms });
+        }
+        prior_span = span.posting_span_id;
+    }
     const covered_spans = try a.alloc(sessions.Span, coverage.len);
     for (coverage, 0..) |span, i| covered_spans[i] = .{ .start_ms = span.start_ms, .end_ms = span.end_ms };
-    const pieces = try sessions.remaining(a, &z, bounds.start_ms, bounds.end_ms, focus_spans, covered_spans);
+    const pieces = try sessions.remaining(a, &z, bounds.start_ms, bounds.end_ms, focus_spans.items, covered_spans);
     return .{ .pieces = pieces, .open_session = focus.open_session };
 }
 
@@ -1318,14 +1731,14 @@ fn chainSuccess(app: *App, a: std.mem.Allocator, chain: *SessionChain) !Response
 fn nextSessionQuote(app: *App, a: std.mem.Allocator, chain: *SessionChain) !?Response {
     if (chain.confirmed.items.len >= chain.limit) return null;
     const date = try dateParam(app, a, chain.day);
-    if (try app.store.isBlocked(chain.day, app.provider.?, chain.ref))
+    if (try app.store.isBlocked(chain.day, app.provider.?, chain.ref, chain.task))
         return try postingError(a, chain, .conflict, "PostingBlocked", "");
-    if (try query.hasTotalPosting(app.store, chain.day, app.provider.?, chain.ref))
+    if (try query.hasTotalPosting(app.store, chain.day, app.provider.?, chain.ref, chain.task))
         return try postingError(a, chain, .conflict, "PostedAsTotal", "this day was posted as a total; turn off posting by session to post the rest");
     const remaining = try remainingFor(app, a, date, chain.task, app.provider.?, chain.ref);
     if (remaining.pieces.len == 0) return null;
     const piece = remaining.pieces[0];
-    const fingerprint = try query.postedFingerprint(app.store, a, chain.day, app.provider.?, chain.ref);
+    const fingerprint = try query.postedFingerprint(app.store, a, chain.day, app.provider.?, chain.ref, chain.task);
     const request = try std.json.Stringify.valueAlloc(a, .{
         .day = chain.day, .ref = chain.ref, .day_over = chain.day_over,
         .task_open = try query.taskOpen(app.store, chain.task),
@@ -1354,9 +1767,9 @@ fn offers(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
     for (try focusOn(app, a, date)) |t| {
         const b = try query.binding(app.store, a, t.task_id);
         const mine = if (b) |v| app.provider != null and std.mem.eql(u8, v.instance, app.provider.?) else false;
-        const blocked = if (mine) try app.store.isBlocked(date.text, b.?.instance, b.?.ref) else false;
+        const blocked = if (mine) try app.store.isBlocked(date.text, b.?.instance, b.?.ref, t.task_id) else false;
         const remaining = if (mode and mine) try remainingFor(app, a, date, t.task_id, b.?.instance, b.?.ref) else Remaining{ .pieces = &.{}, .open_session = false };
-        const total = if (mode and mine) try query.hasTotalPosting(app.store, date.text, b.?.instance, b.?.ref) else false;
+        const total = if (mode and mine) try query.hasTotalPosting(app.store, date.text, b.?.instance, b.?.ref, t.task_id) else false;
         try list.append(a, .{
             .task = (try query.task(app.store, a, t.task_id)).?,
             .ref = if (mine) b.?.ref else null,
@@ -1369,7 +1782,7 @@ fn offers(app: *App, a: std.mem.Allocator, text: ?[]const u8) !Response {
             .open_session = remaining.open_session,
         });
     }
-    return send(a, .ok, .{ .date = date.text, .instance = app.provider, .sessions_mode = mode, .offers = list.items });
+    return send(a, .ok, .{ .date = date.text, .instance = app.provider, .sessions_mode = mode, .changed_after_posting = try query.changedAfterPosting(app.store, date.text), .offers = list.items });
 }
 
 fn startPosting(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
@@ -1386,9 +1799,9 @@ fn startPosting(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
     const b = try query.binding(app.store, a, id) orelse return error.NotBound;
     if (!std.mem.eql(u8, b.instance, instance)) return error.NotBound;
     const date = try dateParam(app, a, body.date);
-    if (try app.store.isBlocked(date.text, instance, b.ref)) return error.PostingBlocked;
+    if (try app.store.isBlocked(date.text, instance, b.ref, id)) return error.PostingBlocked;
     const mode = try sessionsMode(app);
-    if (mode and try query.hasTotalPosting(app.store, date.text, instance, b.ref))
+    if (mode and try query.hasTotalPosting(app.store, date.text, instance, b.ref, id))
         return fail(a, .{ .status = .conflict, .code = "PostedAsTotal", .message = "this day was posted as a total; turn off posting by session to post the rest" });
     const remaining = if (mode) try remainingFor(app, a, date, id, instance, b.ref) else Remaining{ .pieces = &.{}, .open_session = false };
     if (mode and remaining.pieces.len == 0) {
@@ -1404,8 +1817,8 @@ fn startPosting(app: *App, a: std.mem.Allocator, raw: []const u8) !Response {
     const bounds = try z.dayBounds(date.year, date.month, date.day);
     const day_over = app.clock() >= bounds.end_ms;
     const task_open = try query.taskOpen(app.store, id);
-    const posted = if (mode) &.{} else try query.postedOn(app.store, a, date.text, instance, b.ref);
-    const fingerprint = try query.postedFingerprint(app.store, a, date.text, instance, b.ref);
+    const posted = if (mode) &.{} else try query.postedOn(app.store, a, date.text, instance, b.ref, id);
+    const fingerprint = try query.postedFingerprint(app.store, a, date.text, instance, b.ref, id);
     const request = try std.json.Stringify.valueAlloc(a, .{
         .day = date.text, .ref = b.ref, .day_over = day_over, .task_open = task_open,
         .total_focus_ms = if (mode) (if (body.dry_run) focusLength(remaining.pieces) else remaining.pieces[0].end_ms - remaining.pieces[0].start_ms) else focus_ms, .posted = posted,
@@ -1511,6 +1924,34 @@ fn acceptedOutput(a: std.mem.Allocator, out: []const u8) !Accepted {
     return accepted;
 }
 
+fn switchReply(app: *App, a: std.mem.Allocator, interval: i64, task: i64, created: bool) !Response {
+    return send(a, .ok, .{ .interval = interval, .task = (try query.task(app.store, a, task)).?, .created = created });
+}
+
+fn numericRef(text: []const u8) bool {
+    for (text) |ch| if (ch < '0' or ch > '9') return false;
+    return text.len > 0;
+}
+
+fn bindLookup(app: *App, a: std.mem.Allocator, task: i64, ref: []const u8, outcome: worker.Outcome) void {
+    const instance = app.provider orelse return;
+    if (succeeded(outcome)) {
+        const Found = struct { title: ?[]const u8 = null, fields: std.json.ArrayHashMap([]const u8) = .{} };
+        if (std.json.parseFromSliceLeaky(Found, a, outcome.done.out, .{ .ignore_unknown_fields = true })) |found| {
+            var values: std.ArrayList(Store.FieldValue) = .empty;
+            var it = found.fields.map.iterator();
+            while (it.next()) |e| values.append(a, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch {
+                app.store.bind(task, instance, ref, app.clock()) catch {};
+                return;
+            };
+            app.store.bindWithLookup(task, instance, ref, found.title, values.items, app.clock()) catch {};
+            return;
+        } else |_| {}
+    }
+    // Capture or the switch has committed. Keep its reply even when lookup or binding fails.
+    app.store.bind(task, instance, ref, app.clock()) catch {};
+}
+
 fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Outcome) !Response {
     switch (f) {
         .login_prompts => {
@@ -1526,9 +1967,18 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
         .fields => {
             if (!succeeded(outcome)) return providerFailure(a, outcome, null);
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, outcome.done.out, .{}) catch return error.ProviderOutput;
+            try app.loadDeclaredFields(outcome.done.out);
             return send(a, .ok, .{ .instance = app.provider, .fields = parsed, .settings = app.traits.settings, .post_options = app.traits.post_options, .sessions = app.traits.sessions, .not_signed_in_code = app.traits.not_signed_in_code, .status = app.provider_status });
         },
         .lookup => |l| {
+            if (l.capture) |result| {
+                if (l.task) |task| bindLookup(app, a, task, l.ref, outcome);
+                return captureReply(a, result);
+            }
+            if (l.switched) |interval| {
+                bindLookup(app, a, l.task.?, l.ref, outcome);
+                return switchReply(app, a, interval, l.task.?, true);
+            }
             if (!succeeded(outcome)) {
                 const task = l.task orelse return providerFailure(a, outcome, null);
                 // A bind keeps the ref even when the provider cannot confirm it
@@ -1542,7 +1992,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
             var values: std.ArrayList(Store.FieldValue) = .empty;
             var it = found.fields.map.iterator();
             while (it.next()) |e| try values.append(a, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
-            try app.store.bindWithFields(task, app.provider.?, l.ref, values.items, app.clock());
+            try app.store.bindWithLookup(task, app.provider.?, l.ref, found.title, values.items, app.clock());
             return send(a, .ok, .{ .task = (try query.task(app.store, a, task)).?, .remote_title = found.title, .fields = try query.fields(app.store, a, task) });
         },
         .quote => |r| {
@@ -1555,7 +2005,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
             const binding = try query.binding(app.store, a, r.task) orelse return error.NotBound;
             if (!std.mem.eql(u8, binding.instance, instance) or !std.mem.eql(u8, binding.ref, r.ref))
                 return postingError(a, r.chain, .conflict, "QuoteStale", "postings changed while quoting; try again");
-            const fingerprint = try query.postedFingerprint(app.store, a, r.day, instance, r.ref);
+            const fingerprint = try query.postedFingerprint(app.store, a, r.day, instance, r.ref, r.task);
             if (fingerprint.in_flight or !std.mem.eql(u8, fingerprint.text, r.fingerprint))
                 return postingError(a, r.chain, .conflict, "QuoteStale", "postings changed while quoting; try again");
             // A dry run shows what a post would send and stops there.
@@ -1563,9 +2013,9 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
                 if (r.all_sessions) |all| return send(a, .ok, .{ .day = r.day, .task = r.task, .ref = r.ref, .amount_text = quoted.amount_text, .amount_micro = quoted.amount_micro, .sessions = all });
                 return send(a, .ok, .{ .day = r.day, .task = r.task, .ref = r.ref, .amount_text = quoted.amount_text, .amount_micro = quoted.amount_micro });
             }
-            if (r.session != null and try query.hasTotalPosting(app.store, r.day, instance, r.ref))
+            if (r.session != null and try query.hasTotalPosting(app.store, r.day, instance, r.ref, r.task))
                 return postingError(a, r.chain, .conflict, "PostedAsTotal", "this day was posted as a total; turn off posting by session to post the rest");
-            if (try app.store.isBlocked(r.day, instance, r.ref)) {
+            if (try app.store.isBlocked(r.day, instance, r.ref, r.task)) {
                 if (r.chain != null) return postingError(a, r.chain, .conflict, "PostingBlocked", "");
                 return error.PostingBlocked;
             }
@@ -1609,7 +2059,7 @@ fn proceedInner(app: *App, a: std.mem.Allocator, f: Followup, outcome: worker.Ou
                 job.next = next;
                 return .{ .status = .ok, .body = "", .followup = .{ .status = job } };
             }
-            return finishStatus(a, job);
+            return finishStatus(app, a, job);
         },
         .post => |p| {
             const now = app.clock();
@@ -1692,6 +2142,10 @@ const Fixture = struct {
 
     fn init(f: *Fixture) !void {
         try f.db.open(":memory:");
+        try f.initOpened();
+    }
+
+    fn initOpened(f: *Fixture) !void {
         f.store = try Store.init(&f.db, std.testing.allocator);
         try f.store.setSetting("reporting_zone", "UTC", 0);
         f.app = .{ .store = &f.store, .port = 47100, .clock = testClock, .running_post = worker.runningPost };
@@ -1700,6 +2154,7 @@ const Fixture = struct {
     }
 
     fn deinit(f: *Fixture) void {
+        f.app.clearDeclaredFields();
         f.arena.deinit();
         f.db.close();
     }
@@ -1756,6 +2211,146 @@ const Fixture = struct {
     }
 };
 
+const DayListTimes = struct {
+    bounds: i96 = 0,
+    schedule: i96 = 0,
+    numbers: i96 = 0,
+    changed: i96 = 0,
+    binding: i96 = 0,
+    posted: i96 = 0,
+    remaining: i96 = 0,
+    task_open: i96 = 0,
+    blocked: i96 = 0,
+};
+
+fn benchNow() i96 {
+    return std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+}
+
+fn benchMs(ns: i96) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000;
+}
+
+test "day list synthetic 60 day timing" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const day_ms: i64 = 86_400_000;
+    const today_start: i64 = 1_773_100_800_000; // 2026-03-10T00:00Z
+    test_now = today_start + 23 * 3_600_000;
+    f.app.provider = "fake";
+    f.app.traits.sessions = true;
+    try f.store.setSetting("post_sessions", "1", test_now);
+    var task_ids: [50]i64 = undefined;
+    for (&task_ids, 0..) |*id, i| {
+        const title = try std.fmt.allocPrint(a, "Synthetic task {d}", .{i});
+        id.* = try f.store.createTask(title, test_now);
+        if (i < 25) {
+            const ref = try std.fmt.allocPrint(a, "ref-{d}", .{id.*});
+            try f.store.bind(id.*, "fake", ref, test_now);
+        }
+        if (i % 3 == 0) try f.store.setField(id.*, "category", "synthetic", test_now);
+    }
+    var interval = try f.db.prepare("INSERT INTO intervals(id,task_id,role,start_ms,end_ms,opened_by,closed_by) VALUES(?1,?2,'focus',?3,?4,'switch','stop')");
+    defer interval.finalize();
+    var note = try f.db.prepare("INSERT INTO notes(interval_id,at_ms,text) VALUES(?1,?2,'synthetic note')");
+    defer note.finalize();
+    var edit = try f.db.prepare("INSERT INTO day_edits(day,edited_ms) VALUES(?1,?2)");
+    defer edit.finalize();
+    var posting = try f.db.prepare("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms,covered_start_ms,covered_end_ms) VALUES(?1,?2,'fake',?3,'confirmed','0.25',250000,?4,?4,?5,?6)");
+    defer posting.finalize();
+    const today_index = dayIndex(try dateParam(&f.app, a, null));
+    var tx = try f.db.transaction();
+    defer tx.deinit();
+    for (0..60) |d| {
+        const start = today_start - @as(i64, @intCast(59 - d)) * day_ms;
+        const date = try fromCivilDays(a, today_index - @as(i64, @intCast(59 - d)));
+        for (0..30) |i| {
+            const id: i64 = @intCast(d * 30 + i + 1);
+            const at = start + 8 * 3_600_000 + @as(i64, @intCast(i)) * 20 * 60_000;
+            try interval.bindI64(1, id);
+            try interval.bindI64(2, task_ids[(d * 7 + i * 11) % task_ids.len]);
+            try interval.bindI64(3, at);
+            try interval.bindI64(4, at + 18 * 60_000);
+            try std.testing.expectEqual(sqlite.Statement.Step.done, try interval.step());
+            try interval.reset();
+            for (0..(if (i < 10) @as(usize, 2) else 1)) |n| {
+                try note.bindI64(1, id);
+                try note.bindI64(2, at + @as(i64, @intCast(n + 1)) * 60_000);
+                try std.testing.expectEqual(sqlite.Statement.Step.done, try note.step());
+                try note.reset();
+            }
+        }
+        try edit.bindText(1, date.text);
+        try edit.bindI64(2, start + 20 * 3_600_000);
+        try std.testing.expectEqual(sqlite.Statement.Step.done, try edit.step());
+        try edit.reset();
+        if (d % 3 == 0) {
+            const task = task_ids[d % 25];
+            const ref = try std.fmt.allocPrint(a, "ref-{d}", .{task});
+            try posting.bindText(1, date.text);
+            try posting.bindI64(2, task);
+            try posting.bindText(3, ref);
+            try posting.bindI64(4, start + 19 * 3_600_000);
+            try posting.bindI64(5, start + 8 * 3_600_000);
+            try posting.bindI64(6, start + 8 * 3_600_000 + 15 * 60_000);
+            try std.testing.expectEqual(sqlite.Statement.Step.done, try posting.step());
+            try posting.reset();
+        }
+    }
+    try tx.commit();
+
+    const started = benchNow();
+    const response = try dayList(&f.app, a, "count=8&weekends=1");
+    const elapsed = benchNow() - started;
+    try std.testing.expectEqual(std.http.Status.ok, response.status);
+    try std.testing.expect(response.followup != null and response.followup.? == .status);
+
+    var times: DayListTimes = .{};
+    const z = try loadZone(&f.app, a);
+    for (0..8) |offset| {
+        const date = try fromCivilDays(a, today_index - @as(i64, @intCast(7 - offset)));
+        var mark = benchNow();
+        const bounds = try z.dayBounds(date.year, date.month, date.day);
+        times.bounds += benchNow() - mark;
+        mark = benchNow();
+        const schedule = try scheduleFor(&f.app, a, bounds);
+        times.schedule += benchNow() - mark;
+        mark = benchNow();
+        const numbers = try days.dayNumbers(&f.store, a, bounds.start_ms, bounds.end_ms, test_now, schedule);
+        times.numbers += benchNow() - mark;
+        mark = benchNow();
+        _ = try query.changedAfterPosting(&f.store, date.text);
+        times.changed += benchNow() - mark;
+        for (numbers.tasks) |t| {
+            if (t.focus_ms <= 0) continue;
+            mark = benchNow();
+            const b = try query.binding(&f.store, a, t.task_id) orelse {
+                times.binding += benchNow() - mark;
+                continue;
+            };
+            times.binding += benchNow() - mark;
+            if (!std.mem.eql(u8, b.instance, f.app.provider.?)) continue;
+            mark = benchNow();
+            _ = try query.postedOn(&f.store, a, date.text, b.instance, b.ref, t.task_id);
+            times.posted += benchNow() - mark;
+            mark = benchNow();
+            _ = try remainingFor(&f.app, a, date, t.task_id, b.instance, b.ref);
+            times.remaining += benchNow() - mark;
+            mark = benchNow();
+            _ = try query.taskOpen(&f.store, t.task_id);
+            times.task_open += benchNow() - mark;
+            mark = benchNow();
+            _ = try f.store.isBlocked(date.text, b.instance, b.ref, t.task_id);
+            times.blocked += benchNow() - mark;
+        }
+    }
+    std.debug.print("dayList 8 days: {d:.3} ms; bounds {d:.3}, scheduleFor {d:.3}, dayNumbers {d:.3}, changedAfterPosting {d:.3}, binding {d:.3}, postedOn {d:.3}, remainingFor {d:.3}, taskOpen {d:.3}, isBlocked {d:.3} ms\n", .{
+        benchMs(elapsed), benchMs(times.bounds), benchMs(times.schedule), benchMs(times.numbers), benchMs(times.changed), benchMs(times.binding), benchMs(times.posted), benchMs(times.remaining), benchMs(times.task_open), benchMs(times.blocked),
+    });
+}
+
 test "requests need loopback host, marker and same origin" {
     var f: Fixture = .{};
     try f.init();
@@ -1774,6 +2369,55 @@ test "requests need loopback host, marker and same origin" {
     try std.testing.expectEqual(std.http.Status.method_not_allowed, handle(&f.app, a, .{ .method = .PUT, .target = "/api/pause", .host = "127.0.0.1:47100", .marker = true }).status);
     // GET never changes anything: a mutation route under GET is not found.
     try std.testing.expectEqual(std.http.Status.not_found, f.call(.GET, "/api/pause", "").status);
+}
+
+test "health reports the open database" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.db_path = try std.fs.path.resolve(f.arena.allocator(), &.{"scratch/work.db"});
+    const reply = f.call(.GET, "/api/health", "");
+    try std.testing.expectEqual(std.http.Status.ok, reply.status);
+    const health = try std.json.parseFromSliceLeaky(struct { ok: bool, db: []const u8 }, f.arena.allocator(), reply.body, .{});
+    try std.testing.expect(health.ok);
+    try std.testing.expectEqualStrings(f.app.db_path, health.db);
+}
+
+test "capture origins allow only listed extensions to post captures" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var req: Request = .{
+        .method = .POST,
+        .target = "/api/capture",
+        .host = "127.0.0.1:47100",
+        .origin = "chrome-extension://abc",
+        .marker = true,
+        .body = "{\"source\":\"browser\",\"run\":\"r1\",\"event\":\"e1\",\"kind\":\"prompt\",\"default_subject\":\"work\"}",
+    };
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_origins\":\"chrome-extension://abc\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, req).status);
+    req.host = "evil.test:47100";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.host = "127.0.0.1:47100";
+    req.target = "/api/pause";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.target = "/api/capture";
+    req.origin = "chrome-extension://abd";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.origin = "chrome-extension://ABC";
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+    req.origin = "chrome-extension://abc";
+    req.marker = false;
+    try std.testing.expectEqual(std.http.Status.forbidden, handle(&f.app, a, req).status);
+
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"capture_origins\":\"https://evil.test\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_origins\":\"chrome-extension://abc, moz-extension://x-1\"}").status);
+    req.marker = true;
+    req.origin = "moz-extension://x-1";
+    try std.testing.expectEqual(std.http.Status.ok, handle(&f.app, a, req).status);
 }
 
 test "switch creates, resolves and runs parallel work with targeted notes" {
@@ -1823,6 +2467,64 @@ test "switch creates, resolves and runs parallel work with targeted notes" {
     try std.testing.expectEqual(std.http.Status.ok, r.status);
 }
 
+test "state reports active capture runs by activity" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = try f.store.createTask("Captured", test_now);
+    try f.db.exec("INSERT INTO capture_runs(source,run,task_id,attended,working,lease_until_ms,started_ms) VALUES ('test','working',1,1,1,1773100600000,1773100000000),('test','quiet',1,1,1,1773100600000,1773100000000),('test','idle',1,1,0,1773100600000,1773100000000),('test','ended',1,1,0,1773100600000,1773100000000),('test','expired',1,1,1,1773099999999,1773100000000)");
+    try f.db.exec("UPDATE capture_runs SET idle_since_ms=1773100000000 WHERE run='idle'; UPDATE capture_runs SET ended_ms=1773100000000 WHERE run='ended'; INSERT INTO capture_events(source,event,run,kind,at_ms) VALUES ('test','w','working','prompt',1773099999000),('test','q','quiet','prompt',1773099400000),('test','i','idle','stop',1773099900000)");
+    const State = struct { capture: struct { runs: []query.CaptureRun } };
+    const state_data = try f.get(State, "/api/state");
+    try std.testing.expectEqual(@as(usize, 3), state_data.capture.runs.len);
+    var working = false;
+    var quiet = false;
+    var idle = false;
+    for (state_data.capture.runs) |run| {
+        try std.testing.expectEqualStrings("Captured", run.task.?.title);
+        if (std.mem.eql(u8, run.run, "working")) working = std.mem.eql(u8, run.state, "working");
+        if (std.mem.eql(u8, run.run, "quiet")) quiet = std.mem.eql(u8, run.state, "quiet");
+        if (std.mem.eql(u8, run.run, "idle")) idle = std.mem.eql(u8, run.state, "idle");
+    }
+    try std.testing.expect(working and quiet and idle);
+}
+
+test "state answers after upgrading an early v7 capture database" {
+    var f: Fixture = .{};
+    try f.db.open(":memory:");
+    try @import("schema.zig").testV7CaptureFixture(&f.db);
+    try f.initOpened();
+    defer f.deinit();
+    const State = struct { capture: struct { runs: []query.CaptureRun } };
+    const state_data = try f.get(State, "/api/state");
+    try std.testing.expectEqual(@as(usize, 1), state_data.capture.runs.len);
+    try std.testing.expectEqualStrings("run", state_data.capture.runs[0].run);
+    try std.testing.expectEqualStrings("Session", state_data.capture.runs[0].task.?.title);
+}
+
+test "SQLite API failure logs the path and SQLite message" {
+    const Probe = struct {
+        var path: []const u8 = "";
+        var message: []const u8 = "";
+        fn record(request_path: []const u8, sqlite_message: []const u8) void {
+            path = request_path;
+            message = sqlite_message;
+        }
+    };
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    Probe.path = "";
+    Probe.message = "";
+    f.app.on_sqlite_error = Probe.record;
+    try f.db.exec("ALTER TABLE capture_runs DROP COLUMN idle_since_ms");
+    const response = f.call(.GET, "/api/state?probe=1", "");
+    try std.testing.expectEqual(std.http.Status.internal_server_error, response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"Sqlite\",\"message\":\"\",\"candidates\":null}", response.body);
+    try std.testing.expectEqualStrings("/api/state", Probe.path);
+    try std.testing.expect(std.mem.indexOf(u8, Probe.message, "idle_since_ms") != null);
+}
+
 test "a task is deleted unless it is running" {
     var f: Fixture = .{};
     try f.init();
@@ -1833,6 +2535,108 @@ test "a task is deleted unless it is running" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/delete", "").status);
     try std.testing.expectEqual(std.http.Status.not_found, f.call(.GET, "/api/tasks/1", "").status);
     try std.testing.expectEqual(std.http.Status.not_found, f.call(.POST, "/api/tasks/1/delete", "").status);
+}
+
+test "task title can change only without a binding" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Original\"}");
+    const renamed = f.call(.PATCH, "/api/tasks/1", "{\"title\":\"  Corrected  \"}");
+    try std.testing.expectEqual(std.http.Status.ok, renamed.status);
+    try std.testing.expect(contains(renamed.body, "\"title\":\"Corrected\""));
+    try f.store.bind(1, "test", "R-1", test_now);
+    const bound = f.call(.PATCH, "/api/tasks/1", "{\"title\":\"Changed\"}");
+    try std.testing.expectEqual(std.http.Status.conflict, bound.status);
+    try std.testing.expect(contains(bound.body, "TaskBound"));
+    try std.testing.expect(contains(bound.body, "title comes from the provider"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND title='Corrected'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/tasks/1", "{\"project_id\":null}").status);
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Other\"}");
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/tasks/2", "{\"title\":\"  \"}").status);
+}
+
+test "task project patch fills only unassigned closed intervals" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const one = try f.store.createProject("One", test_now);
+    const two = try f.store.createProject("Two", test_now);
+    const task_id = try f.store.createTask("Task", test_now);
+    _ = try f.store.addIntervalProject(task_id, .focus, test_now - 120_000, test_now - 100_000, .{ .selected = null }, test_now);
+    _ = try f.store.addIntervalProject(task_id, .focus, test_now - 80_000, test_now - 60_000, .{ .selected = two }, test_now);
+    _ = try f.store.switchToProject(task_id, null, .{ .selected = null }, test_now);
+    const patched = f.call(.PATCH, "/api/tasks/1", "{\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, patched.status);
+    try std.testing.expect(contains(patched.body, "\"changed\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND project_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=1 AND end_ms IS NOT NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id IS NULL AND end_ms IS NULL"));
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.PATCH, "/api/tasks/1", "{\"project_id\":999}").status);
+    try std.testing.expectEqual(one, try apiScalar(&f.db, "SELECT project_id FROM tasks WHERE id=1"));
+}
+
+test "task project patch refuses posted time atomically" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = try f.store.createProject("One", test_now);
+    const task_id = try f.store.createTask("Task", test_now);
+    const start = test_now - 120_000;
+    const end = test_now - 60_000;
+    _ = try f.store.addIntervalProject(task_id, .focus, start, end, .{ .selected = null }, test_now);
+    var posted = try f.db.prepare("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,covered_start_ms,covered_end_ms) VALUES('2026-03-09',1,'example','R','confirmed','1',1000000,?1,?2,?3)");
+    defer posted.finalize();
+    try posted.bindI64(1, test_now);
+    try posted.bindI64(2, start);
+    try posted.bindI64(3, end);
+    _ = try posted.step();
+    const a = f.arena.allocator();
+    const preview = f.call(.POST, "/api/projects/assign/preview", "{\"scope\":{\"interval_ids\":[1]},\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, preview.status);
+    const parsed = try std.json.parseFromSliceLeaky(store_mod.AssignmentPreview, a, preview.body, .{ .ignore_unknown_fields = true });
+    const apply = try std.json.Stringify.valueAlloc(a, .{ .snapshot = parsed.snapshot }, .{});
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply).status);
+    const result = f.call(.PATCH, "/api/tasks/1", "{\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.conflict, result.status);
+    try std.testing.expect(contains(result.body, "PostingBlocked"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND project_id IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id IS NULL"));
+}
+
+test "binding adopts and refreshes a provider title" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"prompt fragment\"}");
+    const bound = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}");
+    try std.testing.expectEqual(std.http.Status.ok, bound.status);
+    try std.testing.expectEqualStrings("Remote title", (try f.get(struct { task: query.Task }, "/api/tasks/1")).task.title);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.PATCH, "/api/tasks/1", "{\"title\":\"local edit\"}").status);
+    try f.db.exec("UPDATE tasks SET title='stale' WHERE id=1");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try std.testing.expectEqualStrings("Remote title", (try f.get(struct { task: query.Task }, "/api/tasks/1")).task.title);
+
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"prompt fragment\"}");
+    const missing = f.call(.POST, "/api/tasks/2/bind", "{\"ref\":\"missing\"}");
+    try std.testing.expectEqual(std.http.Status.ok, missing.status);
+    try std.testing.expect(contains(missing.body, "\"lookup_error\":\"no such ticket\""));
+    const missing_task = (try f.get(struct { task: query.Task }, "/api/tasks/2")).task;
+    try std.testing.expectEqualStrings("prompt fragment", missing_task.title);
+    try std.testing.expectEqualStrings("missing", missing_task.ref.?);
+
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"keep this title\"}");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/3/bind", "{\"ref\":\"empty-title\"}").status);
+    try std.testing.expectEqualStrings("keep this title", (try f.get(struct { task: query.Task }, "/api/tasks/3")).task.title);
+
+    const provisional = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"provisional\",\"event\":\"p\",\"kind\":\"prompt\"}");
+    try std.testing.expectEqual(std.http.Status.ok, provisional.status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT provisional_title FROM capture_runs WHERE run='provisional'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/4/bind", "{\"ref\":\"T-4\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT provisional_title FROM capture_runs WHERE run='provisional'"));
+    try std.testing.expectEqualStrings("Remote title", (try f.get(struct { task: query.Task }, "/api/tasks/4")).task.title);
 }
 
 test "ambiguous titles ask for an id" {
@@ -1889,10 +2693,35 @@ test "settings accept known keys only and validate" {
     try f.init();
     defer f.deinit();
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"daily_work_minutes\":\"480\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"stable\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"preview\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"update_channel\":\"nightly\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_text\":\"keep\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_text\":\"time\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"capture_text\":\"none\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"nope\":\"1\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"daily_work_minutes\":\"0\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"http_port\":\"80\"}").status);
     try std.testing.expectEqual(@as(u16, 480), try f.store.dailyWorkMinutes());
+}
+
+test "captured text removal validates dates and keeps time" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const prompt = "{\"source\":\"agent\",\"run\":\"r\",\"kind\":\"prompt\",\"first_prompt\":\"work\",\"note\":\"asked\"}";
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", prompt).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-02-30\",\"to\":\"2026-03-09\",\"apply\":false}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-03-10\",\"to\":\"2026-03-09\",\"apply\":false}").status);
+    const dry = f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-03-09\",\"to\":\"2026-03-09\",\"apply\":false}");
+    try std.testing.expectEqual(std.http.Status.ok, dry.status);
+    try std.testing.expect(contains(dry.body, "\"count\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes"));
+    const applied = f.call(.POST, "/api/notes/captured", "{\"from\":\"2026-03-09\",\"to\":\"2026-03-09\",\"apply\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, applied.status);
+    try std.testing.expect(contains(applied.body, "\"deleted\":1"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE captured=1"));
 }
 
 test "settings change together or not at all" {
@@ -1908,6 +2737,474 @@ test "settings change together or not at all" {
 
 fn contains(body: []const u8, part: []const u8) bool {
     return std.mem.indexOf(u8, body, part) != null;
+}
+
+fn apiScalar(db: *sqlite.Db, sql: []const u8) !i64 {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    try std.testing.expectEqual(.row, try stmt.step());
+    return stmt.columnI64(0);
+}
+
+test "a project key on switch and new finds the project capture made for it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"nix:gaze\",\"project_hint\":\"gaze\"}").status);
+    const project = try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='nix:gaze'");
+    const r = f.call(.POST, "/api/switch", "{\"task\":\"Fix login\",\"project_key\":\"nix:gaze\",\"project_hint\":\"gaze\"}");
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    try std.testing.expect(contains(r.body, try std.fmt.allocPrint(f.arena.allocator(), "\"project_id\":{d}", .{project})));
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"Later\",\"project_key\":\"nix:gaze\"}").status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id=(SELECT project_id FROM capture_project_keys WHERE source='agent')"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys"));
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/switch", "{\"task\":\"X\",\"project_key\":\"nix:gaze\",\"project_id\":1}").status);
+}
+
+test "a new project key makes its project from the hint, and bind points a key at one" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Setup\",\"project_key\":\"nix:newrepo\",\"project_hint\":\"newrepo\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects WHERE label='newrepo'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"project_key\":\"nix:renamed\",\"project_id\":1}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"More\",\"project_key\":\"nix:renamed\",\"project_hint\":\"renamed\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id=1"));
+}
+
+test "manual focus keeps its project when capture maps the same task elsewhere" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"A\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"B\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"k\",\"project_hint\":\"capture\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"source\":\"agent\",\"project_key\":\"k\",\"project_id\":2}").status);
+    const manual = f.call(.POST, "/api/switch", "{\"task\":\"T\",\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, manual.status);
+    const t = (try std.json.parseFromSliceLeaky(struct { task: query.Task }, f.arena.allocator(), manual.body, .{ .ignore_unknown_fields = true })).task.id;
+    test_now += 30_000;
+    const prompt = try std.fmt.allocPrint(f.arena.allocator(), "{{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"#{d}\",\"note\":\"do work\"}}", .{t});
+    const result = f.call(.POST, "/api/capture", prompt);
+    try std.testing.expectEqual(std.http.Status.ok, result.status);
+    try std.testing.expect(contains(result.body, "\"project_id\":2"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='focus' AND project_id=1 AND captured=0"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes WHERE text='do work' AND source='prompt'"));
+}
+
+test "title lookup is scoped to project and reports ambiguity within it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Same\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"same\",\"project_id\":2}");
+    const a = f.call(.POST, "/api/switch", "{\"task\":\"SAME\",\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, a.status);
+    try std.testing.expect(contains(a.body, "\"id\":1"));
+    const b = f.call(.POST, "/api/switch", "{\"task\":\"SAME\",\"project_id\":2}");
+    try std.testing.expectEqual(std.http.Status.ok, b.status);
+    try std.testing.expect(contains(b.body, "\"id\":2"));
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"SAME\",\"project_id\":2}");
+    const ambiguous_result = f.call(.POST, "/api/switch", "{\"task\":\"same\",\"project_id\":2}");
+    try std.testing.expectEqual(std.http.Status.conflict, ambiguous_result.status);
+    try std.testing.expect(contains(ambiguous_result.body, "AmbiguousTask"));
+    const by_id = f.call(.POST, "/api/switch", "{\"task\":\"#1\",\"project_id\":2}");
+    try std.testing.expectEqual(std.http.Status.ok, by_id.status);
+    try std.testing.expect(contains(by_id.body, "\"id\":1"));
+}
+
+test "shared captured task alternates projects between runs" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_136_800_000;
+    const task = f.call(.POST, "/api/tasks", "{\"title\":\"Shared\"}");
+    try std.testing.expectEqual(std.http.Status.created, task.status);
+    // Each run names its project on start; the first sight creates it.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"b\",\"project_hint\":\"B\"}").status);
+    const first = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"first\"}");
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    test_now += 20_000;
+    const second = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b1\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"second\"}");
+    try std.testing.expectEqual(std.http.Status.ok, second.status);
+    test_now += 20_000;
+    const third = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a2\",\"kind\":\"prompt\",\"note\":\"third\"}");
+    try std.testing.expectEqual(std.http.Status.ok, third.status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND captured=1"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2"));
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM notes n JOIN intervals i ON i.id=n.interval_id WHERE i.task_id=1"));
+}
+
+test "grace continuation carries old project through gap before split" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_136_800_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"first_prompt\":\"Task\",\"note\":\"keep\"}").status);
+    test_now += 20_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a2\",\"kind\":\"stop\"}");
+    test_now += 10_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a3\",\"kind\":\"end\"}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"b\",\"project_hint\":\"B\"}");
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b1\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"new\"}").status);
+    try std.testing.expectEqual(@as(i64, 40_000), try apiScalar(&f.db, "SELECT end_ms-start_ms FROM intervals WHERE project_id=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2 AND posting_span_id=(SELECT id FROM intervals WHERE project_id=1)"));
+}
+
+test "history add resolves a title in chosen project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Same\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Same\",\"project_id\":2}");
+    const body = try std.fmt.allocPrint(f.arena.allocator(), "{{\"task\":\"same\",\"project_id\":2,\"start_ms\":{d},\"end_ms\":{d}}}", .{ test_now - 120_000, test_now - 60_000 });
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/intervals", body).status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND project_id=2"));
+}
+
+test "capture promotes manual parallel without changing its project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/parallel", "{\"task\":\"T\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"b\",\"project_hint\":\"B\"}");
+    test_now += 20_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"#1\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND role='focus' AND end_ms IS NULL AND project_id=1"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2"));
+}
+
+test "subject uses target default when key is absent" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Old\",\"project_id\":1}");
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"New\",\"project_id\":2}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"#1\",\"note\":\"old\"}");
+    test_now += 20_000;
+    const subject = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"subject\",\"subject\":\"#2\"}");
+    try std.testing.expectEqual(std.http.Status.ok, subject.status);
+    try std.testing.expect(contains(subject.body, "\"project_id\":2"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND project_id=2 AND end_ms IS NULL"));
+}
+
+test "same-task subject with changed key splits captured project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"first_prompt\":\"T\",\"note\":\"old\"}");
+    test_now += 20_000;
+    const changed = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"x\",\"kind\":\"subject\",\"subject\":\"#1\",\"project_key\":\"b\",\"project_hint\":\"B\"}");
+    try std.testing.expectEqual(std.http.Status.ok, changed.status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND captured=1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2 AND end_ms IS NULL"));
+}
+
+test "a project change during a run's grace waits until work resumes" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"a\",\"project_hint\":\"A\"}");
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"first_prompt\":\"T\"}");
+    test_now += 20_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"t\",\"kind\":\"stop\"}");
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"x\",\"kind\":\"subject\",\"subject\":\"#1\",\"project_key\":\"b\",\"project_hint\":\"B\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1"));
+    test_now += 10_000;
+    _ = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"q\",\"kind\":\"prompt\"}");
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND project_id=2 AND end_ms IS NULL"));
+}
+
+test "task patch rolls back title when project is invalid" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"Original\"}");
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.PATCH, "/api/tasks/1", "{\"title\":\"Changed\",\"project_id\":999}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND title='Original'"));
+}
+
+test "provider field validation uses all loaded declarations without provider GET" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    var fields: std.ArrayList(u8) = .empty;
+    const a = f.arena.allocator();
+    try fields.appendSlice(a, "[");
+    for (0..70) |i| {
+        if (i != 0) try fields.appendSlice(a, ",");
+        try fields.appendSlice(a, try std.fmt.allocPrint(a, "{{\"name\":\"field{d}\"}}", .{i}));
+    }
+    try fields.appendSlice(a, "]");
+    try f.app.loadDeclaredFields(fields.items);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"field69\"}").status);
+    f.app.clearDeclaredFields();
+    try f.app.loadDeclaredFields("[{\"name\":\"replacement\"}]");
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"field69\"}").status);
+}
+
+test "capture key changes split captured time, terminal context waits, and duplicate is inert" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_136_800_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"s\",\"kind\":\"start\",\"project_key\":\"A\",\"project_hint\":\"Alpha\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"b\",\"kind\":\"busy\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    const first = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p1\",\"kind\":\"prompt\",\"first_prompt\":\"Investigate startup failure\",\"note\":\"first note\"}");
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    try std.testing.expect(contains(first.body, "\"project_id\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='Investigate startup failure' AND project_id=1"));
+    test_now += 20_000;
+    const second = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p2\",\"kind\":\"prompt\",\"project_key\":\"B\",\"project_hint\":\"Beta\",\"note\":\"second note\"}");
+    try std.testing.expectEqual(std.http.Status.ok, second.status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE captured=1 AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes WHERE text='first note' AND interval_id=(SELECT id FROM intervals WHERE project_id=1)"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM notes WHERE text='second note' AND interval_id=(SELECT id FROM intervals WHERE project_id=2)"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=1 AND posting_span_id=id"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2 AND posting_span_id=(SELECT id FROM intervals WHERE project_id=1)"));
+    const duplicate = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p2\",\"kind\":\"prompt\",\"project_key\":\"C\",\"project_hint\":\"Gamma\"}");
+    try std.testing.expect(contains(duplicate.body, "\"applied\":false"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"stop\",\"kind\":\"stop\",\"project_key\":\"A\"}").status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/projects/1", "{\"archived\":true}").status);
+    test_now += 10_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p3\",\"kind\":\"prompt\"}").status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND project_id=1"));
+}
+
+test "capture keys keep distinct long hints and reject blank first hints" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    var hint: [200]u8 = undefined;
+    @memset(&hint, 'x');
+    const a = f.arena.allocator();
+    const first = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"one\",\"event\":\"a\",\"kind\":\"start\",\"project_key\":\"one\",\"project_hint\":\"{s}\"}}", .{hint[0..]});
+    const second = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"two\",\"event\":\"b\",\"kind\":\"start\",\"project_key\":\"two\",\"project_hint\":\"{s}\"}}", .{hint[0..]});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", first).status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", second).status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(DISTINCT label) FROM projects WHERE length(CAST(label AS BLOB))<=200"));
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"bad\",\"event\":\"x\",\"kind\":\"start\",\"project_key\":\"bad\",\"project_hint\":\"  \"}").status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+}
+
+test "a new capture key joins the user's project of the same name" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"kowalski\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"old\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/projects/2", "{\"archived\":true}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"Kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:h/kowalski'"));
+    // An archived project is not joined: the key gets a project of its own.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"git:h/old\",\"project_hint\":\"old\"}").status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:h/old'"));
+    // Neither is a project another key already claims.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"c\",\"event\":\"c0\",\"kind\":\"start\",\"project_key\":\"git:fork/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 4), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='git:fork/kowalski'"));
+    try std.testing.expectEqual(@as(i64, 4), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+}
+
+test "the same capture key from another source joins its project" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agy\",\"run\":\"b\",\"event\":\"b0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys WHERE project_id=1"));
+    // Sources that disagree leave a third without a side.
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"other\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"source\":\"agy\",\"project_key\":\"git:h/kowalski\",\"project_id\":2}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"codex\",\"run\":\"c\",\"event\":\"c0\",\"kind\":\"start\",\"project_key\":\"git:h/kowalski\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys WHERE source='codex' AND project_id IN (1,2)"));
+    // Without a source, the key moves for every source at once.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/project-keys", "{\"project_key\":\"git:h/kowalski\",\"project_id\":1}").status);
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys WHERE project_key='git:h/kowalski' AND project_id=1"));
+}
+
+test "deleting a project moves its work into another, or unassigns it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"kowalski\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a0\",\"kind\":\"start\",\"subject\":\"work\",\"project_key\":\"k\",\"project_hint\":\"kowalski\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='k'"));
+    try f.db.exec("INSERT INTO projects(id,label) VALUES(2,'kowalski-45904b93')");
+    try f.db.exec("UPDATE capture_project_keys SET project_id=2; UPDATE intervals SET project_id=2; UPDATE tasks SET project_id=2");
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.DELETE, "/api/projects/2", "{\"into\":1}").status);
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.DELETE, "/api/projects/2?into=2", "").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.DELETE, "/api/projects/2?into=x", "").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/2?into=1", "").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id IS NOT 1"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE project_id IS NOT 1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT project_id FROM capture_project_keys WHERE project_key='k'"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.DELETE, "/api/projects/1?into=none", "").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM capture_project_keys"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id IS NOT NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+}
+
+test "explicit Unassigned blocks first provider fallback and invalid labels are ignored" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.GET, "/api/provider", "").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"unknown\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"project_provider_field\":\"client\"}").status);
+    const explicit = f.call(.POST, "/api/tasks", "{\"title\":\"explicit\",\"project_id\":null}");
+    try std.testing.expectEqual(std.http.Status.created, explicit.status);
+    const id = (try std.json.parseFromSliceLeaky(struct { task: query.Task }, f.arena.allocator(), explicit.body, .{ .ignore_unknown_fields = true })).task.id;
+    try f.store.bindWithFields(id, "fake", "E-1", &.{.{ .name = "client", .value = "Valid" }}, test_now);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='explicit' AND project_id IS NULL AND project_choice_explicit=1 AND project_fallback_eligible=0"));
+    const pending = try f.store.createTask("pending", test_now);
+    try f.store.bindWithFields(pending, "fake", "P-1", &.{.{ .name = "client", .value = " bad " }}, test_now);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='pending' AND project_id IS NULL AND project_fallback_eligible=0"));
+    try f.store.bindWithFields(pending, "fake", "P-1", &.{.{ .name = "client", .value = "Valid" }}, test_now);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM projects"));
+    const eligible = try f.store.createTask("eligible", test_now);
+    try f.store.bindWithFields(eligible, "fake", "E-2", &.{.{ .name = "client", .value = "Valid" }}, test_now);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM projects WHERE label='Valid'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='eligible' AND project_id=(SELECT id FROM projects WHERE label='Valid') AND project_fallback_eligible=0"));
+}
+
+test "project assignment preview is read-only and apply checks task role totals and scope" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"A\"}");
+    _ = f.call(.POST, "/api/projects", "{\"label\":\"B\"}");
+    const task_id = try f.store.createTaskWithProject("T", .{ .selected = 1 }, test_now);
+    const other = try f.store.createTask("other", test_now);
+    const start = test_now - 120_000;
+    const end = test_now - 60_000;
+    const interval = try f.store.addInterval(task_id, .focus, start, end, test_now);
+    const edit_path = try std.fmt.allocPrint(a, "/api/intervals/{d}", .{interval});
+    const edit = try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d},\"project_id\":2}}", .{ start, end, start, end });
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.PATCH, edit_path, edit).status);
+    const move_path = try std.fmt.allocPrint(a, "/api/intervals/{d}/move", .{interval});
+    const move = try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"task\":{d},\"project_id\":2}}", .{ start, end, other });
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, move_path, move).status);
+    const preview_body = try std.fmt.allocPrint(a, "{{\"scope\":{{\"task_id\":{d}}},\"project_id\":2}}", .{task_id});
+    const preview = f.call(.POST, "/api/projects/assign/preview", preview_body);
+    try std.testing.expectEqual(std.http.Status.ok, preview.status);
+    const parsed = try std.json.parseFromSliceLeaky(store_mod.AssignmentPreview, a, preview.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqual(@as(usize, 1), parsed.snapshot.intervals.len);
+    try std.testing.expectEqual(@as(i64, 60_000), parsed.snapshot.intervals[0].focus_ms);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=1"));
+    const apply_body = try std.json.Stringify.valueAlloc(a, .{ .snapshot = parsed.snapshot }, .{});
+    try f.db.exec("UPDATE intervals SET role='parallel' WHERE id=1");
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+    try f.db.exec("UPDATE intervals SET role='focus' WHERE id=1");
+    try f.db.exec("UPDATE intervals SET task_id=2 WHERE id=1");
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+    try f.db.exec("UPDATE intervals SET task_id=1 WHERE id=1");
+    const applied = f.call(.POST, "/api/projects/assign/apply", apply_body);
+    try std.testing.expectEqual(std.http.Status.ok, applied.status);
+    try std.testing.expect(contains(applied.body, "\"changed\":1"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE project_id=2"));
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/projects/assign/apply", apply_body).status);
+}
+
+test "interval patch saves times and project in one operation" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const project_id = try f.store.createProject("One", test_now);
+    const task_id = try f.store.createTask("Task", test_now);
+    const start = test_now - 120_000;
+    const end = test_now - 60_000;
+    const interval = try f.store.addInterval(task_id, .focus, start, end, test_now);
+    const preview = f.call(.POST, "/api/projects/assign/preview", "{\"scope\":{\"interval_ids\":[1]},\"project_id\":1}");
+    try std.testing.expectEqual(std.http.Status.ok, preview.status);
+    const parsed = try std.json.parseFromSliceLeaky(store_mod.AssignmentPreview, a, preview.body, .{ .ignore_unknown_fields = true });
+    const path = try std.fmt.allocPrint(a, "/api/intervals/{d}", .{interval});
+    const invalid = try std.json.Stringify.valueAlloc(a, .{
+        .seen = .{ .start_ms = start, .end_ms = end },
+        .start_ms = end + 10_000,
+        .end_ms = start,
+        .project_id = project_id,
+        .snapshot = parsed.snapshot,
+    }, .{});
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, path, invalid).status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE id=1 AND project_id IS NULL AND start_ms=1773099880000"));
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .seen = .{ .start_ms = start, .end_ms = end },
+        .start_ms = start + 10_000,
+        .end_ms = end + 10_000,
+        .project_id = project_id,
+        .snapshot = parsed.snapshot,
+    }, .{});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, path, body).status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE id=1 AND project_id=1 AND start_ms=1773099890000 AND end_ms=1773099950000"));
+}
+
+test "forty seconds split by project posts as one unchanged session" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    f.app.traits = parseTraits(f.arena.allocator(), "{\"sessions\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"post_sessions\":\"1\"}").status);
+    const day_start = (try (try zone.Zone.load("UTC")).dayBounds(2026, 3, 10)).start_ms;
+    test_now = day_start + 10 * 3_600_000 + 10_000;
+    const baseline = try f.store.createTask("baseline", test_now);
+    const split = try f.store.createTask("split", test_now);
+    try f.store.bind(baseline, "fake", "BASE", test_now);
+    try f.store.bind(split, "fake", "SPLIT", test_now);
+    const a = try f.store.createProject("A", test_now);
+    const b = try f.store.createProject("B", test_now);
+    const baseline_start = day_start + 9 * 3_600_000 + 10_000;
+    _ = try f.store.addIntervalProject(baseline, .focus, baseline_start, baseline_start + 40_000, .{ .selected = a }, test_now);
+    _ = try f.store.switchToProject(split, null, .{ .selected = a }, test_now);
+    test_now += 20_000;
+    _ = try f.store.switchToProject(split, null, .{ .selected = b }, test_now);
+    test_now += 20_000;
+    try f.store.stop(split, test_now);
+    try std.testing.expectEqual(@as(i64, 40_000), try apiScalar(&f.db, "SELECT sum(end_ms-start_ms) FROM intervals WHERE task_id=2 AND role='focus'"));
+    const offer = f.call(.GET, "/api/postings?date=2026-03-10", "");
+    try std.testing.expectEqual(std.http.Status.ok, offer.status);
+    try std.testing.expect(contains(offer.body, "\"total_focus_ms\":40000"));
+    worker.Fake.post_code = 0;
+    worker.Fake.quote_code = 0;
+    worker.Fake.fake_policy_past_only = false;
+    const baseline_post = f.call(.POST, "/api/postings", "{\"date\":\"2026-03-10\",\"task\":\"#1\"}");
+    try std.testing.expectEqual(std.http.Status.created, baseline_post.status);
+    const split_post = f.call(.POST, "/api/postings", "{\"date\":\"2026-03-10\",\"task\":\"#2\"}");
+    try std.testing.expectEqual(std.http.Status.created, split_post.status);
+    try std.testing.expectEqual(@as(i64, 2), try apiScalar(&f.db, "SELECT count(*) FROM postings WHERE covered_end_ms-covered_start_ms=40000"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(DISTINCT amount_micro) FROM postings WHERE state='confirmed'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM postings WHERE task_id=2 AND covered_start_ms=(SELECT min(start_ms) FROM intervals WHERE task_id=2) AND covered_end_ms=(SELECT max(end_ms) FROM intervals WHERE task_id=2)"));
 }
 
 /// A fixture with the fake provider and 61 minutes of focus on task #1 today.
@@ -2020,7 +3317,7 @@ test "session chain unknown second post blocks further posting" {
     try std.testing.expect(contains(r.body, "\"start\":\"10:00\",\"end\":\"10:30\""));
     const rows = try query.postingsOn(&f.store, f.arena.allocator(), "2026-03-10", task_id);
     try std.testing.expectEqualStrings("unknown", rows[1].state);
-    try std.testing.expect(try f.store.isBlocked("2026-03-10", "fake", "R-1"));
+    try std.testing.expect(try f.store.isBlocked("2026-03-10", "fake", "R-1", task_id));
 }
 
 test "session edits offer only extra coverage and suppress equal rounded endpoints" {
@@ -2092,7 +3389,7 @@ test "provider settings and post options reach the post request" {
     const r = f.call(.POST, "/api/postings", "{\"task\":\"T-1\",\"options\":{\"internal\":true}}");
     try std.testing.expectEqual(std.http.Status.created, r.status);
     const sent = worker.Fake.last_post[0..worker.Fake.last_post_len];
-    try std.testing.expect(contains(sent, "\"title\":\"Ticket\""));
+    try std.testing.expect(contains(sent, "\"title\":\"Remote title\""));
     try std.testing.expect(contains(sent, "\"settings\":{\"mode\":\"b\",\"note\":\"x\"}"));
     try std.testing.expect(contains(sent, "\"options\":{\"internal\":true}"));
 }
@@ -2131,7 +3428,7 @@ test "posting needs a binding and can post a later difference" {
     try std.testing.expectEqual(std.http.Status.conflict, r.status);
     try std.testing.expect(contains(r.body, "NothingToPost"));
     try std.testing.expectEqual(before + 1, worker.Fake.posted.load(.acquire));
-    _ = f.call(.POST, "/api/switch", "{\"task\":\"Ticket\"}");
+    _ = f.call(.POST, "/api/switch", "{\"task\":\"T-1\"}");
     try f.advance(30 * 60_000);
     _ = f.call(.POST, "/api/switch", "{\"task\":\"Other\"}");
     r = f.call(.POST, "/api/postings", "{\"task\":\"T-1\"}");
@@ -2238,7 +3535,7 @@ test "post accepts the provider's adjusted amount and data" {
     try std.testing.expectEqual(@as(i64, 1), worker.Fake.seen_posting.load(.acquire));
 }
 
-test "rebinding starts a new posted history for the new ref" {
+test "rebinding keeps time posted under the old ref posted" {
     var f: Fixture = .{};
     try postingFixture(&f);
     defer f.deinit();
@@ -2246,11 +3543,34 @@ test "rebinding starts a new posted history for the new ref" {
     try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/postings", "{\"task\":\"#1\"}").status);
     _ = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-2\"}");
     const r = f.call(.POST, "/api/postings", "{\"task\":\"#1\"}");
-    try std.testing.expectEqual(std.http.Status.created, r.status);
-    try std.testing.expect(contains(r.body, "\"amount_text\":\"1.25\""));
-    try std.testing.expect(contains(r.body, "\"external_ref\":\"T-2\""));
+    // The fake provider quotes total minus posted: nothing is left for T-2.
+    try std.testing.expect(r.status != .created);
     const old = (try query.posting(&f.store, f.arena.allocator(), 1)).?;
     try std.testing.expectEqualStrings("T-1", old.external_ref);
+    var count = try f.db.prepare("SELECT count(*) FROM postings WHERE state='confirmed'");
+    defer count.finalize();
+    _ = try count.step();
+    try std.testing.expectEqual(@as(i64, 1), count.columnI64(0));
+}
+
+test "a rebind waits for the task's unresolved posting and drops the old fields" {
+    var f: Fixture = .{};
+    try postingFixture(&f);
+    defer f.deinit();
+    _ = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}");
+    try f.db.exec("INSERT INTO task_fields VALUES(1,'old_only','x')");
+    const id = try f.store.startPosting("2026-03-10", 1, "fake", "T-1", "0.25", 250_000, test_now, null);
+    const waiting = f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-2\"}");
+    try std.testing.expectEqual(std.http.Status.conflict, waiting.status);
+    try std.testing.expect(contains(waiting.body, "PostingInFlight"));
+    // Binding the same ref again is a refresh, not a rebind.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try f.store.postingFailed(id, test_now);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-2\"}").status);
+    var stmt = try f.db.prepare("SELECT count(*) FROM task_fields WHERE task_id=1 AND name='old_only'");
+    defer stmt.finalize();
+    _ = try stmt.step();
+    try std.testing.expectEqual(@as(i64, 0), stmt.columnI64(0));
 }
 
 test "a failed post with a known outcome is cancelled and can be retried" {
@@ -2405,6 +3725,56 @@ test "history merges and deletes closed intervals" {
     try std.testing.expectEqual(@as(usize, 0), empty.intervals.len);
 }
 
+test "selection API assigns and deletes ranges and day lists posted tasks" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_129_600_000;
+    test_now = start + 4 * 3_600_000;
+    const task_a = try f.store.createTask("A", test_now);
+    const task_b = try f.store.createTask("B", test_now);
+    const task_c = try f.store.createTask("C", test_now);
+    const first = try f.store.addInterval(task_a, .focus, start, start + 3_600_000, test_now);
+    const second = try f.store.addInterval(task_b, .focus, start + 2 * 3_600_000, start + 3 * 3_600_000, test_now);
+    const SourceBody = struct { id: i64, seen: SeenBody, ranges: []const [2]i64 };
+    const ResultBody = struct { op: []const u8, pieces: []i64, ms: i64 };
+    const assign_body = try std.json.Stringify.valueAlloc(a, .{
+        .op = "assign",
+        .task = task_c,
+        .sources = &[_]SourceBody{.{ .id = first, .seen = .{ .start_ms = start, .end_ms = start + 3_600_000 }, .ranges = &[_][2]i64{.{ start + 900_000, start + 1_800_000 }} }},
+    }, .{});
+    const assign_response = f.call(.POST, "/api/intervals/selection", assign_body);
+    try std.testing.expectEqual(std.http.Status.ok, assign_response.status);
+    const assigned = try std.json.parseFromSliceLeaky(ResultBody, a, assign_response.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("assign", assigned.op);
+    try std.testing.expectEqual(@as(i64, 900_000), assigned.ms);
+    try std.testing.expectEqual(@as(usize, 1), assigned.pieces.len);
+    try std.testing.expectEqual(task_c, try historyScalar(&f.db, try std.fmt.allocPrint(a, "SELECT task_id FROM intervals WHERE id={d}", .{assigned.pieces[0]})));
+    const delete_body = try std.json.Stringify.valueAlloc(a, .{
+        .op = "delete",
+        .sources = &[_]SourceBody{.{ .id = second, .seen = .{ .start_ms = start + 2 * 3_600_000, .end_ms = start + 3 * 3_600_000 }, .ranges = &[_][2]i64{.{ start + 2 * 3_600_000 + 900_000, start + 2 * 3_600_000 + 1_800_000 }} }},
+    }, .{});
+    const delete_response = f.call(.POST, "/api/intervals/selection", delete_body);
+    try std.testing.expectEqual(std.http.Status.ok, delete_response.status);
+    const deleted = try std.json.parseFromSliceLeaky(ResultBody, a, delete_response.body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("delete", deleted.op);
+    try std.testing.expectEqual(@as(i64, 900_000), deleted.ms);
+    try std.testing.expectEqual(@as(usize, 0), deleted.pieces.len);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, try std.fmt.allocPrint(a, "SELECT count(*) FROM intervals WHERE task_id={d} AND start_ms<{d} AND end_ms>{d}", .{ task_b, start + 2 * 3_600_000 + 1_800_000, start + 2 * 3_600_000 + 900_000 })));
+    try f.db.exec(try std.fmt.allocPrint(
+        a,
+        "INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms,confirmed_ms) VALUES" ++
+            "('2026-03-10',{d},'fake','a','confirmed','1',1000000,{d},{d})," ++
+            "('2026-03-10',{d},'fake','c','confirmed','1',1000000,{d},{d})," ++
+            "('2026-03-10',{d},'fake','c2','unknown','1',1000000,{d},NULL)," ++
+            "('2026-03-10',{d},'fake','b','cancelled','1',1000000,{d},NULL)",
+        .{ task_a, test_now, test_now, task_c, test_now, test_now, task_c, test_now, task_b, test_now },
+    ));
+    const viewed = try f.get(struct { posted_tasks: []i64 }, "/api/day?date=2026-03-10");
+    try std.testing.expectEqualSlices(i64, &.{ task_a, task_c }, viewed.posted_tasks);
+}
+
 test "timed notes can be added moved edited and deleted" {
     var f: Fixture = .{};
     try f.init();
@@ -2436,6 +3806,120 @@ test "timed notes can be added moved edited and deleted" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, try std.fmt.allocPrint(a, "/api/notes/{d}/delete", .{note}), "").status);
     const after = try f.get(Day, "/api/day?date=2026-03-10");
     try std.testing.expectEqual(@as(usize, 0), after.intervals[0].notes.len);
+}
+
+test "starred notes can be created, patched and changed in bulk" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_129_600_000;
+    test_now = start + 3_600_000;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"A\"}").status);
+    const opened = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, test_now }));
+    try std.testing.expectEqual(std.http.Status.created, opened.status);
+    const interval = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, opened.body, .{})).interval;
+    const first_body = try std.fmt.allocPrint(a, "{{\"interval\":{d},\"at_ms\":{d},\"text\":\"first\",\"starred\":true}}", .{ interval, start + 1_000 });
+    const second_body = try std.fmt.allocPrint(a, "{{\"interval\":{d},\"at_ms\":{d},\"text\":\"second\"}}", .{ interval, start + 2_000 });
+    const first_response = f.call(.POST, "/api/notes", first_body);
+    const second_response = f.call(.POST, "/api/notes", second_body);
+    try std.testing.expectEqual(std.http.Status.created, first_response.status);
+    try std.testing.expectEqual(std.http.Status.created, second_response.status);
+    const first = (try std.json.parseFromSliceLeaky(struct { note: i64 }, a, first_response.body, .{})).note;
+    const second = (try std.json.parseFromSliceLeaky(struct { note: i64 }, a, second_response.body, .{})).note;
+    const Day = struct { intervals: []struct { notes: []query.Note } };
+    const before = try f.get(Day, "/api/day?date=2026-03-10");
+    try std.testing.expect(before.intervals[0].notes[0].starred);
+    try std.testing.expect(!before.intervals[0].notes[1].starred);
+
+    const target = try std.fmt.allocPrint(a, "/api/notes/{d}", .{first});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, "{\"starred\":false}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, target, "{}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, target, "{\"at_ms\":1000}").status);
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.PATCH, "/api/notes/999", "{\"starred\":true}").status);
+    const after_patch = try f.get(Day, "/api/day?date=2026-03-10");
+    try std.testing.expectEqualStrings("first", after_patch.intervals[0].notes[0].text);
+    try std.testing.expect(!after_patch.intervals[0].notes[0].starred);
+
+    const unknown = try std.fmt.allocPrint(a, "{{\"ids\":[{d},999],\"starred\":true}}", .{first});
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.POST, "/api/notes/star", unknown).status);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM notes WHERE starred=1"));
+    const mark = try std.fmt.allocPrint(a, "{{\"ids\":[{d},{d}],\"starred\":true}}", .{ first, second });
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/notes/star", mark).status);
+    const after_mark = try f.get(Day, "/api/day?date=2026-03-10");
+    try std.testing.expect(after_mark.intervals[0].notes[0].starred);
+    try std.testing.expect(after_mark.intervals[0].notes[1].starred);
+
+    const delete_unknown = try std.fmt.allocPrint(a, "{{\"ids\":[{d},999]}}", .{first});
+    try std.testing.expectEqual(std.http.Status.not_found, f.call(.POST, "/api/notes/delete", delete_unknown).status);
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM notes"));
+    const delete_both = try std.fmt.allocPrint(a, "{{\"ids\":[{d},{d}]}}", .{ first, second });
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/notes/delete", delete_both).status);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM notes"));
+
+    const too_many = try a.alloc(i64, 501);
+    @memset(too_many, first);
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .ids = too_many, .starred = true }, .{});
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/star", oversized).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes/delete", oversized).status);
+}
+
+test "manual notes preserve lines and enforce the byte limit on every path" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"A\"}").status);
+    const opened = f.call(.POST, "/api/switch", "{\"task\":\"#1\"}");
+    try std.testing.expectEqual(std.http.Status.ok, opened.status);
+    const interval = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, opened.body, .{ .ignore_unknown_fields = true })).interval;
+    const long = try a.alloc(u8, 2000);
+    @memset(long, 'x');
+    long[1000] = '\n';
+    const too_long = try a.alloc(u8, 2001);
+    @memset(too_long, 'x');
+    const focus_body = try std.json.Stringify.valueAlloc(a, .{ .text = long }, .{});
+    const focus_over = try std.json.Stringify.valueAlloc(a, .{ .text = too_long }, .{});
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/notes", focus_body).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes", focus_over).status);
+    const timed_body = try std.json.Stringify.valueAlloc(a, .{ .interval = interval, .at_ms = test_now, .text = long }, .{});
+    const timed_over = try std.json.Stringify.valueAlloc(a, .{ .interval = interval, .at_ms = test_now, .text = too_long }, .{});
+    const added = f.call(.POST, "/api/notes", timed_body);
+    try std.testing.expectEqual(std.http.Status.created, added.status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/notes", timed_over).status);
+    const note = (try std.json.parseFromSliceLeaky(struct { note: i64 }, a, added.body, .{})).note;
+    const target = try std.fmt.allocPrint(a, "/api/notes/{d}", .{note});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, focus_body).status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, target, focus_over).status);
+    const crlf = "\nfirst\r\nsecond\r\nthird\n";
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, try std.json.Stringify.valueAlloc(a, .{ .text = crlf }, .{})).status);
+    const Day = struct { intervals: []struct { notes: []query.Note } };
+    const viewed = try f.get(Day, "/api/day?date=2026-03-09");
+    try std.testing.expectEqual(@as(usize, 2), viewed.intervals[0].notes.len);
+    try std.testing.expectEqualStrings(long, viewed.intervals[0].notes[0].text);
+    try std.testing.expectEqualStrings("\nfirst\nsecond\nthird\n", viewed.intervals[0].notes[1].text);
+}
+
+test "session note text accepts 2000 bytes and normalizes CRLF" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"A\"}").status);
+    const long = try a.alloc(u8, 2000);
+    @memset(long, 'x');
+    long[1000] = '\n';
+    const too_long = try a.alloc(u8, 2001);
+    @memset(too_long, 'x');
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/switch", try std.json.Stringify.valueAlloc(a, .{ .task = "#1", .text = too_long }, .{})).status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", try std.json.Stringify.valueAlloc(a, .{ .task = "#1", .text = long }, .{})).status);
+    const Day = struct { intervals: []struct { text: ?[]const u8 } };
+    const viewed = try f.get(Day, "/api/day?date=2026-03-09");
+    try std.testing.expectEqualStrings(long, viewed.intervals[0].text.?);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"B\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"#2\",\"text\":\"first\\r\\nsecond\"}").status);
+    const normalized = try f.get(Day, "/api/day?date=2026-03-09");
+    try std.testing.expectEqualStrings("first\nsecond", normalized.intervals[normalized.intervals.len - 1].text.?);
 }
 
 test "the provider login runs through the API" {
@@ -2517,6 +4001,34 @@ test "lookup stays unbound while provider fields appear in state and search" {
     try std.testing.expectEqualStrings("Example", by_field.results[0].fields[0].value);
 }
 
+test "search returns the matching note day ahead of the latest focus day" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const newer: i64 = 1_773_129_600_000; // 2026-03-10T08:00Z
+    const older = newer - 86_400_000;
+    test_now = newer + 3_600_000;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/tasks", "{\"title\":\"Planning\"}").status);
+    const first = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ older, older + 3_600_000 }));
+    try std.testing.expectEqual(std.http.Status.created, first.status);
+    const interval = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, first.body, .{})).interval;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ newer, newer + 3_600_000 })).status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/notes", try std.fmt.allocPrint(a, "{{\"interval\":{d},\"at_ms\":{d},\"text\":\"older needle note\"}}", .{ interval, older + 900_000 })).status);
+    const Search = struct { results: []struct { snippet: ?[]const u8, last_date: ?[]const u8, match_date: ?[]const u8, match_dates: [][]const u8 } };
+    const by_note = try f.get(Search, "/api/search?q=needle");
+    try std.testing.expectEqual(@as(usize, 1), by_note.results.len);
+    try std.testing.expectEqualStrings("older needle note", by_note.results[0].snippet.?);
+    try std.testing.expectEqualStrings("2026-03-10", by_note.results[0].last_date.?);
+    try std.testing.expectEqualStrings("2026-03-09", by_note.results[0].match_date.?);
+    try std.testing.expectEqual(@as(usize, 1), by_note.results[0].match_dates.len);
+    try std.testing.expectEqualStrings("2026-03-09", by_note.results[0].match_dates[0]);
+    const by_title = try f.get(Search, "/api/search?q=Planning");
+    try std.testing.expectEqual(@as(usize, 1), by_title.results.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), by_title.results[0].match_date);
+    try std.testing.expectEqual(@as(usize, 0), by_title.results[0].match_dates.len);
+}
+
 test "day totals frequent tasks and charts count focus only" {
     var f: Fixture = .{};
     try f.init();
@@ -2543,7 +4055,7 @@ test "day totals frequent tasks and charts count focus only" {
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.GET, "/api/daytotals?from=2026-01-01&to=2026-03-10", "").status);
     const frequent = try f.get(struct { tasks: []struct { task: query.Task, fields: []query.Field, focus_ms: i64 } }, "/api/frequent?days=30&limit=8");
     try std.testing.expectEqual(@as(usize, 2), frequent.tasks.len);
-    try std.testing.expectEqualStrings("A", frequent.tasks[0].task.title);
+    try std.testing.expectEqualStrings("Remote title", frequent.tasks[0].task.title);
     try std.testing.expectEqual(@as(i64, 3_600_000), frequent.tasks[0].focus_ms);
     try std.testing.expectEqual(@as(i64, 1_800_000), frequent.tasks[1].focus_ms);
     const Chart = struct { dates: [][]const u8, series: []struct { label: []const u8, total_ms: i64, ms: []i64 } };
@@ -2560,9 +4072,47 @@ test "day totals frequent tasks and charts count focus only" {
     try std.testing.expectEqual(@as(i64, 5_400_000), by_client.series[0].total_ms);
     try std.testing.expectEqual(@as(i64, 3_600_000), by_client.series[0].ms[5]);
     try std.testing.expectEqual(@as(i64, 1_800_000), by_client.series[0].ms[6]);
+    // A provider field named like the core grouping still charts by its values.
+    const by_field = try f.get(Chart, "/api/chart?days=7&group=project");
+    try std.testing.expectEqual(@as(usize, 1), by_field.series.len);
+    try std.testing.expectEqualStrings("-", by_field.series[0].label);
+    const by_project = try f.get(Chart, "/api/chart?days=7&group=%40project");
+    try std.testing.expectEqual(@as(usize, 1), by_project.series.len);
+    try std.testing.expectEqual(@as(i64, 5_400_000), by_project.series[0].total_ms);
     const posted = f.call(.POST, "/api/postings", "{\"task\":\"#2\",\"date\":\"2026-03-10\"}");
     try std.testing.expectEqual(std.http.Status.created, posted.status);
     try std.testing.expect(contains(posted.body, "\"amount_micro\":500000"));
+}
+
+test "day start moves early work to prior day and posting covers it" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const midnight = (try (try zone.Zone.load("UTC")).dayBounds(2026, 3, 15)).start_ms;
+    test_now = midnight + 12 * 3_600_000;
+    const task = try f.store.createTask("Night work", test_now);
+    f.app.provider = "fake";
+    f.app.traits = parseTraits(f.arena.allocator(), "{\"sessions\":true}");
+    try f.store.bind(task, "fake", "R-1", test_now);
+    _ = try f.store.addInterval(task, .focus, midnight + 3_600_000, midnight + 5_400_000, test_now);
+    const DayTotal = struct { numbers: Numbers };
+    const before = try f.get(DayTotal, "/api/day?date=2026-03-15");
+    try std.testing.expectEqual(@as(i64, 1_800_000), before.numbers.total_ms);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"day_start\":\"04:00\"}").status);
+    const prior = try f.get(DayTotal, "/api/day?date=2026-03-14");
+    const current = try f.get(DayTotal, "/api/day?date=2026-03-15");
+    try std.testing.expectEqual(@as(i64, 1_800_000), prior.numbers.total_ms);
+    try std.testing.expectEqual(@as(i64, 0), current.numbers.total_ms);
+    const totals = f.call(.GET, "/api/daytotals?from=2026-03-14&to=2026-03-15", "");
+    try std.testing.expectEqual(std.http.Status.ok, totals.status);
+    try std.testing.expect(contains(totals.body, "\"2026-03-14\":1800000"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"post_sessions\":\"1\"}").status);
+    const posted = f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-14\"}");
+    try std.testing.expectEqual(std.http.Status.created, posted.status);
+    const rows = try query.postingsOn(&f.store, f.arena.allocator(), "2026-03-14", task);
+    try std.testing.expect(rows.len > 0);
+    try std.testing.expectEqual(midnight + 3_600_000, rows[0].covered_start_ms.?);
+    try std.testing.expectEqual(midnight + 5_400_000, rows[rows.len - 1].covered_end_ms.?);
 }
 
 test "day status follows binding posting and reduced history" {
@@ -2585,10 +4135,14 @@ test "day status follows binding posting and reduced history" {
     try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
     const bound = try f.get(Days, "/api/days?count=3");
     try std.testing.expectEqualStrings("unposted", bound.days[1].status);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
     const posted = f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-09\"}");
     try std.testing.expectEqual(std.http.Status.created, posted.status);
     const confirmed = try f.get(Days, "/api/days?count=3");
     try std.testing.expectEqualStrings("posted", confirmed.days[1].status);
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
     test_now += 60_000;
     const edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 3_660_000, start, start + 1_800_000 }));
     try std.testing.expectEqual(std.http.Status.ok, edit.status);
@@ -2596,6 +4150,88 @@ test "day status follows binding posting and reduced history" {
     try std.testing.expectEqualStrings("changed", changed.days[1].status);
     try std.testing.expect(changed.days[1].changed_after_posting);
     try std.testing.expectEqual(@as(i64, 1_800_000), changed.days[1].total_ms);
+    try std.testing.expect(contains(f.call(.GET, "/api/postings?date=2026-03-09", "").body, "\"changed_after_posting\":true"));
+    const edited_ms = try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'");
+    const posting_count = try apiScalar(&f.db, "SELECT count(*) FROM postings");
+    const interval_count = try apiScalar(&f.db, "SELECT count(*) FROM intervals");
+    const note_count = try apiScalar(&f.db, "SELECT count(*) FROM notes");
+    const accepted = f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}");
+    try std.testing.expectEqual(std.http.Status.ok, accepted.status);
+    try std.testing.expect(contains(accepted.body, "\"date\":\"2026-03-09\""));
+    try std.testing.expectEqual(edited_ms, try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'"));
+    try std.testing.expectEqual(posting_count, try apiScalar(&f.db, "SELECT count(*) FROM postings"));
+    try std.testing.expectEqual(interval_count, try apiScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(note_count, try apiScalar(&f.db, "SELECT count(*) FROM notes"));
+    const accepted_ms = try apiScalar(&f.db, "SELECT accepted_ms FROM day_edits WHERE day='2026-03-09'");
+    const kept = try f.get(Days, "/api/days?count=3");
+    try std.testing.expectEqualStrings("posted", kept.days[1].status);
+    try std.testing.expect(!kept.days[1].changed_after_posting);
+    try std.testing.expect(contains(f.call(.GET, "/api/postings?date=2026-03-09", "").body, "\"changed_after_posting\":false"));
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+    try std.testing.expectEqual(accepted_ms, try apiScalar(&f.db, "SELECT accepted_ms FROM day_edits WHERE day='2026-03-09'"));
+    const later = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 1_800_000, start, start + 1_500_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, later.status);
+    try std.testing.expectEqual(accepted_ms + 1, try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'"));
+    const changed_again = try f.get(Days, "/api/days?count=3");
+    try std.testing.expectEqualStrings("changed", changed_again.days[1].status);
+    try std.testing.expect(changed_again.days[1].changed_after_posting);
+}
+
+test "accept refuses an edit made during the provider follow-up" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_043_200_000;
+    test_now = 1_773_136_800_000;
+    f.app.provider = "fake";
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"A\"}");
+    const added = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 3_660_000 }));
+    try std.testing.expectEqual(std.http.Status.created, added.status);
+    const id = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, added.body, .{})).interval;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-09\"}").status);
+    test_now += 60_000;
+    const first_edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 3_660_000, start, start + 1_800_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, first_edit.status);
+    const snapshot = try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'");
+    const pending = handle(&f.app, a, .{ .method = .POST, .target = "/api/postings/accept", .host = "127.0.0.1:47100", .marker = true, .body = "{\"date\":\"2026-03-09\"}" });
+    try std.testing.expectEqual(std.http.Status.ok, pending.status);
+    try std.testing.expect(pending.followup != null and pending.followup.? == .status);
+    try std.testing.expectEqual(@as(?i64, snapshot), pending.followup.?.status.accept_edit);
+    const second_edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 1_800_000, start, start + 1_500_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, second_edit.status);
+    try std.testing.expectEqual(snapshot + 1, try apiScalar(&f.db, "SELECT edited_ms FROM day_edits WHERE day='2026-03-09'"));
+    const w: worker.Worker = .{ .table = &worker.Fake.table, .io = std.testing.io };
+    const reply = proceed(&f.app, a, pending.followup.?, try w.run(a, pending.followup.?.call(), 5_000));
+    try std.testing.expectEqual(std.http.Status.conflict, reply.status);
+    try std.testing.expect(contains(reply.body, "NotChanged"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}").status);
+}
+
+test "accepting a partly posted day is refused without storing acceptance" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const start: i64 = 1_773_043_200_000;
+    test_now = 1_773_136_800_000;
+    f.app.provider = "fake";
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"A\"}");
+    const added = f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"role\":\"focus\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 900_000 }));
+    try std.testing.expectEqual(std.http.Status.created, added.status);
+    const id = (try std.json.parseFromSliceLeaky(struct { interval: i64 }, a, added.body, .{})).interval;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/tasks/1/bind", "{\"ref\":\"T-1\"}").status);
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/postings", "{\"task\":\"#1\",\"date\":\"2026-03-09\"}").status);
+    test_now += 60_000;
+    const edit = f.call(.PATCH, try std.fmt.allocPrint(a, "/api/intervals/{d}", .{id}), try std.fmt.allocPrint(a, "{{\"seen\":{{\"start_ms\":{d},\"end_ms\":{d}}},\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 900_000, start, start + 1_800_000 }));
+    try std.testing.expectEqual(std.http.Status.ok, edit.status);
+    const days_after = try f.get(struct { days: []struct { date: []const u8, status: []const u8 } }, "/api/days?count=3");
+    try std.testing.expectEqualStrings("partial", days_after.days[1].status);
+    const response = f.call(.POST, "/api/postings/accept", "{\"date\":\"2026-03-09\"}");
+    try std.testing.expectEqual(std.http.Status.conflict, response.status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM day_edits WHERE accepted_ms IS NOT NULL"));
 }
 
 test "day status keeps unknown posting while quoting other days" {
@@ -2625,13 +4261,83 @@ test "day status keeps unknown posting while quoting other days" {
     try std.testing.expectEqualStrings("unknown", listed.days[1].status);
 }
 
+test "projects_rev changes with the project list only" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const Rev = struct { projects_rev: []const u8 };
+    const rev = struct {
+        fn of(fx: *Fixture) ![]const u8 {
+            return (try fx.get(Rev, "/api/state")).projects_rev;
+        }
+    }.of;
+    const start = try rev(&f);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"newest\"}").status);
+    try std.testing.expectEqualStrings(start, try rev(&f));
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/projects", "{\"label\":\"Rev\"}").status);
+    const created = try rev(&f);
+    try std.testing.expect(!std.mem.eql(u8, start, created));
+    const listed = try f.get(struct { projects: []const struct { id: i64, label: []const u8 } }, "/api/projects?archived=1");
+    var id: i64 = 0;
+    for (listed.projects) |p| if (std.mem.eql(u8, p.label, "Rev")) {
+        id = p.id;
+    };
+    const target = try std.fmt.allocPrint(f.arena.allocator(), "/api/projects/{d}", .{id});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, "{\"label\":\"Rev two\"}").status);
+    const renamed = try rev(&f);
+    try std.testing.expect(!std.mem.eql(u8, created, renamed));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, target, "{\"archived\":true}").status);
+    try std.testing.expect(!std.mem.eql(u8, renamed, try rev(&f)));
+}
+
+test "settings keep the 0.3.0 names and zones come from the system" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // Keys renamed or dropped in 0.3.0 are refused, so an old page cannot write them back.
+    for ([_][]const u8{ "ui_autofill_obs", "ui_open_on_launch", "ui_hide_weekends", "ui_chart_engine", "ui_poll_seconds" }) |old| {
+        const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"1\"}}", .{old});
+        try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", body).status);
+    }
+    for ([_][2][]const u8{
+        .{ "post_daily_notes", "1" }, .{ "open_on_launch", "0" }, .{ "ui_show_weekends", "0" },
+        .{ "ui_left_width", "240" },  .{ "ui_reader_width", "480" },
+    }) |kv| {
+        const body = try std.fmt.allocPrint(a, "{{\"{s}\":\"{s}\"}}", .{ kv[0], kv[1] });
+        try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", body).status);
+    }
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_left_width\":\"40\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_reader_width\":\"wide\"}").status);
+
+    const listed = try f.get(struct { zones: []const []const u8 }, "/api/zones");
+    try std.testing.expect(listed.zones.len > 0);
+    var has_utc = false;
+    for (listed.zones) |z| has_utc = has_utc or std.mem.eql(u8, z, "UTC");
+    try std.testing.expect(has_utc);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"reporting_zone\":\"Not A Zone\"}").status);
+    const pick = try std.fmt.allocPrint(a, "{{\"reporting_zone\":\"{s}\"}}", .{listed.zones[listed.zones.len / 2]});
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", pick).status);
+}
+
 test "settings validate preferences and paid breaks credit only the pause" {
     var f: Fixture = .{};
     try f.init();
     defer f.deinit();
     const a = f.arena.allocator();
+    for ([_][]const u8{ "4:00", "04:0", "12:01", "13:00", "04:60", "xx:yy" }) |bad| {
+        const body = try std.fmt.allocPrint(a, "{{\"day_start\":\"{s}\"}}", .{bad});
+        try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", body).status);
+    }
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"day_start\":\"12:00\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"day_start\":\"00:00\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"newest\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_day_order\":\"x\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"ref\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_task_order\":\"id\"}").status);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"grid\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"reader\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_report_layout\":\"cards\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"[\\\"system\\\"]\"}").status);
     try std.testing.expectEqual(std.http.Status.bad_request, f.call(.PATCH, "/api/settings", "{\"ui_chart_hidden\":\"system\"}").status);
     try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"paid_breaks\":\"08:00-12:00=15,13:00-18:00=15\"}").status);
@@ -2650,4 +4356,334 @@ test "settings validate preferences and paid breaks credit only the pause" {
     const settings = f.call(.GET, "/api/settings", "");
     try std.testing.expect(contains(settings.body, "\"key\":\"ui_day_order\",\"value\":\"newest\""));
     try std.testing.expect(contains(settings.body, "\"key\":\"paid_breaks\",\"value\":\"\""));
+}
+
+test "capture applies an event once and names tasks like switch" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e1\",\"kind\":\"prompt\",\"default_subject\":\"kowalski\"}").status);
+    const again = f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e1\",\"kind\":\"prompt\",\"default_subject\":\"kowalski\"}");
+    try std.testing.expect(contains(again.body, "\"applied\":false"));
+    const opened = f.call(.GET, "/api/state", "");
+    try std.testing.expect(contains(opened.body, "\"title\":\"kowalski\""));
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e2\",\"kind\":\"subject\",\"subject\":\"Issue 12\"}").status);
+    try std.testing.expect(contains(f.call(.GET, "/api/state", "").body, "\"title\":\"Issue 12\""));
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"kind\":\"subject\"}").status);
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"kind\":\"nap\"}").status);
+    // A field this daemon does not know yet is skipped, not refused.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e3\",\"kind\":\"busy\",\"from_a_newer_hook\":\"x\"}").status);
+    // A retried subject event changes nothing, not even by recreating a renamed task.
+    try f.db.exec("UPDATE tasks SET title='Renamed' WHERE title='Issue 12'");
+    const retried = f.call(.POST, "/api/capture", "{\"source\":\"claude\",\"run\":\"s1\",\"event\":\"e2\",\"kind\":\"subject\",\"subject\":\"Issue 12\"}");
+    try std.testing.expect(contains(retried.body, "\"applied\":false"));
+    var count = try f.db.prepare("SELECT count(*) FROM tasks WHERE title='Issue 12'");
+    defer count.finalize();
+    _ = try count.step();
+    try std.testing.expectEqual(@as(i64, 0), count.columnI64(0));
+}
+
+test "numeric captured subjects bind once and keep the capture reply" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    const a = f.arena.allocator();
+    const Result = struct { applied: bool, project_id: ?i64, task_id: ?i64 };
+    const before = worker.Fake.lookup_calls.load(.acquire);
+    const first_body = "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"312\",\"project_key\":\"k\",\"project_hint\":\"Work\"}";
+    const first = f.call(.POST, "/api/capture", first_body);
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    const captured = try std.json.parseFromSliceLeaky(Result, a, first.body, .{});
+    try std.testing.expect(captured.applied and captured.project_id != null and captured.task_id != null);
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=1 AND title='Remote title'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=1 AND external_ref='312'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND captured=1"));
+
+    const duplicate = handle(&f.app, a, .{ .method = .POST, .target = "/api/capture", .host = "127.0.0.1:47100", .marker = true, .body = first_body });
+    try std.testing.expectEqual(std.http.Status.ok, duplicate.status);
+    try std.testing.expect(duplicate.followup == null);
+    try std.testing.expectEqualStrings("{\"applied\":false}", duplicate.body);
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+
+    const again = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a2\",\"kind\":\"prompt\",\"subject\":\"312\"}");
+    try std.testing.expectEqual(std.http.Status.ok, again.status);
+    const reused = try std.json.parseFromSliceLeaky(Result, a, again.body, .{});
+    try std.testing.expectEqual(captured.task_id, reused.task_id);
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+
+    const defaulted = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"b\",\"event\":\"b1\",\"kind\":\"prompt\",\"default_subject\":\"399\"}");
+    try std.testing.expectEqual(std.http.Status.ok, defaulted.status);
+    const default_result = try std.json.parseFromSliceLeaky(Result, a, defaulted.body, .{});
+    try std.testing.expectEqual(@as(?i64, 2), default_result.task_id);
+    try std.testing.expectEqual(before + 2, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=2 AND title='Remote title' AND external_ref='399'"));
+
+    const plain = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"c\",\"event\":\"c1\",\"kind\":\"prompt\",\"subject\":\"Readme\"}");
+    try std.testing.expectEqual(std.http.Status.ok, plain.status);
+    try std.testing.expectEqual(before + 2, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE id=3 AND title='Readme'"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=3"));
+
+    const failed = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"d\",\"event\":\"d1\",\"kind\":\"prompt\",\"subject\":\"404\"}");
+    try std.testing.expectEqual(std.http.Status.ok, failed.status);
+    const failed_result = try std.json.parseFromSliceLeaky(Result, a, failed.body, .{});
+    try std.testing.expectEqual(@as(?i64, 4), failed_result.task_id);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=4 AND title='404' AND external_ref='404'"));
+}
+
+test "a capture focus request switches as by hand unless held" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Current\"}").status);
+    test_now += 60_000;
+    // Without focus, a prompt for another task starts in parallel and says nothing of the focus.
+    const plain = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t1\",\"event\":\"e1\",\"kind\":\"prompt\",\"subject\":\"Other\"}");
+    try std.testing.expectEqual(std.http.Status.ok, plain.status);
+    try std.testing.expect(!contains(plain.body, "focus_taken"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Other' AND i.end_ms IS NULL AND i.role='parallel'"));
+    test_now += 60_000;
+    const taken = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t1\",\"event\":\"e2\",\"kind\":\"prompt\",\"subject\":\"Other\",\"focus\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, taken.status);
+    try std.testing.expect(contains(taken.body, "\"focus_taken\":true"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Other' AND i.end_ms IS NULL AND i.role='focus' AND i.captured=0"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Current' AND i.end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='parallel'"));
+    // The focus is the user's now: the run's lease running out leaves it open.
+    try f.advance(30 * 60_000);
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t2\",\"event\":\"e3\",\"kind\":\"start\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Other' AND i.end_ms IS NULL AND i.role='focus'"));
+    // A subject event takes the focus too, opening a task no run works on.
+    test_now += 60_000;
+    const subject = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t2\",\"event\":\"e4\",\"kind\":\"subject\",\"subject\":\"Third\",\"focus\":true}");
+    try std.testing.expect(contains(subject.body, "\"focus_taken\":true"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Third' AND i.end_ms IS NULL AND i.role='focus'"));
+    // Unattended runs and other kinds never take it.
+    test_now += 60_000;
+    const unattended = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t3\",\"event\":\"e5\",\"kind\":\"prompt\",\"subject\":\"Other\",\"attended\":false,\"focus\":true}");
+    try std.testing.expect(contains(unattended.body, "\"focus_taken\":false"));
+    test_now += 60_000;
+    const busy = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t4\",\"event\":\"e6\",\"kind\":\"busy\",\"subject\":\"Fourth\",\"focus\":true}");
+    try std.testing.expect(contains(busy.body, "\"focus_taken\":false"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Third' AND i.end_ms IS NULL AND i.role='focus'"));
+    // A working holding source keeps the focus.
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.PATCH, "/api/settings", "{\"capture_hold_sources\":\"game\"}").status);
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"game\",\"run\":\"g\",\"event\":\"g1\",\"kind\":\"prompt\",\"subject\":\"Game\"}").status);
+    test_now += 60_000;
+    const held = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t5\",\"event\":\"e7\",\"kind\":\"prompt\",\"subject\":\"Third\",\"focus\":true}");
+    try std.testing.expectEqual(std.http.Status.ok, held.status);
+    try std.testing.expect(contains(held.body, "\"applied\":true"));
+    try std.testing.expect(contains(held.body, "\"focus_taken\":false"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Game' AND i.end_ms IS NULL AND i.role='focus'"));
+}
+
+test "a capture focus request keeps a run mid-turn on the old focus in parallel" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"Agent work\"}").status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND role='focus'"));
+    test_now += 60_000;
+    const taken = f.call(.POST, "/api/capture", "{\"source\":\"ext\",\"run\":\"t\",\"event\":\"t1\",\"kind\":\"prompt\",\"subject\":\"Picked\",\"focus\":true}");
+    try std.testing.expect(contains(taken.body, "\"focus_taken\":true"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND role='parallel'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM capture_runs WHERE run='a' AND role='parallel'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals i JOIN tasks t ON t.id=i.task_id WHERE t.title='Picked' AND i.end_ms IS NULL AND i.role='focus'"));
+}
+
+test "switch and parallel bind a new numeric task to the provider ref" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    test_now = 1_773_129_600_000;
+    const before = worker.Fake.lookup_calls.load(.acquire);
+    const switched = f.call(.POST, "/api/switch", "{\"task\":\"312\"}");
+    try std.testing.expectEqual(std.http.Status.ok, switched.status);
+    try std.testing.expect(contains(switched.body, "\"created\":true"));
+    try std.testing.expect(contains(switched.body, "Remote title"));
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=1 AND title='Remote title' AND external_ref='312'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND end_ms IS NULL AND role='focus'"));
+    // The bound task is found again by its ref.
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Other\"}").status);
+    test_now += 60_000;
+    const again = f.call(.POST, "/api/switch", "{\"task\":\"312\"}");
+    try std.testing.expect(contains(again.body, "\"created\":false"));
+    try std.testing.expectEqual(before + 1, worker.Fake.lookup_calls.load(.acquire));
+    // A failed lookup keeps the bind.
+    test_now += 60_000;
+    const parallel = f.call(.POST, "/api/parallel", "{\"task\":\"404\"}");
+    try std.testing.expectEqual(std.http.Status.ok, parallel.status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE title='404' AND external_ref='404'"));
+    try std.testing.expectEqual(@as(i64, 3), try apiScalar(&f.db, "SELECT count(*) FROM tasks"));
+    // Without a provider a numeric task stays a plain one.
+    f.app.provider = null;
+    test_now += 60_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"777\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE external_ref='777'"));
+}
+
+test "capture keeps its reply and time when follow-up binding conflicts" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    const a = f.arena.allocator();
+    const occupied = try f.store.createTask("occupied", test_now);
+    const pending = handle(&f.app, a, .{ .method = .POST, .target = "/api/capture", .host = "127.0.0.1:47100", .marker = true,
+        .body = "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"312\"}" });
+    try std.testing.expectEqual(std.http.Status.ok, pending.status);
+    try std.testing.expect(pending.followup != null);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND captured=1 AND end_ms IS NULL"));
+    try f.store.bind(occupied, "fake", "312", test_now);
+    const w: worker.Worker = .{ .table = &worker.Fake.table, .io = std.testing.io };
+    const reply = proceed(&f.app, a, pending.followup.?, try w.run(a, pending.followup.?.call(), 5_000));
+    try std.testing.expectEqual(std.http.Status.ok, reply.status);
+    const result = try std.json.parseFromSliceLeaky(struct { applied: bool, project_id: ?i64, task_id: ?i64 }, a, reply.body, .{});
+    try std.testing.expect(result.applied);
+    try std.testing.expectEqual(@as(?i64, 2), result.task_id);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=2 AND captured=1 AND end_ms IS NULL"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=1 AND external_ref='312'"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=2"));
+}
+
+test "malformed capture lookup keeps its reply and binds without a title" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.app.provider = "fake";
+    const a = f.arena.allocator();
+    const captured = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"r\",\"event\":\"p\",\"kind\":\"prompt\",\"subject\":\"422\"}");
+    try std.testing.expectEqual(std.http.Status.ok, captured.status);
+    const result = try std.json.parseFromSliceLeaky(struct { applied: bool, project_id: ?i64, task_id: ?i64 }, a, captured.body, .{});
+    try std.testing.expect(result.applied);
+    try std.testing.expectEqual(@as(?i64, 1), result.task_id);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks JOIN task_bindings ON task_bindings.task_id=tasks.id WHERE tasks.id=1 AND title='422' AND external_ref='422'"));
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM intervals WHERE task_id=1 AND captured=1 AND end_ms IS NULL"));
+
+    _ = f.call(.POST, "/api/tasks", "{\"title\":\"manual\"}");
+    try std.testing.expectEqual(std.http.Status.bad_gateway, f.call(.POST, "/api/tasks/2/bind", "{\"ref\":\"garbage\"}").status);
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings WHERE task_id=2"));
+}
+
+test "numeric capture without a provider stays local" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const captured = f.call(.POST, "/api/capture", "{\"source\":\"agent\",\"run\":\"a\",\"event\":\"a1\",\"kind\":\"prompt\",\"subject\":\"312\"}");
+    try std.testing.expectEqual(std.http.Status.ok, captured.status);
+    try std.testing.expectEqual(@as(i64, 1), try apiScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='312'"));
+    try std.testing.expectEqual(@as(i64, 0), try apiScalar(&f.db, "SELECT count(*) FROM task_bindings"));
+}
+
+fn historyScalar(db: *sqlite.Db, sql: []const u8) !i64 {
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    if (try stmt.step() != .row) return error.Sqlite;
+    return stmt.columnI64(0);
+}
+
+test "capture history keeps original times, focus and runs; retries and partial retries" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    test_now = 1_773_129_600_000;
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Current\"}").status);
+    const start = test_now - 3_600_000;
+    const body = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r1\",\"attended\":true,\"intervals\":[{{\"event\":\"i1\",\"subject\":\"Past\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[{{\"event\":\"n1\",\"at_ms\":{d},\"text\":\"first\"}}]}},{{\"event\":\"i2\",\"subject\":\"Past\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[{{\"event\":\"n2\",\"at_ms\":{d},\"text\":\"second\"}}]}}]}}", .{ start, start + 1000, start, start + 2000, start + 3000, start + 3000 });
+    const first = f.call(.POST, "/api/capture/history", body);
+    try std.testing.expectEqual(std.http.Status.ok, first.status);
+    try std.testing.expect(contains(first.body, "\"applied\":2"));
+    try std.testing.expect(contains(first.body, "\"notes\":2"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NOT NULL AND captured=0"));
+    try std.testing.expectEqual(start, try historyScalar(&f.db, "SELECT min(start_ms) FROM intervals WHERE end_ms IS NOT NULL"));
+    try std.testing.expectEqual(start + 3000, try historyScalar(&f.db, "SELECT max(at_ms) FROM notes"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals WHERE opened_by='switch' AND closed_by='stop' AND role='focus'"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM notes WHERE source IS NULL"));
+    try std.testing.expectEqual(@as(i64, 4), try historyScalar(&f.db, "SELECT count(*) FROM capture_events WHERE kind='history'"));
+    try std.testing.expectEqual(start, try historyScalar(&f.db, "SELECT at_ms FROM capture_events WHERE event='i1'"));
+    try std.testing.expectEqual(start + 3000, try historyScalar(&f.db, "SELECT at_ms FROM capture_events WHERE event='n2'"));
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM day_edits WHERE day='2026-03-10'"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_runs"));
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals WHERE end_ms IS NULL AND role='focus' AND task_id=(SELECT id FROM tasks WHERE title='Current')"));
+    const again = f.call(.POST, "/api/capture/history", body);
+    try std.testing.expectEqual(std.http.Status.ok, again.status);
+    try std.testing.expect(contains(again.body, "\"applied\":0"));
+    try std.testing.expect(contains(again.body, "\"skipped\":2"));
+    try std.testing.expectEqual(@as(i64, 3), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    const partial = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r1\",\"intervals\":[{{\"event\":\"i1\",\"subject\":\"Renamed\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}},{{\"event\":\"i3\",\"subject\":\"Past\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start, start + 1000, start + 4000, start + 5000 });
+    const mixed = f.call(.POST, "/api/capture/history", partial);
+    try std.testing.expectEqual(std.http.Status.ok, mixed.status);
+    try std.testing.expect(contains(mixed.body, "\"applied\":1"));
+    try std.testing.expect(contains(mixed.body, "\"skipped\":1"));
+    try std.testing.expectEqual(@as(i64, 4), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='Renamed'"));
+}
+
+test "capture history rejects overlap atomically and validates times" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    test_now = 1_773_129_600_000;
+    _ = try f.store.createTask("Manual", test_now);
+    const start = test_now - 3_600_000;
+    try std.testing.expectEqual(std.http.Status.created, f.call(.POST, "/api/intervals", try std.fmt.allocPrint(a, "{{\"task\":\"#1\",\"start_ms\":{d},\"end_ms\":{d}}}", .{ start, start + 1000 })).status);
+    const existing = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"ok\",\"subject\":\"New\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}},{{\"event\":\"bad\",\"subject\":\"#1\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start + 2000, start + 3000, start + 500, start + 1500 });
+    const conflict = f.call(.POST, "/api/capture/history", existing);
+    try std.testing.expectEqual(std.http.Status.conflict, conflict.status);
+    try std.testing.expect(contains(conflict.body, "\"interval\":1"));
+    try std.testing.expect(contains(conflict.body, "overlap"));
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM tasks WHERE title='New'"));
+    const within = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"a\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}},{{\"event\":\"b\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start + 2000, start + 4000, start + 3000, start + 5000 });
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/capture/history", within).status);
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/switch", "{\"task\":\"Open\"}").status);
+    const open = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"c\",\"subject\":\"Open\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ test_now, test_now + 1 });
+    test_now += 1000;
+    try std.testing.expectEqual(std.http.Status.conflict, f.call(.POST, "/api/capture/history", open).status);
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+    const future = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"d\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ test_now - 1, test_now + 1 });
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture/history", future).status);
+    const outside = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"e\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[{{\"event\":\"ne\",\"at_ms\":{d},\"text\":\"outside\"}}]}}]}}", .{ start + 2000, start + 3000, start + 3001 });
+    try std.testing.expectEqual(std.http.Status.bad_request, f.call(.POST, "/api/capture/history", outside).status);
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    const empty = f.call(.POST, "/api/capture/history", "{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[]}");
+    try std.testing.expectEqual(std.http.Status.ok, empty.status);
+    try std.testing.expect(contains(empty.body, "\"applied\":0"));
+    try std.testing.expectEqual(@as(i64, 2), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
+}
+
+test "capture history blocks posted reporting days only for that task" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    const a = f.arena.allocator();
+    test_now = 1_773_129_600_000;
+    _ = try f.store.createTask("Posted", test_now);
+    const start = test_now - 3_600_000;
+    try f.db.exec("INSERT INTO postings(day,task_id,provider_instance,external_ref,state,amount_text,amount_micro,created_ms) VALUES('2026-03-10',1,'test','one','confirmed','1',1000000,1)");
+    const posted = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"p\",\"subject\":\"#1\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start, start + 1000 });
+    const rejected = f.call(.POST, "/api/capture/history", posted);
+    try std.testing.expectEqual(std.http.Status.conflict, rejected.status);
+    try std.testing.expect(contains(rejected.body, "posted"));
+    try std.testing.expectEqual(@as(i64, 0), try historyScalar(&f.db, "SELECT count(*) FROM capture_events"));
+    const other = try std.fmt.allocPrint(a, "{{\"source\":\"agent\",\"run\":\"r\",\"intervals\":[{{\"event\":\"q\",\"subject\":\"Other\",\"start_ms\":{d},\"end_ms\":{d},\"notes\":[]}}]}}", .{ start, start + 1000 });
+    try std.testing.expectEqual(std.http.Status.ok, f.call(.POST, "/api/capture/history", other).status);
+    try std.testing.expectEqual(@as(i64, 1), try historyScalar(&f.db, "SELECT count(*) FROM intervals"));
 }

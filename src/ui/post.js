@@ -7,9 +7,10 @@ let _obsEntry = null; // the entry the observation popup edits
 let _obsTok = 0;      // drops an autofill answer meant for an older popup
 let _horasGen = 0;    // a new dialog drops answers meant for the old one
 let _horasSessionsMode = false;
+let _horasChanged = false;
 
 // `drafts` maps a task id to the observation and options typed before a reload.
-async function showHorasDialog(date, drafts = null) {
+async function showHorasDialog(date, drafts = null, acceptRejected = false) {
   _horasDate = date;
   const gen = ++_horasGen;
   id('horas-overlay').classList.add('show');
@@ -33,6 +34,8 @@ async function showHorasDialog(date, drafts = null) {
         const draft = drafts?.get(offer.task.id);
         return { offer, quote: null, refused: null, observation: draft?.observation || '', options: { ...draft?.options } };
       });
+    _horasChanged = !acceptRejected && !!data.changed_after_posting && _horasEntries.length > 0 &&
+      _horasEntries.every(e => !pending(e.offer) && (e.offer.postings || []).some(p => p.state === 'confirmed'));
     renderHorasRows();
     await quoteHoras(gen);
   } catch (err) {
@@ -90,10 +93,15 @@ function horasStatus(e) {
   return `<span class="hr-muted">${t('tracked', { t: fmtMs(offer.total_focus_ms) })}</span>`;
 }
 
+// Posted rows read in the tracked h m like the rest of the column; the
+// provider's own figure stays in the amount column and on hover.
+function horasPostedHtml(offer, postings, tag) {
+  return `<${tag} class="hr-ok" title="${escAttr(postings.map(p => p.amount_text).join(' + '))}">${esc(t('posted_amt', { a: t('tracked', { t: fmtMs(offer.total_focus_ms) }) }))}</${tag}>`;
+}
+
 function horasPostedLine(e) {
   const posted = (e.offer.postings || []).filter(p => p.state === 'confirmed');
-  return posted.length
-    ? `<div class="hr-ok">${t('posted_amt', { a: esc(posted.map(p => p.amount_text).join(' + ')) })}</div>` : '';
+  return posted.length ? horasPostedHtml(e.offer, posted, 'div') : '';
 }
 
 // The provider's post options (Internal hours, say) as toggles on a row.
@@ -107,8 +115,9 @@ function horasOptions(e, i) {
 }
 
 function renderHorasRows() {
+  const changed = _horasChanged ? `<div class="hr-changed"><span>${esc(t('st_changed'))}</span><button id="hr-accept-btn" onclick="acceptHoras()">${esc(t('keep_as_posted'))}</button></div>` : '';
   if (!_horasEntries.length) {
-    id('horas-body').innerHTML = `<div class="horas-empty">${t('no_ref_day')}</div>`;
+    id('horas-body').innerHTML = changed + `<div class="horas-empty">${t('no_ref_day')}</div>`;
     return;
   }
   setHorasActions(_horasEntries.some(e => e.offer.postable)); // nothing to post: no Submit
@@ -127,7 +136,28 @@ function renderHorasRows() {
       <span class="hr-status" id="hr-st-${i}">${horasStatus(e)}${horasPostedLine(e)}</span>
     </div>`;
   }).join('');
-  id('horas-body').innerHTML = `<div class="horas-table">${rows}</div>`;
+  id('horas-body').innerHTML = changed + `<div class="horas-table">${rows}</div>`;
+}
+
+async function acceptHoras() {
+  const date = _horasDate;
+  const gen = _horasGen;
+  const drafts = new Map(_horasEntries.map(e => [e.offer.task.id, { observation: e.observation, options: { ...e.options } }]));
+  const button = id('hr-accept-btn');
+  if (button) button.disabled = true;
+  try {
+    await apiJSON('POST', '/api/postings/accept', { date });
+    if (gen === _horasGen) await showHorasDialog(date, drafts);
+    loadDay(selectedDate, { chart: true });
+  } catch (err) {
+    if (gen === _horasGen) {
+      if (err.status === 409) await showHorasDialog(date, drafts, true);
+      else {
+        if (button) button.disabled = false;
+        showError(err.message);
+      }
+    }
+  }
 }
 
 // The provider takes one call at a time, so Submit waits for every quote.
@@ -207,7 +237,7 @@ async function openObsPopup(idx) {
   _obsEntry = e;
   const tok = ++_obsTok;
   let val = e.observation || '';
-  if (!val && pref('ui_autofill_obs', '0') === '1') {
+  if (!val && pref('post_daily_notes', '0') === '1') {
     try {
       const day = D && D.date === _horasDate ? D : await apiJSON('GET', '/api/day?date=' + encodeURIComponent(_horasDate));
       const lines = [];
@@ -228,7 +258,22 @@ async function openObsPopup(idx) {
   setTimeout(() => id('obs-text').focus(), 50);
 }
 
+async function useStarredNotes() {
+  if (_obsEntryIdx === null || !_obsEntry) return;
+  const entry = _obsEntry, date = _horasDate, tok = ++_obsTok;
+  try {
+    const day = D?.date === date ? D : await apiJSON('GET', '/api/day?date=' + encodeURIComponent(date));
+    if (tok !== _obsTok || _obsEntry !== entry || !id('obs-popup').classList.contains('show')) return;
+    const lines = dayStarredNotes(day, entry.offer.task.id)
+      .map(n => `[${hhmm24(n.at_ms)}] ${n.text.replace(/\s*\r?\n\s*/g, ' ')}`);
+    if (!lines.length) { showToast(t('no_starred_notes')); return; }
+    id('obs-text').value = lines.join('\n');
+    id('obs-text').focus();
+  } catch (err) { if (tok === _obsTok) showError(err.message); }
+}
+
 function closeObsPopup() {
+  ++_obsTok;
   id('obs-overlay').classList.remove('show');
   id('obs-popup').classList.remove('show');
   _obsEntryIdx = null;
@@ -282,7 +327,7 @@ async function runHoras() {
       entries[s.i].offer.postings.push(...(data.postings || [data.posting]));
       posted = true;
       if (!live()) continue;
-      if (st) st.innerHTML = `<span class="hr-ok">${t('posted_amt', { a: esc((data.postings || [data.posting]).map(p => p.amount_text).join(' + ')) })}</span>`;
+      if (st) st.innerHTML = horasPostedHtml(entries[s.i].offer, data.postings || [data.posting], 'span');
       id(`hr-${s.i}`)?.classList.add('posted');
       const chk = id(`hr-chk-${s.i}`); if (chk) { chk.checked = false; chk.disabled = true; }
       const obs = id(`hr-obs-btn-${s.i}`); if (obs) obs.disabled = true;

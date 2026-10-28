@@ -11,11 +11,12 @@ const SHORTCUTS = [
   { k: '/',           i: 'keys_search' },
   { k: '←  →',  i: 'keys_day' },
   { k: 'T',           i: 'today' },
-  { k: '1  2',        i: 'keys_tabs' },
+  { k: '1  2  3',     i: 'keys_tabs' },
   { k: 'G',           i: 'keys_calendar' },
   { k: 'C',           i: 'keys_chart' },
   { k: 'A',           i: 'keys_addentry' },
   { k: '[',           i: 'keys_sidebar' },
+  { k: 'J  K',        i: 'keys_sitting' },
   { k: '?',           i: 'keys_help' },
 ];
 
@@ -35,7 +36,7 @@ function hideKeys() {
 // shortcuts stay out of the way until the one on top is dismissed, so they never
 // compete with the Enter/Escape handling further down.
 const POPUP_IDS = ['newtask-popup', 'settings-popup', 'horas-popup',
-                   'obs-popup', 'cal-popup', 'edit-popup', 'addentry-popup',
+                   'obs-popup', 'cal-popup', 'edit-popup', 'task-project-popup', 'addentry-popup',
                    'keys-popup', 'login-popup', 'approve-popup', 'source-popup', 'confirm-popup'];
 function anyPopupOpen() { return POPUP_IDS.some(p => id(p) && id(p).classList.contains('show')); }
 function isTyping(e) {
@@ -80,8 +81,36 @@ document.addEventListener('keydown', e => {
   // A confirmation sits on top of everything: it takes Enter and Escape alone.
   if ((e.key === 'Escape' || e.key === 'Enter') && id('confirm-popup').classList.contains('show')) {
     e.preventDefault();
-    closeConfirm(e.key === 'Enter');
+    closeConfirm(e.key === 'Enter' && e.target !== id('confirm-cancel'));
     return;
+  }
+  if (e.key === 'Escape' && selectionUiOpen()) {
+    e.preventDefault();
+    if (_selectionMenu) closeSelectionMenu(); else closeSelectionPicker();
+    return;
+  }
+  if (e.key === 'Escape' && _selectedNotes.size && !anyPopupOpen() && (activeTab === 'report' || activeTab === 'timeline')) {
+    e.preventDefault(); clearNoteSelection(); return;
+  }
+  if (activeTab === 'report' && !anyPopupOpen() && !selectionUiOpen()) {
+    const row = e.target.closest?.('.slot-row');
+    if ((e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) && row?.classList.contains('sel') && e.target.classList?.contains('slot-time')) {
+      e.preventDefault();
+      openSelectionMenu(e, row);
+      return;
+    }
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.classList?.contains('slot-time') && e.target.classList.contains('pick')) {
+      e.preventDefault();
+      selectSlot(e, Number(row.dataset.bi), Number(row.dataset.slot));
+      return;
+    }
+    if (_slotSel && !isTyping(e)) {
+      if (e.key === 'Escape') { e.preventDefault(); clearSlotSelection(); return; }
+      if (e.key === 'Delete') { e.preventDefault(); deleteSelectedTime(); return; }
+      if (ctrl && (e.key === 'c' || e.key === 'C') && !window.getSelection()?.toString()) {
+        e.preventDefault(); copySelectedTime(); return;
+      }
+    }
   }
   // The calendar can sit on top of another dialog: it takes the key alone.
   if ((e.key === 'Escape' || e.key === 'Enter') && id('cal-popup').classList.contains('show')) {
@@ -99,6 +128,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && id('newtask-popup').classList.contains('show')) hideNewTask();
   if (e.key === 'Enter'  && id('newtask-popup').classList.contains('show')) applyNewTask();
   if (e.key === 'Escape' && id('settings-popup').classList.contains('show')) hideSettings();
+  if (e.key === 'Escape' && id('projects-popup').classList.contains('show')) { if (_deletingProject != null) cancelDeleteProject(); else hideProjects(); }
   if (e.key === 'Enter'  && id('settings-popup').classList.contains('show') && e.target.tagName !== 'BUTTON') applySettings();
   // Notes opens over Post hours: Escape closes Notes alone.
   if (e.key === 'Escape' && id('obs-popup').classList.contains('show')) { closeObsPopup(); return; }
@@ -107,6 +137,8 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && id('horas-popup').classList.contains('show')) hideHoras();
   if (e.key === 'Escape' && id('edit-popup').classList.contains('show')) closeEditTime();
   if (e.key === 'Enter'  && id('edit-popup').classList.contains('show')) { e.preventDefault(); applyEditTime(); }
+  if (e.key === 'Escape' && id('task-project-popup').classList.contains('show')) closeTaskProject();
+  if (e.key === 'Enter' && id('task-project-popup').classList.contains('show')) { e.preventDefault(); saveTaskProject(); }
   if (e.key === 'Escape' && id('addentry-popup').classList.contains('show')) hideAddEntry();
   if (e.key === 'Enter'  && id('addentry-popup').classList.contains('show')) applyAddEntry();
   if (e.key === 'Escape' && id('keys-popup').classList.contains('show')) hideKeys();
@@ -124,10 +156,14 @@ document.addEventListener('keydown', e => {
     case 'ArrowRight':  e.preventDefault(); stepDay(1);     return;
     case 't': case 'T': e.preventDefault(); goToDate(todayStr()); return;
     case '1':           e.preventDefault(); setTab('report');    return;
-    case '2':           e.preventDefault(); setTab('summary');   return;
+    case '2':           e.preventDefault(); setTab('timeline');  return;
+    case '3':           e.preventDefault(); setTab('summary');   return;
     case 'g': case 'G': e.preventDefault(); showCalendar(); return;
     case '[':           e.preventDefault(); toggleLeftPanel(); return;
     case '?':           e.preventDefault(); showKeys();     return;
+  }
+  if ((e.key === 'j' || e.key === 'k') && activeTab === 'timeline') {
+    e.preventDefault(); readerStep(e.key === 'j' ? 1 : -1); return;
   }
   if (e.key === 'c' || e.key === 'C') {
     if (activeTab === 'report') { e.preventDefault(); toggleChartVisible(); }

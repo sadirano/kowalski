@@ -10,21 +10,34 @@ extern "bcrypt" fn BCryptGenRandom(?*anyopaque, [*]u8, u32, u32) callconv(.winap
 pub const current_version = @import("build_options").version;
 pub const release_repo = @import("build_options").update_repo;
 pub const releases_url = "https://api.github.com/repos/" ++ release_repo ++ "/releases/latest";
+pub const preview_releases_url = "https://api.github.com/repos/" ++ release_repo ++ "/releases?per_page=30";
 pub const release_public_key: [32]u8 = blk: {
     var key: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&key, @import("build_options").update_key) catch unreachable;
     break :blk key;
 };
 
-pub const Version = struct { major: u32, minor: u32, patch: u32 };
+pub const Version = struct { major: u32, minor: u32, patch: u32, preview: ?u32 = null };
 pub fn parseVersion(text: []const u8) ?Version {
     const bare = if (std.mem.startsWith(u8, text, "v")) text[1..] else text;
-    var parts = std.mem.splitScalar(u8, bare, '.');
+    const dash = std.mem.indexOfScalar(u8, bare, '-');
+    const base = if (dash) |i| bare[0..i] else bare;
+    const preview: ?u32 = if (dash) |i| blk: {
+        const suffix = bare[i..];
+        if (!std.mem.startsWith(u8, suffix, "-preview.")) return null;
+        const number = suffix["-preview.".len..];
+        if (number.len == 0 or number[0] == '0') return null;
+        for (number) |digit| if (!std.ascii.isDigit(digit)) return null;
+        const n = std.fmt.parseInt(u32, number, 10) catch return null;
+        if (n == 0) return null;
+        break :blk n;
+    } else null;
+    var parts = std.mem.splitScalar(u8, base, '.');
     const major = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
     const minor = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
     const patch = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
     if (parts.next() != null) return null;
-    return .{ .major = major, .minor = minor, .patch = patch };
+    return .{ .major = major, .minor = minor, .patch = patch, .preview = preview };
 }
 
 pub fn versionFromFile(path: []const u8) ?[]const u8 {
@@ -40,9 +53,16 @@ pub fn versionFromFile(path: []const u8) ?[]const u8 {
 fn newerThan(tag: []const u8, running: []const u8) bool {
     const found = parseVersion(tag) orelse return false;
     const current = parseVersion(running) orelse return false;
+    return versionIsNewer(found, current);
+}
+
+fn versionIsNewer(found: Version, current: Version) bool {
     if (found.major != current.major) return found.major > current.major;
     if (found.minor != current.minor) return found.minor > current.minor;
-    return found.patch > current.patch;
+    if (found.patch != current.patch) return found.patch > current.patch;
+    if (found.preview == null) return current.preview != null;
+    if (current.preview == null) return false;
+    return found.preview.? > current.preview.?;
 }
 
 fn newer(tag: []const u8) bool { return newerThan(tag, current_version); }
@@ -58,9 +78,14 @@ pub const Release = struct {
     signed: bool = false,
 };
 pub const Check = union(enum) { up_to_date, available: Release };
+pub const Channel = enum { stable, preview };
 
 pub fn parseRelease(a: std.mem.Allocator, bytes: []const u8) !Check {
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    return parseReleaseObject(a, root);
+}
+
+fn parseReleaseObject(a: std.mem.Allocator, root: std.json.Value) !Check {
     if (root != .object) return error.BadRelease;
     const tag_value = root.object.get("tag_name") orelse return error.BadRelease;
     if (tag_value != .string or !newer(tag_value.string)) return .up_to_date;
@@ -130,10 +155,27 @@ pub fn httpGet(_: *anyopaque, a: std.mem.Allocator, io: Io, url: []const u8, red
     return body.buffered();
 }
 
-pub fn check(a: std.mem.Allocator, io: Io, fetcher: Fetcher) anyerror!Check {
+pub fn check(a: std.mem.Allocator, io: Io, fetcher: Fetcher, channel: Channel) anyerror!Check {
     if (release_repo.len == 0) return error.UpdatesDisabled;
-    const bytes = try fetcher.get(fetcher.context, a, io, releases_url, false, 1024 * 1024);
-    return parseRelease(a, bytes);
+    const bytes = try fetcher.get(fetcher.context, a, io, if (channel == .stable) releases_url else preview_releases_url, false, 1024 * 1024);
+    if (channel == .stable) return parseRelease(a, bytes);
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    if (root != .array) return error.BadRelease;
+    var best: ?std.json.Value = null;
+    var best_version = parseVersion(current_version) orelse return error.BadVersion;
+    for (root.array.items) |item| {
+        if (item != .object) continue;
+        const draft = item.object.get("draft") orelse continue;
+        if (draft != .bool or draft.bool) continue;
+        const tag = item.object.get("tag_name") orelse continue;
+        if (tag != .string) continue;
+        const version = parseVersion(tag.string) orelse continue;
+        if (versionIsNewer(version, best_version)) {
+            best = item;
+            best_version = version;
+        }
+    }
+    return if (best) |item| parseReleaseObject(a, item) else .up_to_date;
 }
 
 pub fn validDownload(bytes: []const u8, release: Release) !void {
@@ -297,7 +339,7 @@ pub fn outcome(value: ?journal.Journal) ?Outcome {
     return .{ .id = j.id, .from = j.from, .to = j.to, .phase = j.phase, .reason = j.reason, .ack = j.ack };
 }
 
-pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db_path: []const u8, version: []const u8, local_file: ?[]const u8) anyerror!Installed {
+pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, channel: Channel, db_path: []const u8, version: []const u8, local_file: ?[]const u8) anyerror!Installed {
     var lock = update_lock.tryAcquire() orelse return error.UpdateInProgress;
     errdefer lock.release();
     // An unfinished transaction still needs its .old executables to roll back.
@@ -315,7 +357,7 @@ pub fn install(a: std.mem.Allocator, io: Io, fetcher: Fetcher, db_path: []const 
         signature = try cwd.readFileAlloc(io, try std.fmt.allocPrint(a, "{s}.sig", .{file}), a, .limited(1024));
     } else {
         if (release_repo.len == 0) return error.UpdatesDisabled;
-        const latest = try check(a, io, fetcher);
+        const latest = try check(a, io, fetcher, channel);
         const release = switch (latest) {
             .up_to_date => return error.NoUpdate,
             .available => |r| r,
@@ -375,10 +417,19 @@ pub fn cleanup(a: std.mem.Allocator, io: Io, db_path: []const u8) !void {
     }
 }
 
-test "version comparison ignores malformed and prerelease tags" {
+test "version comparison accepts previews and ignores malformed tags" {
     try std.testing.expect(parseVersion("v0.1.0") != null);
     try std.testing.expect(parseVersion("v0.1.0-rc1") == null);
+    try std.testing.expect(parseVersion("0.3.0-preview") == null);
+    try std.testing.expect(parseVersion("0.3.0-preview.0") == null);
+    try std.testing.expect(parseVersion("0.3.0-preview.01") == null);
     try std.testing.expect(parseVersion("garbage") == null);
+    try std.testing.expectEqual(@as(?u32, 2), parseVersion("v0.3.0-preview.2").?.preview);
+    try std.testing.expect(newerThan("0.3.0-preview.2", "0.3.0-preview.1"));
+    try std.testing.expect(newerThan("0.3.0", "0.3.0-preview.2"));
+    try std.testing.expect(newerThan("0.3.1-preview.1", "0.3.0"));
+    try std.testing.expect(!newerThan("0.3.0-preview.2", "0.3.0"));
+    try std.testing.expectEqualStrings("0.3.0-preview.2", versionFromFile("kowalski-v0.3.0-preview.2-windows-x86_64.zip").?);
     try std.testing.expect(newerThan("v0.1.1", "0.1.0"));
     try std.testing.expect(newerThan("v0.2.0", "0.1.1"));
     try std.testing.expect(newerThan("v1.0.0", "0.2.0"));
@@ -447,10 +498,10 @@ test "unsigned release returns before fetching ZIP" {
         }
     }.get };
     if (release_repo.len == 0) {
-        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, "unused.db", "99.0.0", null));
+        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, .stable, "unused.db", "99.0.0", null));
         try std.testing.expectEqual(@as(usize, 0), calls);
     } else {
-        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, "unused.db", "99.0.0", null));
+        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, .stable, "unused.db", "99.0.0", null));
         try std.testing.expectEqual(@as(usize, 1), calls);
     }
 }
@@ -477,7 +528,7 @@ test "install refuses a held update lock" {
     }
     while (!state.ready.load(.acquire)) std.Thread.yield() catch {};
     const fetcher: Fetcher = .{ .context = &state, .get = State.noFetch };
-    try std.testing.expectError(error.UpdateInProgress, install(std.testing.allocator, std.testing.io, fetcher, "unused.db", "1.0.0", "missing.zip"));
+    try std.testing.expectError(error.UpdateInProgress, install(std.testing.allocator, std.testing.io, fetcher, .stable, "unused.db", "1.0.0", "missing.zip"));
 }
 
 test "digest mismatch rejects download" {
@@ -624,11 +675,66 @@ test "release check uses the HTTP seam without network" {
         }
     }.get };
     if (release_repo.len == 0) {
-        try std.testing.expectError(error.UpdatesDisabled, check(arena.allocator(), std.testing.io, fake));
+        try std.testing.expectError(error.UpdatesDisabled, check(arena.allocator(), std.testing.io, fake, .stable));
         try std.testing.expect(!called);
     } else {
-        const result = try check(arena.allocator(), std.testing.io, fake);
+        const result = try check(arena.allocator(), std.testing.io, fake, .stable);
         try std.testing.expect(called);
         try std.testing.expect(result == .available);
+    }
+}
+
+const preview_list_json =
+    \\[{"draft":true,"tag_name":"v100.0.0","html_url":"https://example.test/draft","assets":[]},
+    \\ {"draft":false,"tag_name":"v0.1.0-preview.1","html_url":"https://example.test/old-preview","assets":[]},
+    \\ {"draft":false,"tag_name":"v99.0.0-preview.2","html_url":"https://example.test/preview","assets":[{"name":"kowalski-v99.0.0-preview.2-windows-x86_64.zip","size":2,"browser_download_url":"https://example.test/download"}]},
+    \\ {"draft":false,"tag_name":"v0.1.0","html_url":"https://example.test/old-stable","assets":[]}]
+;
+
+test "preview check selects newest nondraft release through HTTP seam" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var called = false;
+    const fake: Fetcher = .{ .context = &called, .get = struct {
+        fn get(context: *anyopaque, _: std.mem.Allocator, _: Io, url: []const u8, redirects: bool, max_size: usize) ![]const u8 {
+            const seen: *bool = @ptrCast(@alignCast(context));
+            seen.* = true;
+            try std.testing.expectEqualStrings(preview_releases_url, url);
+            try std.testing.expect(!redirects);
+            try std.testing.expectEqual(@as(usize, 1024 * 1024), max_size);
+            return preview_list_json;
+        }
+    }.get };
+    if (release_repo.len == 0) {
+        try std.testing.expectError(error.UpdatesDisabled, check(arena.allocator(), std.testing.io, fake, .preview));
+        try std.testing.expect(!called);
+    } else {
+        const result = try check(arena.allocator(), std.testing.io, fake, .preview);
+        try std.testing.expect(called);
+        try std.testing.expectEqualStrings("99.0.0-preview.2", result.available.version);
+        try std.testing.expectEqualStrings("https://example.test/download", result.available.download_url);
+    }
+}
+
+test "preview install recheck uses preview releases URL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var called = false;
+    const fake: Fetcher = .{ .context = &called, .get = struct {
+        fn get(context: *anyopaque, _: std.mem.Allocator, _: Io, url: []const u8, redirects: bool, max_size: usize) ![]const u8 {
+            const seen: *bool = @ptrCast(@alignCast(context));
+            seen.* = true;
+            try std.testing.expectEqualStrings(preview_releases_url, url);
+            try std.testing.expect(!redirects);
+            try std.testing.expectEqual(@as(usize, 1024 * 1024), max_size);
+            return preview_list_json;
+        }
+    }.get };
+    if (release_repo.len == 0) {
+        try std.testing.expectError(error.UpdatesDisabled, install(arena.allocator(), std.testing.io, fake, .preview, "unused.db", "99.0.0-preview.2", null));
+        try std.testing.expect(!called);
+    } else {
+        try std.testing.expectError(error.UnsignedRelease, install(arena.allocator(), std.testing.io, fake, .preview, "unused.db", "99.0.0-preview.2", null));
+        try std.testing.expect(called);
     }
 }

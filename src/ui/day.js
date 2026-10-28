@@ -19,42 +19,75 @@ function setDateTitle(date) {
 // Each day load takes a generation; neither response may paint an older day.
 let _dayGen = 0;
 
-async function loadDay(date, { chart = false } = {}) {
+// The refresh asks for the project list only after the daemon reports a
+// change; null keeps the list it has.
+// The list and its rev are kept together, and only when the day load that
+// asked for them is used.
+function backgroundProjects() {
+  const rev = S?.projects_rev ?? null;
+  if (rev != null && rev === _projectsRev) return Promise.resolve(null);
+  return apiJSON('GET', '/api/projects?archived=1').then(data => ({ list: data.projects, rev })).catch(() => null);
+}
+let _dayLoads = 0;
+
+async function loadDay(date, { chart = false, background = false } = {}) {
+  if (background && _dayLoads > 0) return;
+  ++_dayLoads;
   const gen = ++_dayGen;
   const tab = activeTab;
   try {
-    const [days, day] = await Promise.all([
+    const [days, day, dayProjects] = await Promise.all([
       fetchWeek(),
       apiJSON('GET', '/api/day?date=' + date),
+      // Background results stay local until the editing check below.
+      background
+        ? backgroundProjects()
+        : loadProjects().catch(() => null),
     ]);
     if (gen !== _dayGen || selectedDate !== date || activeTab !== tab) return;
+    if (background && isEditing()) return;
+    if (background && Array.isArray(dayProjects?.list)) { projects = dayProjects.list; _projectsRev = dayProjects.rev; }
     weekData = days;
     D = day;
     setDateTitle(date);
     id('table-area').classList.toggle('summary-view', tab === 'summary');
     renderSchedule();
     renderSidebar();
+    id('cards').parentElement.style.display = tab === 'timeline' ? 'none' : ''; // the timeline reads one task, not the day's numbers
     renderCards(D);
     if (tab === 'report') {
       renderReport(D);
-      if (chart) loadChart();
+      if (chart) loadChart({ background });
+      else updateChartSelectedDay(date);
+    } else if (tab === 'timeline') {
+      id('chart-box').style.display = 'none'; // the timeline has its own day ribbon
+      renderReport(D);
     } else {
       loadSummary(D, date);
     }
+    if (!TOUR) {
+      saveLS('lastDayCache', { date, day: D, state: S, week: weekData, projects, chartData: _lastChartData });
+      if (date === todayStr()) saveLS('bootCache', { date, day: D, state: S, week: weekData, projects, chartData: _lastChartData });
+    }
   } catch (e) {
-    if (gen !== _dayGen) return;
+    if (gen !== _dayGen || background) return;
     id('table-area').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  } finally {
+    --_dayLoads;
   }
 }
 
-async function loadChart() {
+let _chartLoadGen = 0;
+async function loadChart({ background = false } = {}) {
+  const gen = ++_chartLoadGen;
   if (!_chartVisible) { id('chart-box').style.display = 'none'; return; }
   id('chart-box').style.display = '';
   try {
     const pts = await apiJSON('GET', '/api/chart?days=' + chartDays + '&group=' + encodeURIComponent(chartGroupBy));
+    if (gen !== _chartLoadGen || !_chartVisible) return;
     renderChart(pts);
   } catch (e) {
-    showError(e.message);
+    if (!background && gen === _chartLoadGen) showError(e.message);
   }
 }
 
@@ -80,7 +113,7 @@ function toggleChartExpand() {
   btn.textContent = chartExpanded ? '⤡' : '⤢';
   btn.title = label;
   btn.setAttribute('aria-label', label);
-  if (chartInst) chartInst.resize();
+  if (chartInst) chartInst.onResize();
 }
 
 

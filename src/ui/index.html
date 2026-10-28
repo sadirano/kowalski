@@ -8,8 +8,23 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <meta name="theme-color" content="#0f1117">
-<script src="/vendor/chart-4.4.0.min.js"></script>
 <link rel="stylesheet" href="/ui/app.css">
+<script>
+(function(){
+  try {
+    var s = JSON.parse(localStorage.getItem('kw.settingsCache') || '{}');
+    var tab = JSON.parse(localStorage.getItem('kw.activeTab') || '"report"');
+    document.documentElement.classList.add('init-left-panel');
+    if (s.ui_left_collapsed === '1') document.documentElement.classList.add('init-left-collapsed');
+    if (s.ui_chart_visible === '0' || tab !== 'report') document.documentElement.classList.add('init-chart-hidden');
+    if (s.ui_show_keys === '0') document.documentElement.classList.add('init-keys-hidden');
+    var rawLw = parseInt(s.ui_left_width, 10);
+    var lw = isNaN(rawLw) ? 220 : Math.max(150, Math.min(520, rawLw));
+    var maxW = Math.max(150, Math.min(520, Math.round(window.innerWidth / 3)));
+    document.documentElement.style.setProperty('--left-w', Math.min(lw, maxW) + 'px');
+  } catch(e) {}
+})();
+</script>
 </head>
 <body>
 <!-- Line icons in the text colour; one copy each, used by every button -->
@@ -17,9 +32,11 @@
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 20 3M16 7l3 3M13.5 9.5l2 2"/></symbol>
   <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19.5 8.5a2.1 2.1 0 0 0-4-4L4 16z"/><path d="m14 6 4 4"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4"/></symbol>
   <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></symbol>
   <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20h16M7 17v-5M12 17V6M17 17V9"/></symbol>
+  <symbol id="i-timeline" viewBox="0 0 24 24"><path d="M7 3v18M7 5h6M7 12h10M7 19h8"/><circle cx="7" cy="5" r="1.5"/><circle cx="7" cy="12" r="1.5"/><circle cx="7" cy="19" r="1.5"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><path class="fill" d="M8 5.5v13l10.5-6.5z"/></symbol>
   <symbol id="i-pause" viewBox="0 0 24 24"><path class="fill" d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></symbol>
   <symbol id="i-more" viewBox="0 0 24 24"><path d="M5 12h.01M12 12h.01M19 12h.01" stroke-width="3"/></symbol>
@@ -30,6 +47,7 @@
   <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></symbol>
   <symbol id="i-note" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h7M9 17h5"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 2.5 3 6.1 6.7 1-4.9 4.8 1.2 6.7-6-3.2-6 3.2 1.2-6.7-4.9-4.8 6.7-1z"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 5 5 9-10"/></symbol>
   <symbol id="i-chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
@@ -39,7 +57,7 @@
   <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12 20 4l-6 16-2-7z"/></symbol>
   <symbol id="i-compass" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/></symbol>
   <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6V14M12 17h.01"/></symbol>
-  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M18.87 9.83 L21.38 10.51 L21.38 13.49 L18.87 14.17 L18.39 15.32 L19.69 17.58 L17.58 19.69 L15.32 18.39 L14.17 18.87 L13.49 21.38 L10.51 21.38 L9.83 18.87 L8.68 18.39 L6.42 19.69 L4.31 17.58 L5.61 15.32 L5.13 14.17 L2.62 13.49 L2.62 10.51 L5.13 9.83 L5.61 8.68 L4.31 6.42 L6.42 4.31 L8.68 5.61 L9.83 5.13 L10.51 2.62 L13.49 2.62 L14.17 5.13 L15.32 5.61 L17.58 4.31 L19.69 6.42 L18.39 8.68Z"/><circle cx="12" cy="12" r="3"/></symbol>
 </svg>
 
 <header>
@@ -51,8 +69,9 @@
     <button type="button" class="nav-btn icon-btn" onclick="stepDay(1)" title="Next day" aria-label="Next day" data-i18n-title="next_day" data-i18n-aria="next_day">⟩</button>
   </div>
   <div class="tabs" id="main-tabs">
-    <div class="tab active" data-tab="report" onclick="setTab('report',this)" data-i18n="tab_report">Report</div>
-    <div class="tab" data-tab="summary" onclick="setTab('summary',this)" data-i18n="tab_summary">Summary</div>
+    <div class="tab" data-tab="report" onclick="setTab('report',this)" title="Report" aria-label="Report" data-i18n-title="tab_report" data-i18n-aria="tab_report"><svg class="ico" aria-hidden="true"><use href="#i-chart"/></svg></div>
+    <div class="tab" data-tab="timeline" onclick="setTab('timeline',this)" title="Timeline" aria-label="Timeline" data-i18n-title="tab_timeline" data-i18n-aria="tab_timeline"><svg class="ico" aria-hidden="true"><use href="#i-timeline"/></svg></div>
+    <div class="tab" data-tab="summary" onclick="setTab('summary',this)" title="Summary" aria-label="Summary" data-i18n-title="tab_summary" data-i18n-aria="tab_summary"><svg class="ico" aria-hidden="true"><use href="#i-note"/></svg></div>
   </div>
   <div class="search-box">
     <input type="text" id="task-search" class="search-input" autocomplete="off" spellcheck="false"
@@ -68,6 +87,7 @@
     <div class="hdr-task-text">
       <div class="hdr-ref idle" id="hdr-ref">No active session</div>
       <div class="hdr-detail" id="hdr-detail"></div>
+      <div class="capture-popover" id="capture-popover" hidden></div>
     </div>
   </div>
   <div class="hdr-right">
@@ -82,6 +102,7 @@
       <div class="hdr-menu" id="more-menu" role="menu">
       <button type="button" class="menu-item" role="menuitem" id="login-btn" onclick="moreDo(showLogin)" style="display:none"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span data-i18n="login_title">Sign in to the provider</span></button>
       <button type="button" class="menu-item" role="menuitem" id="lang-item" onclick="moreDo(cycleLang)"><svg class="ico" aria-hidden="true"><use href="#i-globe"/></svg><span data-i18n="menu_lang">Language</span></button>
+      <button type="button" class="menu-item" role="menuitem" onclick="moreDo(showProjects)"><svg class="ico" aria-hidden="true"><use href="#i-lanes"/></svg><span data-i18n="projects">Projects</span></button>
       <button type="button" class="menu-item" role="menuitem" onclick="moreDo(showAddEntry)"><svg class="ico" aria-hidden="true"><use href="#i-entry"/></svg><span data-i18n="menu_add_entry">Add a past entry</span><kbd>A</kbd></button>
       <button type="button" class="menu-item" role="menuitem" id="chart-toggle" onclick="moreDo(toggleChartVisible)"><svg class="ico" aria-hidden="true"><use href="#i-chart"/></svg><span data-i18n="menu_chart_hide">Hide the chart</span><kbd>C</kbd></button>
       <button type="button" class="menu-item" role="menuitem" onclick="moreDo(showKeys)"><svg class="ico" aria-hidden="true"><use href="#i-kbd"/></svg><span data-i18n="menu_keys">Keyboard shortcuts</span><kbd>?</kbd></button>
@@ -107,7 +128,10 @@
   </label>
   <div id="nt-info" style="display:none;flex-direction:column;gap:4px;padding:2px 2px 0"></div>
   <label><span data-i18n="lbl_title">Title</span>
-    <input type="text" id="nt-title" autocomplete="off">
+    <input type="text" id="nt-title" autocomplete="off" onblur="syncNewTaskProjectFromId()" data-i18n-ph="project_title_or_id" placeholder="Title or #task ID">
+  </label>
+  <label><span data-i18n="project">Project</span>
+    <select id="nt-project"></select>
   </label>
   <div class="popup-row" style="margin-top:2px">
     <button class="apply-btn" id="nt-submit" onclick="applyNewTask()" style="flex:1" data-i18n="btn_start">Start</button>
@@ -116,16 +140,16 @@
 </div>
 
 <!-- Settings: one page in sections; a single Save sends every change -->
-<div class="newtask-overlay" id="settings-overlay" onclick="hideSettings()"></div>
+<div class="newtask-overlay" id="settings-overlay" onclick="hideSettings();hideProjects()"></div>
 <div class="set-popup" id="settings-popup" role="dialog" aria-labelledby="set-title">
   <div class="set-head"><h3 id="set-title" data-i18n="set_title">Settings</h3>
     <button type="button" class="set-x" onclick="hideSettings()" aria-label="Close"><svg class="ico" aria-hidden="true"><use href="#i-x"/></svg></button></div>
   <div class="set-body">
-    <section class="set-sec">
+    <section class="set-sec" data-help="s_daily">
       <h4><svg class="ico" aria-hidden="true"><use href="#i-clock"/></svg><span data-i18n="sec_workday">Workday</span></h4>
       <div class="set-row"><label class="set-lbl" for="set-daily-h"><span data-i18n="set_daily">Daily target</span></label>
         <div class="set-ctl"><span class="fld"><input id="set-daily-h" class="n" inputmode="numeric" maxlength="2" autocomplete="off"><i>h</i></span><span class="fld"><input id="set-daily-m" class="n" inputmode="numeric" maxlength="2" autocomplete="off"><i>min</i></span></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-lunch"><span data-i18n="set_lunch">Minimum break</span><small data-i18n="set_lunch_hint">Your lunch is the day's longest pause of at least half this time.</small></label>
+      <div class="set-row"><label class="set-lbl" for="set-lunch"><span data-i18n="set_lunch">Lunch</span><small data-i18n="set_lunch_hint">Your lunch is the day's longest pause of at least half this time.</small></label>
         <div class="set-ctl"><span class="fld"><input id="set-lunch" class="n" inputmode="numeric" maxlength="3" autocomplete="off"><i>min</i></span></div></div>
       <div class="set-row"><label class="set-lbl" for="set-paid-mode"><span data-i18n="set_paid_breaks">Paid breaks</span></label>
         <div class="set-ctl"><span class="sel"><select id="set-paid-mode" onchange="renderPaidRows(true)">
@@ -138,49 +162,26 @@
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-lock-on" onchange="renderLockRows(true)"></div></div>
       <div class="win-list" id="lock-rows"></div>
     </section>
-    <section class="set-sec">
-      <h4><svg class="ico" aria-hidden="true"><use href="#i-display"/></svg><span data-i18n="sec_display">Display</span></h4>
-      <div class="set-row"><label class="set-lbl" for="set-lang"><span data-i18n="set_lang">Language</span></label>
-        <div class="set-ctl"><span class="sel"><select id="set-lang">
-          <option value="en">English</option>
-          <option value="pt">Português</option>
-          <option value="ja">日本語</option>
-        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-time-format"><span data-i18n="set_time_format">Time format</span></label>
-        <div class="set-ctl"><span class="sel"><select id="set-time-format">
-          <option value="system" data-i18n="tf_system">System</option>
-          <option value="24" data-i18n="tf_24">24-hour</option>
-          <option value="12" data-i18n="tf_12">12-hour</option>
-        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-sidebar-days"><span data-i18n="set_sidebar">Days in the sidebar</span></label>
-        <div class="set-ctl"><span class="fld"><input id="set-sidebar-days" class="n" inputmode="numeric" maxlength="2" autocomplete="off"></span></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-day-order"><span data-i18n="set_day_order">Day order</span></label>
-        <div class="set-ctl"><span class="sel"><select id="set-day-order">
-          <option value="oldest" data-i18n="day_order_oldest">Oldest first</option>
-          <option value="newest" data-i18n="day_order_newest">Newest first</option>
-        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-show-weekends"><span data-i18n="set_show_weekends">Show weekends</span></label>
-        <div class="set-ctl"><input type="checkbox" class="sw" id="set-show-weekends"></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-summary-format"><span data-i18n="set_summary_format">Summary format</span></label>
-        <div class="set-ctl"><span class="sel"><select id="set-summary-format">
-          <option value="grouped" data-i18n="summary_grouped">Grouped</option>
-          <option value="chronological" data-i18n="summary_chrono">Chronological</option>
-        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
-      <div class="set-row" id="set-chart-tabs-row"><div class="set-lbl"><span data-i18n="set_chart_tabs">Chart tabs</span><small data-i18n="set_chart_tabs_hint">Task is always shown.</small></div>
-        <div class="set-ctl" id="set-chart-tabs"></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-links"><span data-i18n="set_links">Link refs to the provider</span></label>
-        <div class="set-ctl"><input type="checkbox" class="sw" id="set-links"></div></div>
-      <div class="set-row"><div class="set-lbl"><span data-i18n="set_header_btns">Header buttons</span></div>
-        <div class="set-ctl"><label class="set-sw"><input type="checkbox" class="sw" id="set-show-add-entry"><span data-i18n="btn_add_entry">Add entry</span></label><label class="set-sw"><input type="checkbox" class="sw" id="set-show-keys"><span data-i18n="btn_shortcuts">Shortcuts</span></label></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-single-keys"><span data-i18n="set_single_keys">Single-key shortcuts</span><small data-i18n="set_single_keys_hint">N, T, G, C, A, 1, 2, [, ?, / and the arrows.</small></label>
-        <div class="set-ctl"><input type="checkbox" class="sw" id="set-single-keys"></div></div>
-      <div class="set-row"><label class="set-lbl" for="set-open-launch"><span data-i18n="set_open_launch">Open the dashboard on launch</span><small data-i18n="set_open_launch_hint">When kowalski is opened from its .exe. Starting at logon stays quiet.</small></label>
-        <div class="set-ctl"><input type="checkbox" class="sw" id="set-open-launch"></div></div>
+    <section class="set-sec" data-help="s_zone">
+      <h4><svg class="ico" aria-hidden="true"><use href="#i-calendar"/></svg><span data-i18n="sec_day">Day and time zone</span></h4>
+      <div class="set-row"><label class="set-lbl" for="set-zone"><span data-i18n="set_zone">Reporting time zone</span><small data-i18n="set_zone_hint">Days are counted in this zone.</small></label>
+        <div class="set-ctl"><span class="sel"><select id="set-zone"></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-day-start"><span data-i18n="set_day_start">Day starts at</span><small data-i18n="set_day_start_hint">Work before this time belongs to the previous day.</small></label>
+        <div class="set-ctl"><input class="t" id="set-day-start" spellcheck="false" autocomplete="off" onchange="tidyDayStart(this)"></div></div>
     </section>
     <section class="set-sec">
-      <h4><svg class="ico" aria-hidden="true"><use href="#i-send"/></svg><span data-i18n="sec_posting">Posting</span></h4>
-      <div class="set-row"><label class="set-lbl" for="set-autofill"><span data-i18n="set_autofill">Use daily notes</span><small data-i18n="set_autofill_hint">Fill posting observations with the day's notes.</small></label>
-        <div class="set-ctl"><input type="checkbox" class="sw" id="set-autofill"></div></div>
+      <h4><svg class="ico" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="sec_capture">Capture</span></h4>
+      <div class="set-row"><label class="set-lbl" for="set-capture-keep"><span data-i18n="capture_keep_text">Keep captured text</span><small data-i18n="capture_keep_hint">Save agent prompts and outcomes as notes. Off keeps the time only.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-capture-keep"></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="capture_remove">Delete captured text</span><small id="capture-result" role="status" aria-live="polite"></small></div>
+        <div class="set-ctl"><input type="date" class="d" id="capture-from" aria-label="From" data-i18n-aria-label="project_from" oninput="invalidateCapturedPreview()"><i>&ndash;</i><input type="date" class="d" id="capture-to" aria-label="To" data-i18n-aria-label="project_to" oninput="invalidateCapturedPreview()"><button type="button" class="set-btn" id="capture-preview" onclick="previewCapturedText()" data-i18n="capture_preview">Preview</button><button type="button" class="set-btn" id="capture-remove" onclick="removeCapturedText()" data-i18n="capture_remove_button" disabled>Delete</button></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="set_hold_sources">Sources that keep the focus</span><small data-i18n="set_hold_sources_hint">While one of these runs, prompts from other sources count in parallel, such as a game you play.</small></div>
+        <div class="set-ctl set-checks" id="set-hold-sources"></div></div>
+    </section>
+    <section class="set-sec" data-help="s_autofill">
+      <h4><svg class="ico" aria-hidden="true"><use href="#i-send"/></svg><span data-i18n="sec_posting">Provider and posting</span></h4>
+      <div class="set-row"><label class="set-lbl" for="set-post-notes"><span data-i18n="set_post_notes">Post the day's notes</span><small data-i18n="set_post_notes_hint">Fill each posting's text with the task's notes for that day.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-post-notes"></div></div>
       <div class="set-row" id="set-post-sessions-row"><label class="set-lbl" for="set-post-sessions"><span data-i18n="set_post_sessions">Post each session with its start and end</span><small data-i18n="set_post_sessions_hint">One entry per focus session instead of the day's total. A running session waits until it stops.</small></label>
         <div class="set-ctl"><input type="checkbox" class="sw" id="set-post-sessions"></div></div>
       <div id="set-provider-rows"></div>
@@ -201,19 +202,42 @@
       <div class="set-row" id="set-account-row"><div class="set-lbl"><span data-i18n="set_account">Provider account</span></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="showLogin()"><svg class="ico" aria-hidden="true"><use href="#i-key"/></svg><span data-i18n="login_submit">Sign in</span></button></div></div>
     </section>
+    <section class="set-sec" data-help="s_lang">
+      <h4><svg class="ico" aria-hidden="true"><use href="#i-display"/></svg><span data-i18n="sec_display">Display</span></h4>
+      <div class="set-row"><label class="set-lbl" for="set-lang"><span data-i18n="set_lang">Language</span></label>
+        <div class="set-ctl"><span class="sel"><select id="set-lang">
+          <option value="en">English</option>
+          <option value="pt">Português</option>
+          <option value="ja">日本語</option>
+        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-time-format"><span data-i18n="set_time_format">Time format</span></label>
+        <div class="set-ctl"><span class="sel"><select id="set-time-format">
+          <option value="system" data-i18n="tf_system">System</option>
+          <option value="24" data-i18n="tf_24">24-hour</option>
+          <option value="12" data-i18n="tf_12">12-hour</option>
+        </select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-links"><span data-i18n="set_links">Link refs to the provider</span></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-links"></div></div>
+      <div class="set-row"><div class="set-lbl"><span data-i18n="set_header_btns">Header buttons</span></div>
+        <div class="set-ctl"><label class="set-sw"><input type="checkbox" class="sw" id="set-show-add-entry"><span data-i18n="btn_add_entry">Add entry</span></label><label class="set-sw"><input type="checkbox" class="sw" id="set-show-keys"><span data-i18n="btn_shortcuts">Shortcuts</span></label></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-show-summary"><span data-i18n="set_show_summary">Summary tab</span><small data-i18n="set_show_summary_hint">Timeline covers the same day; hide Summary if you do not use it.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-show-summary"></div></div>
+      <div class="set-row"><label class="set-lbl" for="set-single-keys"><span data-i18n="set_single_keys">Single-key shortcuts</span><small data-i18n="set_single_keys_hint">N, T, G, C, A, 1, 2, [, ?, / and the arrows.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-single-keys"></div></div>
+    </section>
     <details class="set-sec set-adv">
-      <summary><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="sec_advanced">Advanced</span><svg class="ico chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
-      <div class="set-row"><label class="set-lbl" for="set-zone"><span data-i18n="set_zone">Reporting time zone</span><small data-i18n="set_zone_hint">A Windows time zone name; days start and end at its midnight.</small></label>
-        <div class="set-ctl"><input type="text" id="set-zone" class="wide" spellcheck="false" autocomplete="off"></div></div>
+      <summary><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg><span data-i18n="sec_service">Updates and service</span><svg class="ico chev" aria-hidden="true"><use href="#i-chevr"/></svg></summary>
+      <div class="set-row" id="update-row" style="display:none"><label class="set-lbl" for="set-update-channel"><span data-i18n="update_channel">Updates</span><small><span data-i18n="update_version">Current version</span>: <span id="set-version">...</span></small><small id="update-stable-note" data-i18n="update_stable_note" style="display:none">Stable waits for the next stable release. Only a backup made before an upgrade goes back to an older version.</small></label>
+        <div class="set-ctl"><span class="sel"><select id="set-update-channel"><option value="stable" data-i18n="update_stable">Stable</option><option value="preview" data-i18n="update_preview">Preview</option></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span><button type="button" class="set-btn" id="update-check" onclick="checkKowalskiUpdate()" data-i18n="update_check">Check for updates</button></div></div>
+      <div class="update-result" id="update-result" style="display:none"><span id="update-message"></span>
+        <a id="update-notes" target="_blank" rel="noopener noreferrer" data-i18n="update_notes" style="display:none">Release notes</a>
+        <button type="button" class="set-btn" id="update-install" onclick="installKowalskiUpdate()" data-i18n="update_install" style="display:none">Update and restart</button></div>
+      <div class="set-row"><label class="set-lbl" for="set-open-launch"><span data-i18n="set_open_launch">Open the dashboard on launch</span><small data-i18n="set_open_launch_hint">When kowalski is opened from its .exe. Starting at logon stays quiet.</small></label>
+        <div class="set-ctl"><input type="checkbox" class="sw" id="set-open-launch"></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="set_port">HTTP port</span><small data-i18n="set_port_hint">Change it with kowalski set http_port, then restart kowalski and install the app again.</small></div>
         <div class="set-ctl"><span class="set-ro" id="set-port"></span></div></div>
       <div class="set-row"><div class="set-lbl"><span data-i18n="restart_btn">Restart kowalski</span><small data-i18n="restart_hint">Stops and starts the background service, for example to load a newly approved provider.</small></div>
         <div class="set-ctl"><button type="button" class="set-btn" onclick="restartKowalski()" data-i18n="restart_btn">Restart kowalski</button></div></div>
-      <div class="set-row" id="update-row" style="display:none"><div class="set-lbl"><span data-i18n="update_check">Check for updates</span><small><span data-i18n="update_version">Current version</span>: <span id="set-version">...</span></small></div>
-        <div class="set-ctl"><button type="button" class="set-btn" id="update-check" onclick="checkKowalskiUpdate()" data-i18n="update_check">Check for updates</button></div></div>
-      <div class="update-result" id="update-result" style="display:none"><span id="update-message"></span>
-        <a id="update-notes" target="_blank" rel="noopener noreferrer" data-i18n="update_notes" style="display:none">Release notes</a>
-        <button type="button" class="set-btn" id="update-install" onclick="installKowalskiUpdate()" data-i18n="update_install" style="display:none">Update and restart</button></div>
     </details>
   </div>
   <div class="set-foot">
@@ -221,6 +245,26 @@
     <button type="button" class="set-save" onclick="applySettings()" data-i18n="save_changes">Save changes</button>
   </div>
 </div>
+<div class="set-popup" id="projects-popup" role="dialog" aria-labelledby="projects-title">
+  <div class="set-head"><h3 id="projects-title" data-i18n="projects">Projects</h3>
+    <button type="button" class="set-x" onclick="hideProjects()" aria-label="Close"><svg class="ico" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+  <div class="set-body">
+    <section class="set-sec">
+      <div id="set-project-list" class="proj-list"></div>
+      <details class="proj-archived" id="set-project-archived"><summary></summary><div id="set-project-archived-list" class="proj-list"></div></details>
+      <div class="proj-add"><input id="set-project-new" type="text" maxlength="200" data-i18n-ph="project_name" placeholder="Project name" spellcheck="false" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();addProject()}"><button type="button" class="set-btn" onclick="addProject()"><svg class="ico" aria-hidden="true"><use href="#i-plus"/></svg><span data-i18n="project_add">Add project</span></button></div>
+      <div class="set-row" id="set-project-field-row"><label class="set-lbl" for="set-project-field"><span data-i18n="project_provider_field">Project from a provider field</span><small data-i18n="project_provider_field_hint">A new task joins the project named in this field.</small></label>
+        <div class="set-ctl"><span class="sel"><select id="set-project-field" onchange="saveProjectField(this.value)"></select><svg class="ico" aria-hidden="true"><use href="#i-chev"/></svg></span></div></div>
+    </section>
+    <section class="set-sec">
+      <h4><svg class="ico" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="project_capture_sources">Capture sources</span></h4>
+      <div class="proj-hint" data-i18n="project_capture_sources_hint">Each repository your agents work in, and the project its time goes to.</div>
+      <div id="set-project-keys" class="proj-list"></div>
+    </section>
+  </div>
+  <div class="set-foot"><button type="button" class="set-save" onclick="hideProjects()" data-i18n="close">Close</button></div>
+</div>
+<div class="pref-menu" id="pref-menu" role="dialog"></div>
 <div class="restart-banner" id="restart-banner" role="status" aria-live="polite"></div>
 <!-- Post hours dialog -->
 <div class="newtask-overlay" id="horas-overlay" onclick="hideHoras()"></div>
@@ -241,6 +285,7 @@
   <div class="settings-hint" id="obs-hint" style="margin-bottom:8px" data-i18n="obs_hint">This note will be sent to the provider.</div>
   <textarea id="obs-text" style="width:100%;height:120px;background:var(--bg);border:1px solid var(--brd);color:var(--txt);border-radius:4px;padding:8px;font-size:13px;outline:none;resize:vertical;font-family:inherit"
             onkeydown="if(event.key==='Enter' && event.ctrlKey) { event.preventDefault(); applyObsPopup(); }"></textarea>
+  <button type="button" class="set-btn obs-starred" onclick="useStarredNotes()" data-i18n="use_starred_notes">Use starred notes</button>
   <div class="popup-row" style="margin-top:2px">
     <button class="apply-btn" onclick="applyObsPopup()" style="flex:1;background:var(--acc)" data-i18n="set_note">Set Note</button>
     <span class="cancel-link" onclick="closeObsPopup()" style="flex:0;padding:6px 10px" data-i18n="close">Close</span>
@@ -251,9 +296,10 @@
 <div class="newtask-overlay confirm-overlay" id="confirm-overlay" onclick="closeConfirm(false)"></div>
 <div class="newtask-popup confirm-popup" id="confirm-popup" role="alertdialog" aria-modal="true" aria-labelledby="confirm-text">
   <div class="confirm-text" id="confirm-text"></div>
+  <ul class="confirm-details" id="confirm-details" hidden></ul>
   <div class="popup-row">
     <button class="apply-btn" id="confirm-ok" onclick="closeConfirm(true)" style="flex:1"></button>
-    <span class="cancel-link" onclick="closeConfirm(false)" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
+    <button type="button" class="cancel-link" id="confirm-cancel" onclick="closeConfirm(false)" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</button>
   </div>
 </div>
 
@@ -279,9 +325,24 @@
   <h3 data-i18n="edit_title">Edit session times</h3>
   <label><span data-i18n="lbl_start_time">Start time</span><input type="text" class="t" id="edit-start" inputmode="numeric" autocomplete="off" spellcheck="false" onchange="tidyClock(this)"></label>
   <label><span data-i18n="lbl_end_time">End time</span><input type="text" class="t" id="edit-end" inputmode="numeric" autocomplete="off" spellcheck="false" onchange="tidyClock(this)"></label>
+  <label><span data-i18n="project">Project</span><input type="text" class="t" id="edit-project-filter" data-i18n-ph="project_filter" placeholder="Filter projects" autocomplete="off"><select id="edit-project-target"></select></label>
+  <small id="edit-project-open-hint" class="project-picker-hint" data-i18n="project_open_hint" hidden>This task's project applies to future sessions.</small>
+  <div class="edit-project-actions"><button type="button" class="set-btn" id="edit-end-activity" onclick="applyIntervalAction('end-at-activity')" data-i18n="end_at_activity" style="display:none">End at last activity</button><button type="button" class="set-btn" id="edit-take-focus" onclick="applyIntervalAction('take-focus')" data-i18n="take_focus" style="display:none">Make this my focus</button></div>
   <div class="popup-row">
     <button class="apply-btn" onclick="applyEditTime()" style="flex:1" data-i18n="save">Save</button>
     <span class="cancel-link" onclick="closeEditTime()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
+  </div>
+</div>
+
+<!-- Task project popup -->
+<div class="edit-overlay" id="task-project-overlay" onclick="closeTaskProject()"></div>
+<div class="edit-popup" id="task-project-popup" role="dialog" aria-labelledby="task-project-title">
+  <h3 id="task-project-title" data-i18n="project">Project</h3>
+  <div id="task-project-name" class="project-picker-hint"></div>
+  <label><span data-i18n="project">Project</span><input type="text" class="t" id="task-project-filter" data-i18n-ph="project_filter" placeholder="Filter projects" autocomplete="off"><select id="task-project-target"></select></label>
+  <div class="popup-row">
+    <button type="button" class="apply-btn" onclick="saveTaskProject()" style="flex:1" data-i18n="save">Save</button>
+    <span class="cancel-link" onclick="closeTaskProject()" style="flex:0;padding:6px 10px" data-i18n="cancel">Cancel</span>
   </div>
 </div>
 
@@ -364,7 +425,8 @@
     <div class="left-inner">
     <div class="shead shead-row">
       <button type="button" class="panel-collapse icon-btn" onclick="toggleLeftPanel()" title="Collapse sidebar" aria-label="Collapse sidebar" data-i18n-title="collapse_sidebar" data-i18n-aria="collapse_sidebar">«</button>
-      <span id="sidebar-head-label" style="flex:1">Last 7 days</span>
+      <span id="sidebar-head-label" style="flex:1"></span>
+      <button type="button" class="icon-btn pref-btn" data-view="sidebar" onclick="togglePrefMenu(this,'sidebar')" title="View options" aria-label="View options" data-i18n-title="view_options" data-i18n-aria="view_options"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button>
       <button type="button" class="cal-open icon-btn" onclick="showCalendar()" title="Open calendar" aria-label="Open calendar" data-i18n-title="open_calendar" data-i18n-aria="open_calendar"><svg class="ico" aria-hidden="true"><use href="#i-calendar"/></svg></button>
     </div>
     <div id="week-nav"></div>
@@ -401,7 +463,7 @@
             <button type="button" data-view="lanes" onclick="setChartView('lanes')" title="Task lanes" aria-label="Task lanes" data-i18n-title="chart_lanes" data-i18n-aria="chart_lanes"><svg class="ico" aria-hidden="true"><use href="#i-lanes"/></svg></button>
           </div>
         </div>
-        <div id="chart-groups" style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--brd);border-radius:5px;padding:2px"></div>
+        <div style="display:flex;align-items:center;gap:6px"><div id="chart-groups" style="display:flex;gap:2px;background:var(--bg);border:1px solid var(--brd);border-radius:5px;padding:2px"></div><button type="button" class="icon-btn pref-btn" id="chart-pref-btn" data-view="chart" onclick="togglePrefMenu(this,'chart')" title="Chart tabs" aria-label="Chart tabs" data-i18n-title="set_chart_tabs" data-i18n-aria="set_chart_tabs"><svg class="ico" aria-hidden="true"><use href="#i-gear"/></svg></button></div>
       </div>
       <div class="chart-main">
         <div class="chart-canvas-wrap" id="chart-canvas-wrap"><canvas id="chart"></canvas></div>
@@ -414,25 +476,6 @@
 
 </main>
 
-<script src="/ui/util.js"></script>
-<script src="/ui/i18n.js"></script>
-<script src="/ui/state.js"></script>
-<script src="/ui/layout.js"></script>
-<script src="/ui/header.js"></script>
-<script src="/ui/cards.js"></script>
-<script src="/ui/settings.js"></script>
-<script src="/ui/post.js"></script>
-<script src="/ui/switch.js"></script>
-<script src="/ui/search.js"></script>
-<script src="/ui/newtask.js"></script>
-<script src="/ui/keys.js"></script>
-<script src="/ui/day.js"></script>
-<script src="/ui/summary.js"></script>
-<script src="/ui/history.js"></script>
-<script src="/ui/sidebar.js"></script>
-<script src="/ui/report.js"></script>
-<script src="/ui/charts.js"></script>
-<script src="/ui/tour.js"></script>
-<script src="/ui/boot.js"></script>
+<script src="/ui/bundle.js"></script>
 </body>
 </html>

@@ -1,13 +1,6 @@
 'use strict';
 
 // ── Layout: collapsible & resizable side panel + chart visibility ──────────────
-function loadLS(key, def) {
-  try { const v = localStorage.getItem('kw.' + key); return v === null ? def : JSON.parse(v); }
-  catch { return def; }
-}
-function saveLS(key, val) {
-  try { localStorage.setItem('kw.' + key, JSON.stringify(val)); } catch { /* private mode / quota */ }
-}
 // A panel never takes more than a third of the window so the day view fits
 // when the window shrinks, even if a wider preference was stored.
 function maxPanelW() { return Math.max(MIN_PANEL_W, Math.min(MAX_PANEL_W, Math.round(window.innerWidth / 3))); }
@@ -69,7 +62,7 @@ function onResizeMove(e) {
 function endResize(e) {
   if (!_resize) return;
   id('left-panel').classList.remove('resizing');
-  saveLS('leftWidth', _leftWidth);
+  setPref('ui_left_width', String(Math.round(_leftWidth))).catch(err => showError(err.message));
   _resize = null;
   const h = e.currentTarget;
   h.classList.remove('dragging');
@@ -77,7 +70,57 @@ function endResize(e) {
   h.removeEventListener('pointermove', onResizeMove);
   h.removeEventListener('pointerup', endResize);
   h.removeEventListener('pointercancel', endResize);
-  if (chartInst) chartInst.resize(); // the content column width just changed
+  if (chartInst) chartInst.onResize(); // the content column width just changed
+}
+
+// The Timeline preference is a pixel width. Only the rendered width is fitted
+// to the current grid, so a narrower window does not erase the preference.
+let _rdWorkWidth = null;
+let _rdResize = null;
+function applyRdWorkWidth() {
+  const grid = document.querySelector('.rd');
+  if (!grid) return;
+  const room = grid.clientWidth - 280 - 48;
+  const wanted = _rdWorkWidth ?? Math.round(room * 0.4);
+  const width = Math.max(360, Math.min(wanted, room - 480));
+  grid.style.setProperty('--rd-work-w', width + 'px');
+}
+function startRdResize(e) {
+  if (e.button !== 0) return;
+  const grid = e.currentTarget.closest('.rd');
+  e.preventDefault();
+  _rdResize = { startX: e.clientX, startW: grid.querySelector('.rd-work').getBoundingClientRect().width };
+  const h = e.currentTarget;
+  h.classList.add('dragging');
+  h.setPointerCapture?.(e.pointerId);
+  h.addEventListener('pointermove', onRdResizeMove);
+  h.addEventListener('pointerup', endRdResize);
+  h.addEventListener('pointercancel', endRdResize);
+}
+function onRdResizeMove(e) {
+  if (!_rdResize) return;
+  const grid = e.currentTarget.closest('.rd');
+  const room = grid.clientWidth - 280 - 48;
+  _rdWorkWidth = Math.max(360, Math.min(_rdResize.startW - (e.clientX - _rdResize.startX), room - 480));
+  applyRdWorkWidth();
+}
+function endRdResize(e) {
+  if (!_rdResize) return;
+  if (_rdWorkWidth !== null) setPref('ui_reader_width', String(Math.round(_rdWorkWidth))).catch(err => showError(err.message));
+  _rdResize = null;
+  const h = e.currentTarget;
+  h.classList.remove('dragging');
+  h.releasePointerCapture?.(e.pointerId);
+  h.removeEventListener('pointermove', onRdResizeMove);
+  h.removeEventListener('pointerup', endRdResize);
+  h.removeEventListener('pointercancel', endRdResize);
+  requestAnimationFrame(readerRefitMap);
+}
+function resetRdWorkWidth() {
+  _rdWorkWidth = null;
+  setPref('ui_reader_width', null).catch(err => showError(err.message));
+  applyRdWorkWidth();
+  requestAnimationFrame(readerRefitMap);
 }
 
 // Chart visibility — only meaningful in the report view, so the toggle button
@@ -102,27 +145,56 @@ function toggleChartVisible() {
   });
 }
 
-function initLayout() {
-  _leftWidth     = sanitizeW(loadLS('leftWidth', 220));
+function onLayoutResize() {
+  applyLeftWidth();
+  applyRdWorkWidth();
+  requestAnimationFrame(readerRefitMap);
+}
+
+function applyActiveTab(tab) {
+  activeTab = tab === 'summary' && !_showSummary ? 'timeline'
+    : ['report', 'timeline', 'summary'].includes(tab) ? tab : 'report';
+  document.querySelectorAll('#main-tabs .tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.tab === activeTab));
+  updateChartToggleBtn();
+}
+
+let _resizeListenerAttached = false;
+function initLayout({ migrate = false } = {}) {
+  document.documentElement.classList.remove('init-left-collapsed', 'init-chart-hidden');
+  requestAnimationFrame(() => document.documentElement.classList.remove('init-left-panel'));
+  activeTab = loadLS('activeTab', 'report');
+  // Widths live in the daemon; one kept by an older dashboard in the browser
+  // moves there once.
+  const oldLeft = loadLS('leftWidth', null), oldReader = loadLS('rdWorkW', null);
+  const forget = key => { try { localStorage.removeItem('kw.' + key); } catch { /* private mode */ } };
+  if (migrate && oldLeft != null) (pref('ui_left_width', null) == null && Number.isFinite(oldLeft)
+    ? setPref('ui_left_width', String(Math.round(sanitizeW(oldLeft)))) : Promise.resolve()).then(() => forget('leftWidth'), () => {});
+  if (migrate && oldReader != null) (pref('ui_reader_width', null) == null && Number.isFinite(oldReader)
+    ? setPref('ui_reader_width', String(Math.max(360, Math.round(oldReader)))) : Promise.resolve()).then(() => forget('rdWorkW'), () => {});
+  _leftWidth     = sanitizeW(Number(pref('ui_left_width', Number.isFinite(oldLeft) ? oldLeft : 220)));
+  const rdWidth  = Number(pref('ui_reader_width', Number.isFinite(oldReader) ? oldReader : NaN));
+  _rdWorkWidth   = Number.isFinite(rdWidth) ? Math.max(360, Math.round(rdWidth)) : null;
   _leftCollapsed = pref('ui_left_collapsed', '0') === '1';
   _chartVisible  = pref('ui_chart_visible', '1') === '1';
   applyLeftWidth();
   applyLeftCollapsed();
-  updateChartToggleBtn();
+  applyActiveTab(activeTab);
   // Re-fit the panels when the window changes: the stored preference stays put,
   // only the rendered width follows.
-  window.addEventListener('resize', applyLeftWidth);
+  if (!_resizeListenerAttached) {
+    window.addEventListener('resize', onLayoutResize);
+    _resizeListenerAttached = true;
+  }
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-// el is the clicked tab when a click got us here; the keyboard shortcuts pass
-// only the name and let the tab be looked up by its data-tab.
-function setTab(tab, el) {
+// Clicks and keyboard shortcuts both select the tab by name.
+function setTab(tab) {
+  if (activeTab === 'report' && tab !== 'report') clearSlotSelection();
   activeTab = tab;
-  el = el || document.querySelector(`#main-tabs .tab[data-tab="${tab}"]`);
-  document.querySelectorAll('#main-tabs .tab').forEach(t => t.classList.remove('active'));
-  if (el) el.classList.add('active');
-  updateChartToggleBtn(); // hide the chart toggle in the summary view
-  loadDay(selectedDate, { chart: tab === 'report' });
+  applyActiveTab(activeTab);
+  saveLS('activeTab', activeTab);
+  loadDay(selectedDate, { chart: activeTab === 'report' });
 }
 

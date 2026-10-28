@@ -3,9 +3,15 @@
 Use a Windows machine with Zig 0.17, the release signing key, and `gh`.
 
 1. Set the version in `build.zig.zon`, run `zig build test`, and build with `zig build -Doptimize=ReleaseSafe`. A `v*` tag only re-runs these checks in CI; it publishes nothing.
-2. Make a directory named `kowalski-vX.Y.Z-windows-x86_64`. Put `zig-out/bin/kowalski.exe`, `zig-out/bin/kowalskiw.exe`, `LICENSE`, `src/ui/vendor/LICENSE-chart.js.txt`, and `README.md` directly inside it. Zip that directory as `kowalski-vX.Y.Z-windows-x86_64.zip` with `tar -a -c -f kowalski-vX.Y.Z-windows-x86_64.zip kowalski-vX.Y.Z-windows-x86_64` (Windows' own `tar`); Windows PowerShell's `Compress-Archive` writes backslash paths, which the updater rejects. The updater expects the two executables at `kowalski-vX.Y.Z-windows-x86_64/kowalski.exe` and `kowalski-vX.Y.Z-windows-x86_64/kowalskiw.exe` inside the archive.
+2. Make a directory named `kowalski-vX.Y.Z-windows-x86_64`. Put `zig-out/bin/kowalski.exe`, `zig-out/bin/kowalskiw.exe`, `LICENSE` and `README.md` directly inside it. Zip that directory as `kowalski-vX.Y.Z-windows-x86_64.zip` with `tar -a -c -f kowalski-vX.Y.Z-windows-x86_64.zip kowalski-vX.Y.Z-windows-x86_64` (Windows' own `tar`); Windows PowerShell's `Compress-Archive` writes backslash paths, which the updater rejects. The updater expects the two executables at `kowalski-vX.Y.Z-windows-x86_64/kowalski.exe` and `kowalski-vX.Y.Z-windows-x86_64/kowalskiw.exe` inside the archive.
 3. Run `zig build sign -- kowalski-vX.Y.Z-windows-x86_64.zip`. The command writes `kowalski-vX.Y.Z-windows-x86_64.zip.sig` and prints its path and SHA-256. Use `--key <path>` after the ZIP path to select another key file.
 4. Publish both assets with `gh release create vX.Y.Z kowalski-vX.Y.Z-windows-x86_64.zip kowalski-vX.Y.Z-windows-x86_64.zip.sig`.
+
+## Preview releases
+
+On a preview build, selecting Stable waits for the next stable release: the upgraded database cannot be opened by an older version, and only a `backup-vN-*.db` made before the upgrade beside the database can take it back.
+
+Keep the coming stable version in `build.zig.zon` and build with `zig build -Dpreview=N`. Name the directory and ZIP `kowalski-vX.Y.Z-preview.N-windows-x86_64` and `kowalski-vX.Y.Z-preview.N-windows-x86_64.zip`. Sign the ZIP as usual, then publish with `gh release create vX.Y.Z-preview.N <zip> <sig> --prerelease`. Stable builds never see these releases; users opt in under Settings > Updates.
 
 For an offline install, put the ZIP and matching `.sig` together and run
 `kowalski update --from <absolute path to ZIP>`. The updater verifies the same

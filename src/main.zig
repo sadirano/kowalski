@@ -11,13 +11,16 @@ const demo = @import("demo.zig");
 const tour_mod = @import("tour.zig");
 const zone_mod = @import("zone.zig");
 const update_guard = @import("update_guard.zig");
+const doctor = @import("doctor.zig");
 
 test { _ = @import("kowalskiw.zig"); }
+test { _ = @import("agent.zig"); }
 test { _ = @import("update.zig"); }
 test { _ = @import("update_journal.zig"); }
 test { _ = @import("update_lock.zig"); }
 test { _ = @import("update_snapshot.zig"); }
 test { _ = @import("update_guard.zig"); }
+test { _ = @import("doctor.zig"); }
 
 extern "kernel32" fn SetConsoleOutputCP(code_page: u32) callconv(.winapi) i32;
 pub fn main(init: std.process.Init) void {
@@ -43,6 +46,7 @@ fn run(init: std.process.Init) !u8 {
 
     var db_path: ?[]const u8 = null;
     var json = false;
+    var agent = false;
     var words: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < all.len) : (i += 1) {
@@ -53,6 +57,8 @@ fn run(init: std.process.Init) !u8 {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json = true;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            agent = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             try std.Io.File.stdout().writeStreamingAll(init.io, "kowalski " ++ @import("build_options").version ++ "\n");
             return 0;
@@ -60,6 +66,19 @@ fn run(init: std.process.Init) !u8 {
             try std.Io.File.stdout().writeStreamingAll(init.io, cli.usage);
             return 0;
         } else try words.append(a, arg);
+    }
+    if (agent) {
+        const spec = @import("agent.zig");
+        const name = if (words.items.len == 0) null else try std.mem.join(a, " ", words.items);
+        const only = if (name) |n| spec.find(n) orelse {
+            std.debug.print("kowalski: no command named {s}\n", .{n});
+            return 2;
+        } else null;
+        var out: std.Io.Writer.Allocating = .init(a);
+        if (json) try spec.writeJson(&out.writer, only) else try spec.writeText(&out.writer, only);
+        if (json) try out.writer.writeAll("\n");
+        try std.Io.File.stdout().writeStreamingAll(init.io, out.written());
+        return 0;
     }
     const command = if (words.items.len > 0) words.items[0] else "status";
     const args = if (words.items.len > 0) words.items[1..] else words.items;
@@ -87,11 +106,28 @@ fn run(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, command, "open")) {
         if (args.len != 0) return usageError();
-        opener.open(init.io, a, db, db_path, true) catch |err| {
-            std.debug.print("kowalski: could not open the dashboard: {s} (see daemon.log next to the database)\n", .{@errorName(err)});
+        const problem = opener.open(init.io, a, db, db_path, true) catch |err| {
+            std.debug.print("kowalski: could not open the dashboard: {s}\n", .{@errorName(err)});
             return 1;
         };
+        if (problem) |message| {
+            try std.Io.File.stderr().writeStreamingAll(init.io, message);
+            return 1;
+        }
         return 0;
+    }
+    if (std.mem.eql(u8, command, "doctor")) {
+        var fix = false;
+        for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--fix")) fix = true else return usageError();
+        }
+        const report = try doctor.run(init.io, a, db, db_path, fix);
+        const text = if (json)
+            try doctor.ascii(a, try std.json.Stringify.valueAlloc(a, .{ .findings = report.findings, .actions = report.actions, .ok = report.healthy }, .{}))
+        else try report.format(a);
+        try std.Io.File.stdout().writeStreamingAll(init.io, text);
+        if (json) try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        return if (report.healthy) 0 else 1;
     }
     if (std.mem.eql(u8, command, "autostart")) return autostart(init, db_path, args);
     const exit = try cli.run(&ctx, command, args);
@@ -169,7 +205,8 @@ fn demoData(init: std.process.Init, destination: []const u8, args: []const []con
         try store.setSetting("reporting_zone", id, clock.nowMs());
         break :blk id;
     };
-    const zone = try zone_mod.Zone.load(zone_id);
+    defer a.free(zone_id);
+    const zone = try store.loadZone();
     const now = if (at) |text| localMs(&zone, text) orelse return usageError() else clock.nowMs();
     const instance = try store.getSetting("provider_instance") orelse tour_mod.instance;
     demo.seed(&db, a, .{ .lang = lang, .instance = instance, .now_ms = now, .zone = &zone }) catch |err| switch (err) {
@@ -212,6 +249,7 @@ test {
     _ = @import("paths.zig");
     _ = @import("query.zig");
     _ = @import("api.zig");
+    _ = @import("settings.zig");
     _ = @import("cli.zig");
     _ = @import("daemon.zig");
     _ = @import("provider_loader.zig");

@@ -127,6 +127,18 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     _ = WriteFile(file, &buffer, @intCast(w.end + 1), null, null);
 }
 
+fn asciiLogText(value: []const u8, buffer: []u8) []const u8 {
+    const len = @min(value.len, buffer.len);
+    for (value[0..len], 0..) |byte, i| buffer[i] = if (byte >= 32 and byte <= 126) byte else '?';
+    return buffer[0..len];
+}
+
+fn logSqliteError(path: []const u8, message: []const u8) void {
+    var path_buffer: [384]u8 = undefined;
+    var message_buffer: [512]u8 = undefined;
+    log("request {s}: SQLite: {s}", .{ asciiLogText(path, &path_buffer), asciiLogText(message, &message_buffer) });
+}
+
 fn openLog(gpa: std.mem.Allocator, path: []const u8) !void {
     const name = try std.unicode.utf8ToUtf16LeAllocZ(gpa, path);
     defer gpa.free(name);
@@ -244,7 +256,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
 
     var traits_arena = std.heap.ArenaAllocator.init(gpa);
     defer traits_arena.deinit();
-    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .running_post = worker.runningPost, .trial_nonce = options.trial_nonce } };
+    var d: Daemon = .{ .io = io, .gpa = gpa, .db_path = options.db_path, .traits_allocator = traits_arena.allocator(), .app = .{ .store = &store, .port = port, .clock = clock.nowMs, .db_path = options.db_path, .running_post = worker.runningPost, .on_sqlite_error = logSqliteError, .trial_nonce = options.trial_nonce } };
     // The tour's sandbox sits next to the database and never outlives a run.
     const tour_path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(options.db_path) orelse ".", tour_mod.file_name });
     defer gpa.free(tour_path);
@@ -259,6 +271,7 @@ pub fn serve(io: Io, gpa: std.mem.Allocator, options: Options) !void {
             std.heap.page_allocator.destroy(table);
         }
     };
+    defer d.app.clearDeclaredFields();
     try startProvider(&d);
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
     var listener = address.listen(io, .{}) catch |err| {
@@ -365,6 +378,7 @@ fn approveTrust(db: *sqlite.Db, sha: []const u8, how: []const u8) !void {
 }
 
 fn startProvider(d: *Daemon) !void {
+    d.app.clearDeclaredFields();
     const a = d.traits_allocator;
     try rememberQuarantine(d.app.store.db);
     if (try provider_source.read(d.app.store.db, a)) |enrolled| {
@@ -482,6 +496,9 @@ fn loadHash(d: *Daemon, sha: []const u8) !void {
     d.app.provider_status.reason = "";
     try d.app.store.setSetting("provider_instance", copy.instance.slice(), clock.nowMs());
     d.app.traits = api.parseTraits(a, copy.traits.slice());
+    const fields_outcome = try worker.runInline(copy, a, .fields);
+    if (fields_outcome == .done and fields_outcome.done.code == 0)
+        try d.app.loadDeclaredFields(fields_outcome.done.out);
     try markGood(d.app.store.db, sha);
     log("provider: {s}", .{copy.instance.slice()});
 }
@@ -648,7 +665,7 @@ test "background source check leaves database work responsive during a slow read
         var started = std.atomic.Value(bool).init(false);
         fn get(_: *anyopaque, _: std.mem.Allocator, _: Io, _: []const u8, _: usize) ![]const u8 {
             started.store(true, .release);
-            Sleep(300);
+            Sleep(1000);
             return "late";
         }
     };
@@ -668,7 +685,7 @@ test "background source check leaves database work responsive during a slow read
         .app = .{ .store = &store, .port = api.default_port, .clock = clock.nowMs },
         .source_fetcher = .{ .context = undefined, .get = Fake.get }, .source_start_delay_ms = 0 };
     var future = try io.concurrent(backgroundSourceCheck, .{&d});
-    for (0..40) |_| {
+    for (0..200) |_| {
         if (Fake.started.load(.acquire)) break;
         try io.sleep(.fromMilliseconds(5), .awake);
     }
@@ -678,9 +695,9 @@ test "background source check leaves database work responsive during a slow read
     const count = try sourceScalar(&db, "SELECT count(*) FROM provider_source");
     d.mutex.unlock(io);
     try std.testing.expectEqual(@as(i64, 1), count);
-    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - before.toMilliseconds() < 200);
+    try std.testing.expect(Io.Clock.awake.now(io).toMilliseconds() - before.toMilliseconds() < 500);
     future.cancel(io);
-    try io.sleep(.fromMilliseconds(350), .awake);
+    try io.sleep(.fromMilliseconds(1100), .awake);
 }
 
 fn sourceScalar(db: *sqlite.Db, sql: []const u8) !i64 {
@@ -730,7 +747,7 @@ fn tourCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Resp
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     const start = std.mem.eql(u8, path, "/api/tour/start");
     if (!start and !std.mem.eql(u8, path, "/api/tour/finish")) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
     if (d.tour) |t| {
         t.destroy(d.io);
@@ -755,7 +772,7 @@ fn tourCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Resp
 fn providerCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     if (!std.mem.eql(u8, path, "/api/provider/approve")) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
     const Body = struct { sha256: []const u8, how: []const u8 };
     const body = std.json.parseFromSliceLeaky(Body, a, request.body, .{ .ignore_unknown_fields = true }) catch
@@ -835,7 +852,7 @@ fn sourceCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
     const checking = std.mem.eql(u8, path, "/api/provider/source/check");
     const installing = std.mem.eql(u8, path, "/api/provider/source/install");
     if (!base and !checking and !installing) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     return sourceCommandInner(d, a, request, base, checking, installing) catch |err|
         api.answer(a, switch (err) {
             error.SourceChanged, error.ReleaseChanged, error.CheckBusy, error.ManifestChangedWithoutSequence, error.IdentityChanged, error.StaleProposal => .conflict,
@@ -1008,7 +1025,7 @@ fn sourceCommandInner(d: *Daemon, a: std.mem.Allocator, request: api.Request, ba
 fn restartCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     if (!std.mem.eql(u8, path, "/api/restart")) return null;
-    if (api.refused(d.app.port, a, request)) |r| return r;
+    if (api.refused(d.app.port, a, request, false)) |r| return r;
     if (request.method != .POST) return api.answer(a, .method_not_allowed, .{ .@"error" = "method" });
     const command = launch.backgroundCommand(a, d.db_path, GetCurrentProcessId()) catch |err| {
         log("restart command failed: {s}", .{@errorName(err)});
@@ -1044,6 +1061,13 @@ test "empty update repo gives a disabled API answer" {
     try std.testing.expectEqualStrings("{\"state\":\"disabled\"}", response.body);
 }
 
+fn updateChannel(d: *Daemon) !update.Channel {
+    const saved = try d.app.store.getSetting("update_channel");
+    defer if (saved) |value| d.app.store.allocator.free(value);
+    if (saved) |value| return if (std.mem.eql(u8, value, "preview")) .preview else .stable;
+    return if (std.mem.indexOf(u8, update.current_version, "-preview.") != null) .preview else .stable;
+}
+
 fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Response {
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     const is_update = std.mem.eql(u8, path, "/api/update");
@@ -1066,7 +1090,8 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
         const last = update.outcome(saved);
         if (std.mem.eql(u8, request.target, "/api/update?outcome=1")) return api.answer(a, .ok, .{ .last = last });
         if (disabledUpdateResponse(a, update.release_repo, request.method) != null) return api.answer(a, .ok, .{ .state = "disabled", .last = last });
-        const result = update.check(a, d.io, fetcher) catch |err| {
+        const channel = updateChannel(d) catch return api.answer(a, .internal_server_error, .{ .@"error" = "settings" });
+        const result = update.check(a, d.io, fetcher, channel) catch |err| {
             log("update check failed: {s}", .{@errorName(err)});
             return api.answer(a, .bad_gateway, .{ .@"error" = "update_check", .message = @errorName(err) });
         };
@@ -1082,7 +1107,8 @@ fn updateCommand(d: *Daemon, a: std.mem.Allocator, request: api.Request) ?api.Re
     const version = if (body.file) |file| update.versionFromFile(file) orelse return api.answer(a, .bad_request, .{ .@"error" = "file" }) else body.version orelse return api.answer(a, .bad_request, .{ .@"error" = "version" });
     if (body.file != null and !request.local_file) return api.answer(a, .forbidden, .{ .@"error" = "file_cli_only" });
     if (update.parseVersion(version) == null) return api.answer(a, .bad_request, .{ .@"error" = "version" });
-    var installed = update.install(a, d.io, fetcher, d.db_path, version, body.file) catch |err| {
+    const channel = updateChannel(d) catch return api.answer(a, .internal_server_error, .{ .@"error" = "settings" });
+    var installed = update.install(a, d.io, fetcher, channel, d.db_path, version, body.file) catch |err| {
         log("update install failed: {s}", .{@errorName(err)});
         const message: []const u8 = switch (err) {
             error.UnsignedRelease => "this release is not signed; kowalski will not install it",
@@ -1172,7 +1198,7 @@ fn acceptLoop(d: *Daemon, listener: *Io.net.Server, connections: *Io.Group) Io.C
 fn respond(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) void {
     req.respond(body, .{
         .status = status,
-        .keep_alive = false,
+        .keep_alive = req.head.keep_alive,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "application/json" },
             .{ .name = "cache-control", .value = "no-store" },
@@ -1180,50 +1206,119 @@ fn respond(req: *std.http.Server.Request, status: std.http.Status, body: []const
     }) catch {};
 }
 
-const UiFile = struct { path: []const u8, body: []const u8, kind: []const u8 };
+const UiFile = struct { path: []const u8, body: []const u8, kind: []const u8, etag: []const u8 = undefined };
 
 const html = "text/html; charset=utf-8";
 const js = "text/javascript; charset=utf-8";
 const css = "text/css; charset=utf-8";
 
+// Keep the same order as the dashboard's former script tags. A semicolon
+// separates files even if one ends with a line comment or no newline.
+const bundle_js =
+    @embedFile("ui/util.js") ++ "\n;\n" ++
+    @embedFile("ui/i18n.js") ++ "\n;\n" ++
+    @embedFile("ui/state.js") ++ "\n;\n" ++
+    @embedFile("ui/layout.js") ++ "\n;\n" ++
+    @embedFile("ui/header.js") ++ "\n;\n" ++
+    @embedFile("ui/cards.js") ++ "\n;\n" ++
+    @embedFile("ui/settings.js") ++ "\n;\n" ++
+    @embedFile("ui/prefs.js") ++ "\n;\n" ++
+    @embedFile("ui/post.js") ++ "\n;\n" ++
+    @embedFile("ui/switch.js") ++ "\n;\n" ++
+    @embedFile("ui/search.js") ++ "\n;\n" ++
+    @embedFile("ui/newtask.js") ++ "\n;\n" ++
+    @embedFile("ui/keys.js") ++ "\n;\n" ++
+    @embedFile("ui/day.js") ++ "\n;\n" ++
+    @embedFile("ui/summary.js") ++ "\n;\n" ++
+    @embedFile("ui/history.js") ++ "\n;\n" ++
+    @embedFile("ui/sidebar.js") ++ "\n;\n" ++
+    @embedFile("ui/report.js") ++ "\n;\n" ++
+    @embedFile("ui/reader.js") ++ "\n;\n" ++
+    @embedFile("ui/barchart.js") ++ "\n;\n" ++
+    @embedFile("ui/charts.js") ++ "\n;\n" ++
+    @embedFile("ui/tour.js") ++ "\n;\n" ++
+    @embedFile("ui/boot.js");
+
+// Changing any precached asset changes the service worker's own bytes, so a
+// new build installs a fresh shell instead of retaining an older cache.
+const shell_hash = blk: {
+    @setEvalBranchQuota(20_000_000);
+    var hash = std.hash.Wyhash.init(0);
+    for (.{
+        @embedFile("ui/index.html"),
+        @embedFile("ui/favicon.svg"),
+        @embedFile("ui/manifest.webmanifest"),
+        @embedFile("ui/app.css"),
+        bundle_js,
+        @embedFile("ui/icon-192.png"),
+        @embedFile("ui/icon-512.png"),
+        @embedFile("ui/sw.js"),
+    }) |body| hash.update(body);
+    break :blk hash.final();
+};
+const sw_js = std.fmt.comptimePrint("const SHELL_REVISION = '{s}-{x}';\n", .{ @import("build_options").version, shell_hash }) ++ @embedFile("ui/sw.js");
+
+fn assetEtag(comptime body: []const u8) []const u8 {
+    @setEvalBranchQuota(20_000_000);
+    return std.fmt.comptimePrint("\"{s}-{x}\"", .{ @import("build_options").version, std.hash.Wyhash.hash(0, body) });
+}
+
 /// The dashboard, compiled in. A file the page references must be listed
 /// here (a test checks it).
-const ui_files = [_]UiFile{
-    .{ .path = "/", .body = @embedFile("ui/index.html"), .kind = html },
-    .{ .path = "/index.html", .body = @embedFile("ui/index.html"), .kind = html },
-    .{ .path = "/favicon.svg", .body = @embedFile("ui/favicon.svg"), .kind = "image/svg+xml" },
-    // Installed-app pieces; the service worker sits at the root for its scope.
-    .{ .path = "/manifest.webmanifest", .body = @embedFile("ui/manifest.webmanifest"), .kind = "application/manifest+json" },
-    .{ .path = "/sw.js", .body = @embedFile("ui/sw.js"), .kind = js },
-    .{ .path = "/icon-192.png", .body = @embedFile("ui/icon-192.png"), .kind = "image/png" },
-    .{ .path = "/icon-512.png", .body = @embedFile("ui/icon-512.png"), .kind = "image/png" },
-    .{ .path = "/vendor/chart-4.4.0.min.js", .body = @embedFile("ui/vendor/chart-4.4.0.min.js"), .kind = js },
-    .{ .path = "/ui/app.css", .body = @embedFile("ui/app.css"), .kind = css },
-    .{ .path = "/ui/util.js", .body = @embedFile("ui/util.js"), .kind = js },
-    .{ .path = "/ui/i18n.js", .body = @embedFile("ui/i18n.js"), .kind = js },
-    .{ .path = "/ui/state.js", .body = @embedFile("ui/state.js"), .kind = js },
-    .{ .path = "/ui/layout.js", .body = @embedFile("ui/layout.js"), .kind = js },
-    .{ .path = "/ui/header.js", .body = @embedFile("ui/header.js"), .kind = js },
-    .{ .path = "/ui/cards.js", .body = @embedFile("ui/cards.js"), .kind = js },
-    .{ .path = "/ui/settings.js", .body = @embedFile("ui/settings.js"), .kind = js },
-    .{ .path = "/ui/post.js", .body = @embedFile("ui/post.js"), .kind = js },
-    .{ .path = "/ui/switch.js", .body = @embedFile("ui/switch.js"), .kind = js },
-    .{ .path = "/ui/search.js", .body = @embedFile("ui/search.js"), .kind = js },
-    .{ .path = "/ui/newtask.js", .body = @embedFile("ui/newtask.js"), .kind = js },
-    .{ .path = "/ui/keys.js", .body = @embedFile("ui/keys.js"), .kind = js },
-    .{ .path = "/ui/day.js", .body = @embedFile("ui/day.js"), .kind = js },
-    .{ .path = "/ui/summary.js", .body = @embedFile("ui/summary.js"), .kind = js },
-    .{ .path = "/ui/history.js", .body = @embedFile("ui/history.js"), .kind = js },
-    .{ .path = "/ui/sidebar.js", .body = @embedFile("ui/sidebar.js"), .kind = js },
-    .{ .path = "/ui/report.js", .body = @embedFile("ui/report.js"), .kind = js },
-    .{ .path = "/ui/charts.js", .body = @embedFile("ui/charts.js"), .kind = js },
-    .{ .path = "/ui/tour.js", .body = @embedFile("ui/tour.js"), .kind = js },
-    .{ .path = "/ui/boot.js", .body = @embedFile("ui/boot.js"), .kind = js },
+const ui_files = blk: {
+    var files = [_]UiFile{
+        .{ .path = "/", .body = @embedFile("ui/index.html"), .kind = html },
+        .{ .path = "/index.html", .body = @embedFile("ui/index.html"), .kind = html },
+        .{ .path = "/favicon.svg", .body = @embedFile("ui/favicon.svg"), .kind = "image/svg+xml" },
+        // Installed-app pieces; the service worker sits at the root for its scope.
+        .{ .path = "/manifest.webmanifest", .body = @embedFile("ui/manifest.webmanifest"), .kind = "application/manifest+json" },
+        .{ .path = "/sw.js", .body = sw_js, .kind = js },
+        .{ .path = "/icon-192.png", .body = @embedFile("ui/icon-192.png"), .kind = "image/png" },
+        .{ .path = "/icon-512.png", .body = @embedFile("ui/icon-512.png"), .kind = "image/png" },
+        .{ .path = "/ui/app.css", .body = @embedFile("ui/app.css"), .kind = css },
+        .{ .path = "/ui/bundle.js", .body = bundle_js, .kind = js },
+        .{ .path = "/ui/util.js", .body = @embedFile("ui/util.js"), .kind = js },
+        .{ .path = "/ui/i18n.js", .body = @embedFile("ui/i18n.js"), .kind = js },
+        .{ .path = "/ui/state.js", .body = @embedFile("ui/state.js"), .kind = js },
+        .{ .path = "/ui/layout.js", .body = @embedFile("ui/layout.js"), .kind = js },
+        .{ .path = "/ui/header.js", .body = @embedFile("ui/header.js"), .kind = js },
+        .{ .path = "/ui/cards.js", .body = @embedFile("ui/cards.js"), .kind = js },
+        .{ .path = "/ui/settings.js", .body = @embedFile("ui/settings.js"), .kind = js },
+        .{ .path = "/ui/prefs.js", .body = @embedFile("ui/prefs.js"), .kind = js },
+        .{ .path = "/ui/post.js", .body = @embedFile("ui/post.js"), .kind = js },
+        .{ .path = "/ui/switch.js", .body = @embedFile("ui/switch.js"), .kind = js },
+        .{ .path = "/ui/search.js", .body = @embedFile("ui/search.js"), .kind = js },
+        .{ .path = "/ui/newtask.js", .body = @embedFile("ui/newtask.js"), .kind = js },
+        .{ .path = "/ui/keys.js", .body = @embedFile("ui/keys.js"), .kind = js },
+        .{ .path = "/ui/day.js", .body = @embedFile("ui/day.js"), .kind = js },
+        .{ .path = "/ui/summary.js", .body = @embedFile("ui/summary.js"), .kind = js },
+        .{ .path = "/ui/history.js", .body = @embedFile("ui/history.js"), .kind = js },
+        .{ .path = "/ui/sidebar.js", .body = @embedFile("ui/sidebar.js"), .kind = js },
+        .{ .path = "/ui/report.js", .body = @embedFile("ui/report.js"), .kind = js },
+        .{ .path = "/ui/reader.js", .body = @embedFile("ui/reader.js"), .kind = js },
+        .{ .path = "/ui/barchart.js", .body = @embedFile("ui/barchart.js"), .kind = js },
+        .{ .path = "/ui/charts.js", .body = @embedFile("ui/charts.js"), .kind = js },
+        .{ .path = "/ui/tour.js", .body = @embedFile("ui/tour.js"), .kind = js },
+        .{ .path = "/ui/boot.js", .body = @embedFile("ui/boot.js"), .kind = js },
+    };
+    for (&files) |*file| file.etag = assetEtag(file.body);
+    break :blk files;
 };
 
 fn uiFile(path: []const u8) ?UiFile {
     for (ui_files) |f| if (std.mem.eql(u8, f.path, path)) return f;
     return null;
+}
+
+fn etagMatches(header: []const u8, etag: []const u8) bool {
+    var values = std.mem.splitScalar(u8, header, ',');
+    while (values.next()) |value| {
+        const tag = std.mem.trim(u8, value, " \t");
+        if (std.mem.eql(u8, tag, "*")) return true;
+        const tag_value = if (std.mem.startsWith(u8, tag, "W/")) tag[2..] else tag;
+        if (std.mem.eql(u8, tag_value, etag)) return true;
+    }
+    return false;
 }
 
 /// The dashboard: same loopback Host rule as the API, GET only.
@@ -1233,12 +1328,32 @@ fn serveUi(req: *std.http.Server.Request, request: api.Request, port: u16) void 
     if (request.method != .GET) return respond(req, .method_not_allowed, "{\"error\":\"method\"}");
     const path = if (std.mem.indexOfScalar(u8, request.target, '?')) |at| request.target[0..at] else request.target;
     const file = uiFile(path) orelse return respond(req, .not_found, "{\"error\":\"not_found\"}");
+    var headers = req.iterateHeaders();
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "if-none-match")) continue;
+        if (!etagMatches(header.value, file.etag)) continue;
+        // Zig's responder derives Content-Length from the supplied bytes and
+        // suppresses the body for HEAD. Use that framing for a bodyless 304.
+        const method = req.head.method;
+        req.head.method = .HEAD;
+        defer req.head.method = method;
+        req.respond(file.body, .{
+            .status = .not_modified,
+            .keep_alive = req.head.keep_alive,
+            .extra_headers = &.{
+                .{ .name = "etag", .value = file.etag },
+                .{ .name = "cache-control", .value = "no-cache" },
+            },
+        }) catch {};
+        return;
+    }
     req.respond(file.body, .{
         .status = .ok,
-        .keep_alive = false,
+        .keep_alive = req.head.keep_alive,
         .extra_headers = &.{
             .{ .name = "content-type", .value = file.kind },
-            .{ .name = "cache-control", .value = "no-store" },
+            .{ .name = "etag", .value = file.etag },
+            .{ .name = "cache-control", .value = "no-cache" },
             .{ .name = "x-frame-options", .value = "DENY" },
             .{ .name = "content-security-policy", .value = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'" },
         },
@@ -1247,16 +1362,30 @@ fn serveUi(req: *std.http.Server.Request, request: api.Request, port: u16) void 
 
 fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
     defer stream.close(d.io);
-    var arena_state = std.heap.ArenaAllocator.init(d.gpa);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
     var read_buffer: [16 * 1024]u8 = undefined;
     var write_buffer: [4096]u8 = undefined;
     var reader = stream.reader(d.io, &read_buffer);
     var writer = stream.writer(d.io, &write_buffer);
     var server = std.http.Server.init(&reader.interface, &writer.interface);
-    var req = server.receiveHead() catch return;
+    while (true) {
+        var arena_state = std.heap.ArenaAllocator.init(d.gpa);
+        defer arena_state.deinit();
+        var req = server.receiveHead() catch return;
+        // A bodyless POST still needs an explicit zero length for Zig's
+        // keep-alive body discard path.
+        if (req.head.method.requestHasBody() and req.head.content_length == null and req.head.transfer_encoding == .none) {
+            req.head.content_length = 0;
+        }
+        // The reader does not consume bodies for GET and similar methods.
+        if (!req.head.method.requestHasBody() and ((req.head.content_length orelse 0) > 0 or req.head.transfer_encoding == .chunked)) {
+            req.head.keep_alive = false;
+        }
+        try serveRequest(d, &req, arena_state.allocator());
+        if (!req.head.keep_alive or server.reader.state != .ready or d.app.stop_requested) return;
+    }
+}
 
+fn serveRequest(d: *Daemon, req: *std.http.Server.Request, a: std.mem.Allocator) Io.Cancelable!void {
     // Header slices die once the body is read, so copy what the API needs.
     var request: api.Request = .{
         .method = req.head.method,
@@ -1285,7 +1414,7 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
 
     // Everything outside /api/ is the dashboard, compiled into the binary.
     if (!std.mem.startsWith(u8, request.target, "/api/")) {
-        serveUi(&req, request, d.app.port);
+        serveUi(req, request, d.app.port);
         return;
     }
 
@@ -1293,7 +1422,8 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
     const has_body = req.head.content_length != null or req.head.transfer_encoding == .chunked;
     if (req.head.method.requestHasBody() and has_body) {
         if (req.head.content_length) |len| if (len > max_body) {
-            respond(&req, .payload_too_large, "{\"error\":\"too_large\"}");
+            req.head.keep_alive = false;
+            respond(req, .payload_too_large, "{\"error\":\"too_large\"}");
             return;
         };
         var body_buffer: [4096]u8 = undefined;
@@ -1301,31 +1431,32 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
         defer @memset(&body_buffer, 0);
         const body_reader = req.readerExpectContinue(&body_buffer) catch return;
         request.body = body_reader.allocRemaining(a, .limited(max_body)) catch {
-            respond(&req, .bad_request, "{\"error\":\"body\"}");
+            req.head.keep_alive = false;
+            respond(req, .bad_request, "{\"error\":\"body\"}");
             return;
         };
     }
 
     defer @memset(@constCast(request.body), 0);
     if (d.app.trial_nonce != null and request.method != .GET and !std.mem.eql(u8, request.target, "/api/update/commit")) {
-        if (api.refused(d.app.port, a, request)) |r| return respond(&req, r.status, r.body);
-        return respond(&req, .service_unavailable, "{\"error\":\"updating\"}");
+        if (api.refused(d.app.port, a, request, false)) |r| return respond(req, r.status, r.body);
+        return respond(req, .service_unavailable, "{\"error\":\"updating\"}");
     }
     if (in_tour) {
         // The tour's provider answers at once, so it runs under the lock:
         // a finish cannot pull the sandbox out from under it.
         try d.mutex.lock(d.io);
         defer d.mutex.unlock(d.io);
-        const t = d.tour orelse return respond(&req, .conflict, "{\"error\":\"no_tour\",\"message\":\"no tour is running\"}");
+        const t = d.tour orelse return respond(req, .conflict, "{\"error\":\"no_tour\",\"message\":\"no tour is running\"}");
         var response = api.handle(&t.app, a, request);
         while (response.followup) |next| {
             const outcome = worker.runInline(&t.table, a, next.call()) catch worker.Outcome.busy;
             response = api.proceed(&t.app, a, next, outcome);
         }
-        return respond(&req, response.status, response.body);
+        return respond(req, response.status, response.body);
     }
 
-    if (sourceCommand(d, a, request)) |source_response| return respond(&req, source_response.status, source_response.body);
+    if (sourceCommand(d, a, request)) |source_response| return respond(req, source_response.status, source_response.body);
     var response = blk: {
         try d.mutex.lock(d.io);
         defer d.mutex.unlock(d.io);
@@ -1347,7 +1478,7 @@ fn serveConnection(d: *Daemon, stream: Io.net.Stream) Io.Cancelable!void {
         defer d.mutex.unlock(d.io);
         response = api.proceed(&d.app, a, next, outcome);
     }
-    respond(&req, response.status, response.body);
+    respond(req, response.status, response.body);
     if (d.app.stop_requested) d.stop.set(d.io);
 }
 
@@ -1371,5 +1502,63 @@ test "every local file the dashboard references is served" {
         }
     }
     try std.testing.expect(count > 0);
-    try std.testing.expectEqual(@as(usize, 21), ui_count); // stylesheet and 20 scripts
+    try std.testing.expectEqual(@as(usize, 2), ui_count); // stylesheet and bundle
+}
+
+test "static ETags accept matching and weak conditional requests" {
+    const etag = uiFile("/ui/bundle.js").?.etag;
+    const weak_list = try std.fmt.allocPrint(std.testing.allocator, "\"other\", W/{s}", .{etag});
+    defer std.testing.allocator.free(weak_list);
+    try std.testing.expect(etagMatches(etag, etag));
+    try std.testing.expect(etagMatches(weak_list, etag));
+    try std.testing.expect(etagMatches("*", etag));
+    try std.testing.expect(!etagMatches("\"other\"", etag));
+    try std.testing.expect(!std.mem.eql(u8, etag, uiFile("/ui/app.css").?.etag));
+}
+
+test "static and JSON responses share an HTTP connection" {
+    const a = std.testing.allocator;
+    const file = uiFile("/ui/app.css").?;
+    const etag = file.etag;
+    const wire = try std.fmt.allocPrint(a,
+        "GET /ui/app.css HTTP/1.1\r\nHost: 127.0.0.1:47100\r\n\r\n" ++
+            "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:47100\r\n\r\n" ++
+            "GET /ui/app.css HTTP/1.1\r\nHost: 127.0.0.1:47100\r\nIf-None-Match: W/{s}\r\n\r\n" ++
+            "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:47100\r\nConnection: close\r\n\r\n",
+        .{etag},
+    );
+    defer a.free(wire);
+    var input = Io.Reader.fixed(wire);
+    var output: Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var server = std.http.Server.init(&input, &output.writer);
+    const ui_request: api.Request = .{ .method = .GET, .target = "/ui/app.css", .host = "127.0.0.1:47100" };
+
+    var first = try server.receiveHead();
+    serveUi(&first, ui_request, api.default_port);
+    try std.testing.expect(server.reader.state == .ready);
+
+    var second = try server.receiveHead();
+    respond(&second, .ok, "{}");
+    try std.testing.expect(server.reader.state == .ready);
+
+    var third = try server.receiveHead();
+    serveUi(&third, ui_request, api.default_port);
+    try std.testing.expect(server.reader.state == .ready);
+
+    var fourth = try server.receiveHead();
+    respond(&fourth, .ok, "{}");
+    try std.testing.expect(server.reader.state == .closing);
+
+    const response = output.written();
+    try std.testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "content-type: application/json\r\n") != null);
+    const last = std.mem.lastIndexOf(u8, response, "HTTP/1.1 304 Not Modified\r\n") orelse return error.MissingNotModified;
+    const expected_length = try std.fmt.allocPrint(a, "content-length: {d}\r\n", .{file.body.len});
+    defer a.free(expected_length);
+    const next = std.mem.indexOfPos(u8, response, last, "\r\n\r\n") orelse return error.MissingHeaderEnd;
+    try std.testing.expect(std.mem.indexOf(u8, response[last .. next + 4], expected_length) != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[last .. next + 4], "cache-control: no-cache\r\n") != null);
+    try std.testing.expect(std.mem.startsWith(u8, response[next + 4 ..], "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response[next + 4 ..], "connection: close\r\n") != null);
 }

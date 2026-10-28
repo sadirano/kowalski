@@ -11,7 +11,28 @@ The data model and behavior of kowalski. Contributor rules are in
   external ref)`, both opaque strings. The provider describes its extra
   fields (label, type, order) and kowalski displays them; it never knows
   what they mean.
+  Binding takes the provider's title; a numeric captured subject, or a
+  numeric `switch` or `parallel` text, with no matching task is bound to
+  that ref when a provider is configured.
+- Binding a task to a different ref drops the old ref's fields, and waits
+  while any of the task's postings is `sending` or `unknown`.
 - A task without a provider is a complete local task.
+
+## Projects
+
+A project is an optional user-chosen grouping, independent of providers.
+It has a stable ID, a unique editable label and an archived flag. A task
+may have a default project. Each interval stores its own attributed project;
+old intervals and tasks remain Unassigned after upgrade. New intervals use
+an explicit choice, then capture context, then task default. Changing a
+task default never moves history. Historical reassignment requires a preview
+and explicit apply. Renaming changes labels, not attribution. Archiving hides
+a project from new pickers; history and existing capture mappings still work.
+Capture keys identify source projects; names are hints, never merge keys.
+Title lookup is scoped to the current project and rejects ambiguity; refs
+and `#id` remain global. Provider fields remain separate. An opt-in provider
+field can supply a new task default. Project does not affect provider
+binding, posting identity, amounts or coverage.
 
 ## Time model
 
@@ -25,6 +46,10 @@ The data model and behavior of kowalski. Contributor rules are in
 - **Switch** closes the current focus and opens a focus interval on the
   target. If the target was running in parallel, its parallel interval
   closes and a focus interval opens. Other parallel intervals carry on.
+A captured change of project on an event that continues or opens time closes
+the current interval and opens another at that event boundary. Terminal
+events only close or release. Focus, parallel and posting time keep their
+existing rules.
 - **Pause** saves the set of open tasks and their roles, then closes their
   intervals, in one transaction. Pausing with nothing open keeps the saved
   set. **Resume** needs nothing open and turns the saved set back into new
@@ -34,6 +59,8 @@ The data model and behavior of kowalski. Contributor rules are in
   open interval is an error. Without a target they go to the focus; with no
   focus they are an error, not a guess. Switching to the task that is
   already the focus does nothing.
+- Starring a note is a saved mark, not a history edit; it does not mark the
+  day edited and is allowed under posted spans.
 - Intervals are half-open `[start, end)` in UTC Unix milliseconds. The API
   carries milliseconds or strings, never nanoseconds (too large for
   JavaScript numbers).
@@ -97,7 +124,8 @@ The data model and behavior of kowalski. Contributor rules are in
   day's focus and confirmed postings. Several confirmed postings can share
   a day and ref. `sending` is saved before the provider is called, with a
   stable id for provider-side de-duplication. Only a `sending` or `unknown`
-  posting blocks another for the same day, provider instance and ref. A
+  posting blocks another for the same day and either the same task or the
+  same provider instance and ref. A
   timeout, or a `sending` row found at startup, becomes `unknown`; a late
   completion is applied when it arrives. Manual resolution is refused while
   that provider call still runs. After a crash, an `unknown` outcome needs
@@ -110,12 +138,18 @@ The data model and behavior of kowalski. Contributor rules are in
   represent day totals; total and session postings cannot mix for one day
   and ref because a total does not identify which minutes it covered.
 
+  What counts as posted for a task's day is every posting of that task,
+  under any ref it was bound to, plus every posting under its current ref.
+  So a rebind never makes time posted under the old ref postable again.
+  A day changed after all its postings were confirmed can be accepted as
+  posted without changing its postings; a later edit marks it changed again.
+
 ## Imported history
 
 - Importing from another tool is a separate tool's job, not the core's.
   Up to v0.1.0 kowalski exported its database code as a Zig module for
   such a tool; it no longer does. An importer built against v0.1.0 writes
-  schema v3. Kowalski upgrades that database to v5 on open. Imported
+  schema v3. Kowalski upgrades that database to the current schema on open. Imported
   rows become ordinary history;
   import provenance is no longer kept.
 

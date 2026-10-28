@@ -1,14 +1,18 @@
 'use strict';
 // ── Settings ──────────────────────────────────────────────────────────────────
 function applyPrefs() {
-  _hideWeekends = pref('ui_hide_weekends', '0') === '1';
+  _hideWeekends = pref('ui_show_weekends', '1') !== '1';
   _sidebarDays = parseInt(pref('ui_sidebar_days', '7'), 10);
   if (!Number.isFinite(_sidebarDays) || _sidebarDays < 1 || _sidebarDays > 90) _sidebarDays = 7;
   _refLinks = pref('ui_links', '0') === '1';
   _showAddEntry = pref('ui_show_add_entry', '0') === '1';
   _showKeys = pref('ui_show_keys', '1') === '1';
+  _showSummary = pref('ui_show_summary', '1') === '1';
+  document.querySelector('#main-tabs [data-tab="summary"]').style.display = _showSummary ? '' : 'none';
   _singleKeys = pref('ui_single_keys', '1') === '1';
   _summaryFormat = pref('ui_summary_format', 'grouped');
+  _taskOrder = pref('ui_task_order', 'time');
+  _reportLayout = ['grid'].includes(pref('ui_report_layout', 'classic')) ? pref('ui_report_layout', 'classic') : 'classic';
   _chartVisible = pref('ui_chart_visible', '1') === '1';
   chartDays = parseInt(pref('ui_chart_days', '14'), 10);
   if (!Number.isFinite(chartDays) || chartDays < 1) chartDays = 14;
@@ -18,10 +22,59 @@ function applyPrefs() {
 async function loadSettings() {
   const data = await apiJSON('GET', '/api/settings');
   settings = Object.fromEntries(data.settings.map(({ key, value }) => [key, value]));
+  saveLS('settingsCache', settings);
   applyPrefs();
 }
 
+applyPrefs();
+
 let _settingsLoaded = false;
+let _captureKeys = [];
+let _deletingProject = null; // id whose delete row is open
+let _capturedPreview = null, _capturedEpoch = 0, _capturedBusy = false;
+
+function invalidateCapturedPreview() {
+  _capturedEpoch++;
+  _capturedPreview = null;
+  id('capture-remove').disabled = true;
+  id('capture-result').textContent = '';
+}
+
+async function previewCapturedText() {
+  if (_capturedBusy) return;
+  const from = id('capture-from').value, to = id('capture-to').value;
+  invalidateCapturedPreview();
+  if (!from || !to || from > to) { showError(t('capture_bad_range')); return; }
+  const epoch = _capturedEpoch;
+  _capturedBusy = true;
+  id('capture-preview').disabled = true;
+  try {
+    const data = await apiJSON('POST', '/api/notes/captured', { from, to, apply: false });
+    if (epoch !== _capturedEpoch) return;
+    _capturedPreview = { from, to };
+    id('capture-result').textContent = t('capture_preview_count', { n: data.count });
+    id('capture-remove').disabled = false;
+  } catch (e) { if (epoch === _capturedEpoch) showError(e.message); }
+  finally { _capturedBusy = false; id('capture-preview').disabled = false; }
+}
+
+async function removeCapturedText() {
+  if (_capturedBusy || !_capturedPreview) return;
+  const { from, to } = _capturedPreview;
+  if (id('capture-from').value !== from || id('capture-to').value !== to) { invalidateCapturedPreview(); return; }
+  _capturedBusy = true;
+  id('capture-remove').disabled = true;
+  id('capture-preview').disabled = true;
+  id('capture-from').disabled = true;
+  id('capture-to').disabled = true;
+  try {
+    const data = await apiJSON('POST', '/api/notes/captured', { from, to, apply: true });
+    _capturedPreview = null;
+    id('capture-result').textContent = t('capture_removed_count', { n: data.deleted });
+    loadDay(selectedDate);
+  } catch (e) { showError(e.message); }
+  finally { _capturedBusy = false; id('capture-preview').disabled = false; id('capture-from').disabled = false; id('capture-to').disabled = false; }
+}
 // Window rows being edited; switching a mode off keeps them for this visit.
 let _paidDraft = [];
 let _lockDraft = [];
@@ -52,23 +105,24 @@ async function showSettings() {
     id('set-lock-on').checked = _lockDraft.length > 0;
     id('set-lang').value = _lang;
     id('set-time-format').value = pref('ui_time_format', 'system');
-    id('set-sidebar-days').value = pref('ui_sidebar_days', '7');
-    id('set-day-order').value = pref('ui_day_order', 'oldest');
-    id('set-show-weekends').checked = pref('ui_hide_weekends', '0') !== '1';
-    id('set-summary-format').value = pref('ui_summary_format', 'grouped');
     id('set-links').checked = pref('ui_links', '0') === '1';
     id('set-show-add-entry').checked = pref('ui_show_add_entry', '0') === '1';
     id('set-show-keys').checked = pref('ui_show_keys', '1') === '1';
+    id('set-show-summary').checked = pref('ui_show_summary', '1') === '1';
     id('set-single-keys').checked = pref('ui_single_keys', '1') === '1';
-    id('set-open-launch').checked = pref('ui_open_on_launch', '1') === '1';
-    id('set-autofill').checked = pref('ui_autofill_obs', '0') === '1';
+    id('set-open-launch').checked = pref('open_on_launch', '1') === '1';
+    id('set-post-notes').checked = pref('post_daily_notes', '0') === '1';
     id('set-post-sessions').checked = pref('post_sessions', '0') === '1';
+    id('set-capture-keep').checked = pref('capture_text', 'keep') === 'keep';
+    invalidateCapturedPreview();
     renderProviderControls();
+    await renderPickers();
     loadSourceStatus().catch(e => { id('set-source-error').textContent = e.message; });
-    id('set-zone').value = pref('reporting_zone', '');
     id('set-port').textContent = pref('http_port', location.port || '47100');
     apiJSON('GET', '/api/version').then(data => {
       id('set-version').textContent = data.version;
+      id('set-update-channel').value = pref('update_channel', String(data.version).includes('-preview.') ? 'preview' : 'stable');
+      id('update-stable-note').style.display = String(data.version).includes('-preview.') ? '' : 'none';
       id('update-row').style.display = data.update_repo || _lastUpdateOutcome ? '' : 'none';
       if (!data.update_repo && !_lastUpdateOutcome) id('update-result').style.display = 'none';
       else if (_lastUpdateOutcome) {
@@ -94,10 +148,180 @@ function renderProviderControls() {
   id('set-account-row').style.display = provider ? '' : 'none';
   renderProviderStatus();
   renderProviderSettings();
+}
+
+// The zone and holding sources are chosen from lists; the day start is the
+// app's time field, in the chosen 12/24-hour format.
+let _zones = null;
+async function renderPickers() {
+  if (!_zones) _zones = (await apiJSON('GET', '/api/zones')).zones;
+  const zone = pref('reporting_zone', '');
+  const zones = zone && !_zones.includes(zone) ? [zone, ..._zones] : _zones;
+  // Unset stays unset: saving another setting must not pick a zone.
+  id('set-zone').innerHTML = (zone ? '' : `<option value="" selected>${esc(t('zone_default'))}</option>`) +
+    zones.map(z => `<option value="${escAttr(z)}"${z === zone ? ' selected' : ''}>${esc(z)}</option>`).join('');
+  id('set-day-start').value = fmtClock(pref('day_start', '00:00'));
+  id('set-day-start').classList.remove('bad');
+  const held = (pref('capture_hold_sources', '') || '').split(',').map(x => x.trim()).filter(Boolean);
+  const keys = (await apiJSON('GET', '/api/project-keys')).keys;
+  const sources = [...new Set([...keys.map(k => k.source), ...held])].sort();
+  id('set-hold-sources').innerHTML = sources.map(src => `<label class="set-sw"><input type="checkbox" class="sw" data-source="${escAttr(src)}"${held.includes(src) ? ' checked' : ''}><span>${esc(src)}</span></label>`).join('')
+    || `<small>${esc(t('set_hold_none'))}</small>`;
+}
+
+// ── Projects ──────────────────────────────────────────────────────────────────
+async function showProjects() {
+  try {
+    await loadSettings();
+    renderProjectField();
+    await loadProjectSettings();
+  } catch (e) { showError(e.message); }
+  id('settings-overlay').classList.add('show');
+  id('projects-popup').classList.add('show');
+}
+
+function hideProjects() {
+  id('projects-popup').classList.remove('show');
+  id('settings-overlay').classList.remove('show');
+}
+
+function renderProjectField() {
   const fields = (provider?.fields || []).slice().sort((a, b) => a.order - b.order);
-  const hiddenTabs = chartHiddenGroups();
-  id('set-chart-tabs-row').style.display = fields.length ? '' : 'none';
-  id('set-chart-tabs').innerHTML = fields.map(f => `<label class="set-sw"><input type="checkbox" class="sw" data-group="${escAttr(f.name)}"${hiddenTabs.includes(f.name) ? '' : ' checked'}><span>${esc(providerLabel(f))}</span></label>`).join('');
+  id('set-project-field-row').style.display = fields.length ? '' : 'none';
+  const projectField = id('set-project-field');
+  projectField.innerHTML = `<option value="">${esc(t('project_off'))}</option>` + fields.map(f =>
+    `<option value="${escAttr(f.name)}">${esc(providerLabel(f))}</option>`).join('');
+  projectField.value = pref('project_provider_field', '');
+}
+
+async function saveProjectField(value) {
+  try { await setPref('project_provider_field', value || null); showToast(t('settings_saved')); }
+  catch (e) { showError(e.message); renderProjectField(); }
+}
+
+async function loadProjectSettings() {
+  const [, keys] = await Promise.all([loadProjects(), apiJSON('GET', '/api/project-keys')]);
+  _captureKeys = keys.keys;
+  renderProjectSettings();
+}
+
+// A capture duplicate is named "<name>-<8 hex>"; deleting it offers <name>.
+function deleteTargetFor(p) {
+  const base = p.label.replace(/-[0-9a-f]{8}$/, '');
+  const match = base !== p.label && projects.find(o => o.id !== p.id && !o.archived && o.label.toLowerCase() === base.toLowerCase());
+  return match ? String(match.id) : 'unassigned';
+}
+
+function projectRow(p) {
+  if (_deletingProject === p.id) {
+    const options = `<option value="unassigned">${esc(t('project_unassigned'))}</option>` + projects.filter(o => o.id !== p.id && !o.archived)
+      .map(o => `<option value="${o.id}">${esc(o.label)}</option>`).join('');
+    return `<div class="proj-row deleting"><span class="proj-label">${esc(p.label)}</span>
+      <span class="proj-move"><i>${esc(t('project_move_to'))}</i><span class="sel"><select id="set-project-into">${options}</select>${icon('chev')}</span></span>
+      <button type="button" class="set-btn danger" onclick="deleteProject(${p.id})">${esc(t('project_delete'))}</button>
+      <button type="button" class="set-btn" onclick="cancelDeleteProject()">${esc(t('cancel'))}</button></div>`;
+  }
+  const archive = p.archived ? t('project_restore') : t('project_archive');
+  return `<div class="proj-row"><input class="proj-name" id="set-project-name-${p.id}" value="${escAttr(p.label)}" maxlength="200" spellcheck="false" autocomplete="off" aria-label="${escAttr(t('project_name'))}" onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur()}else if(event.key==='Escape'){event.stopPropagation();this.value=this.defaultValue;this.blur()}" onblur="renameProject(${p.id})">
+    <button type="button" class="btn-icon" title="${escAttr(archive)}" aria-label="${escAttr(archive)}" onclick="toggleProjectArchive(${p.id},${!p.archived})">${icon(p.archived ? 'refresh' : 'archive')}</button>
+    <button type="button" class="btn-icon" title="${escAttr(t('project_delete'))}" aria-label="${escAttr(t('project_delete'))}" onclick="askDeleteProject(${p.id})">${icon('trash')}</button></div>`;
+}
+
+// One row per repository key; its sources share one project.
+function keyRows() {
+  const byKey = new Map();
+  for (const k of _captureKeys) {
+    if (!byKey.has(k.project_key)) byKey.set(k.project_key, []);
+    byKey.get(k.project_key).push(k);
+  }
+  return [...byKey.entries()].map(([key, rows]) => {
+    const ids = [...new Set(rows.map(r => r.project_id))];
+    const mixed = ids.length > 1;
+    const options = (mixed ? `<option value="" selected>${esc(t('project_keys_mixed'))}</option>` : '') + projects.map(p =>
+      `<option value="${p.id}"${!mixed && p.id === ids[0] ? ' selected' : ''}>${esc(p.label)}${p.archived ? ' (' + esc(t('project_archived')) + ')' : ''}</option>`).join('');
+    const sources = rows.map(r => mixed ? `${r.source}: ${projectName(r.project_id)}` : r.source).join(', ');
+    return `<div class="proj-row proj-key"><span class="proj-label" title="${escAttr(key)}">${esc(rows[0].project_hint)}<small>${esc(sources)}</small></span>
+      <span class="sel"><select aria-label="${escAttr(t('project_capture_sources'))}" data-key="${escAttr(key)}" onchange="changeKeyProject(this)">${options}</select>${icon('chev')}</span></div>`;
+  }).join('') || `<div class="project-message">${esc(t('project_no_keys'))}</div>`;
+}
+
+function renderProjectSettings() {
+  const active = projects.filter(p => !p.archived), archived = projects.filter(p => p.archived);
+  id('set-project-list').innerHTML = active.map(projectRow).join('') || `<div class="project-message">${esc(t('project_none'))}</div>`;
+  const box = id('set-project-archived');
+  box.style.display = archived.length ? '' : 'none';
+  box.querySelector('summary').textContent = t('project_archived_count', { n: archived.length });
+  id('set-project-archived-list').innerHTML = archived.map(projectRow).join('');
+  if (_deletingProject != null) {
+    const p = projects.find(p => p.id === _deletingProject);
+    if (p) id('set-project-into').value = deleteTargetFor(p);
+  }
+  id('set-project-keys').innerHTML = keyRows();
+}
+
+async function refreshProjects() {
+  await _projectsLoading?.catch(() => {});
+  await loadProjectSettings();
+  loadDay(selectedDate, { chart: true });
+}
+
+async function addProject() {
+  const field = id('set-project-new');
+  const label = field.value.trim();
+  if (!label) { field.focus(); return; }
+  try {
+    await apiJSON('POST', '/api/projects', { label });
+    field.value = '';
+    await refreshProjects();
+  } catch (e) { showError(e.message); }
+}
+
+async function renameProject(projectId) {
+  const field = id('set-project-name-' + projectId);
+  const p = projects.find(p => p.id === projectId);
+  const label = field?.value.trim();
+  if (!field || !p || label === p.label) return;
+  if (!label) { field.value = p.label; return; }
+  try {
+    await apiJSON('PATCH', '/api/projects/' + projectId, { label });
+    await refreshProjects();
+  } catch (e) { field.value = p.label; showError(e.message); }
+}
+
+async function toggleProjectArchive(projectId, archived) {
+  try {
+    await apiJSON('PATCH', '/api/projects/' + projectId, { archived });
+    await refreshProjects();
+  } catch (e) { showError(e.message); }
+}
+
+function askDeleteProject(projectId) {
+  _deletingProject = projectId;
+  if (projects.find(p => p.id === projectId)?.archived) id('set-project-archived').open = true;
+  renderProjectSettings();
+  id('set-project-into')?.focus();
+}
+
+function cancelDeleteProject() {
+  _deletingProject = null;
+  renderProjectSettings();
+}
+
+async function deleteProject(projectId) {
+  const value = id('set-project-into').value;
+  try {
+    await apiJSON('DELETE', '/api/projects/' + projectId + '?into=' + (value === 'unassigned' ? 'none' : encodeURIComponent(value)));
+    _deletingProject = null;
+    await refreshProjects();
+  } catch (e) { showError(e.message); }
+}
+
+async function changeKeyProject(select) {
+  if (!select.value) return;
+  try {
+    await apiJSON('PATCH', '/api/project-keys', { project_key: select.dataset.key, project_id: Number(select.value) });
+    await loadProjectSettings();
+  } catch (e) { showError(e.message); renderProjectSettings(); }
 }
 
 function renderProviderStatus() {
@@ -558,6 +782,12 @@ function renderLockRows(changed) {
   id('lock-rows').innerHTML = id('set-lock-on').checked ? windowRows('lock', _lockDraft, false) : '';
 }
 
+function tidyDayStart(el) {
+  const v = parseClock(el.value);
+  el.classList.toggle('bad', !v || v > '12:00');
+  if (v) el.value = fmtClock(v);
+}
+
 function minClock(m) { return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; }
 
 function readWindows(kind) {
@@ -612,9 +842,6 @@ async function applySettings() {
     if (!ok) return settingsError('lock-rows', 'win_bad');
     lockPause = joinWindows(_lockDraft, false);
   }
-  let sidebarDays = parseInt(id('set-sidebar-days').value, 10);
-  if (isNaN(sidebarDays)) sidebarDays = 7;
-  sidebarDays = Math.min(90, Math.max(1, sidebarDays));
   const lang = id('set-lang').value;
   const changes = {
     daily_work_minutes: String(daily),
@@ -623,37 +850,43 @@ async function applySettings() {
     lock_pause: lockPause,
     ui_lang: lang,
     ui_time_format: id('set-time-format').value,
-    ui_sidebar_days: String(sidebarDays),
-    ui_day_order: id('set-day-order').value,
-    ui_hide_weekends: id('set-show-weekends').checked ? '0' : '1',
-    ui_summary_format: id('set-summary-format').value,
     ui_links: id('set-links').checked ? '1' : '0',
     ui_show_add_entry: id('set-show-add-entry').checked ? '1' : '0',
     ui_show_keys: id('set-show-keys').checked ? '1' : '0',
+    ui_show_summary: id('set-show-summary').checked ? '1' : '0',
     ui_single_keys: id('set-single-keys').checked ? '1' : '0',
-    ui_open_on_launch: id('set-open-launch').checked ? '1' : '0',
-    ui_autofill_obs: id('set-autofill').checked ? '1' : '0',
+    open_on_launch: id('set-open-launch').checked ? '1' : '0',
+    post_daily_notes: id('set-post-notes').checked ? '1' : '0',
     post_sessions: id('set-post-sessions').checked ? '1' : '0',
+    update_channel: id('set-update-channel').value,
+    capture_text: id('set-capture-keep').checked ? 'keep' : 'time',
+    capture_hold_sources: [...id('set-hold-sources').querySelectorAll('input[data-source]:checked')].map(el => el.dataset.source).join(','),
     // An emptied text goes back to the provider's default.
     ...Object.fromEntries([...document.querySelectorAll('#set-provider-rows [data-key]')]
       .map(el => [el.dataset.key, el.value.trim() || null])),
-    ui_chart_hidden: JSON.stringify([...id('set-chart-tabs').querySelectorAll('input:not(:checked)')].map(el => el.dataset.group)),
   };
-  const zoneName = id('set-zone').value.trim();
+  const zoneName = id('set-zone').value;
   if (zoneName && zoneName !== pref('reporting_zone', '')) changes.reporting_zone = zoneName;
+  const dayStart = parseClock(id('set-day-start').value);
+  if (!dayStart || dayStart > '12:00') return settingsError('set-day-start', 'set_bad_day_start');
+  changes.day_start = dayStart;
 
   try {
     const data = await apiJSON('PATCH', '/api/settings', changes);
     settings = Object.fromEntries(data.settings.map(({ key, value }) => [key, value]));
+    saveLS('settingsCache', settings);
     applyPrefs();
+    if (!_showSummary && activeTab === 'summary') {
+      applyActiveTab(activeTab);
+      saveLS('activeTab', activeTab);
+    }
     hideSettings();
     showToast(t('settings_saved'));
     applyFeatureToggles();
-    renderChartGroups();
     if (lang !== _lang) { setLangFrom(settings); relabel(); return; }
     loadCurrent(); // the header picks up the link and time-format choices
     loadSchedule();
-    loadDay(selectedDate, { chart: true }); // weekends, sidebar days and day order
+    loadDay(selectedDate, { chart: true }); // weekends, sidebar days, day and task order
   } catch (e) {
     showError(e.message);
   }

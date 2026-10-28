@@ -15,15 +15,23 @@ function typedMs(hhmm, anchorMs) {
 // Asks in the page, never with a browser dialog. Resolves true on OK; a newer
 // question answers the older one with false.
 let _confirmDone = null;
-function askConfirm(text, okLabel, danger = false) {
+function askConfirm(text, okLabel, danger = false, { details = [], focusCancel = false } = {}) {
   if (_confirmDone) closeConfirm(false);
   id('confirm-text').textContent = text;
+  const list = id('confirm-details');
+  list.replaceChildren();
+  for (const detail of details) {
+    const item = document.createElement('li');
+    item.textContent = detail;
+    list.appendChild(item);
+  }
+  list.hidden = !details.length;
   const ok = id('confirm-ok');
   ok.textContent = okLabel;
   ok.classList.toggle('danger', danger);
   id('confirm-overlay').classList.add('show');
   id('confirm-popup').classList.add('show');
-  setTimeout(() => ok.focus(), 50);
+  setTimeout(() => (focusCancel ? id('confirm-cancel') : ok).focus(), 50);
   return new Promise(resolve => { _confirmDone = resolve; });
 }
 
@@ -68,10 +76,24 @@ async function deleteBlock(i) {
 
 // The block as it was when the popup opened: a reload may reorder _blockData.
 let _editBlock = null;
+let _editProjectEpoch = 0, _editProjectBusy = false;
 
-function openEditTime(i) {
+async function openEditTime(i) {
+  const epoch = ++_editProjectEpoch;
   const s = _blockData[i];
-  _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms };
+  // No target until this dialog's picker is ready: Save must not act on the old one.
+  _editBlock = null;
+  id('edit-end-activity').style.display = s.captured && s.end_ms == null ? '' : 'none';
+  id('edit-take-focus').style.display = s.role === 'parallel' ? '' : 'none';
+  const current = () => epoch === _editProjectEpoch;
+  try { if (!await setupProjectPicker(id('edit-project-filter'), id('edit-project-target'), s.project_id, current)) return; }
+  catch (e) { if (current()) showError(e.message); return; }
+  if (!current()) return;
+  _editBlock = { id: s.id, start_ms: s.start_ms, end_ms: s.end_ms, project_id: s.project_id };
+  const isOpen = s.end_ms == null;
+  id('edit-project-filter').disabled = isOpen;
+  id('edit-project-target').disabled = isOpen;
+  id('edit-project-open-hint').hidden = !isOpen;
   id('edit-start').value = fmtClock(hhmm24(s.start_ms));
   id('edit-end').value = s.end_ms == null ? '' : fmtClock(hhmm24(s.end_ms));
   for (const el of [id('edit-start'), id('edit-end')]) el.classList.remove('bad');
@@ -80,14 +102,26 @@ function openEditTime(i) {
   id('edit-popup').classList.add('show');
 }
 
+async function applyIntervalAction(action) {
+  if (!_editBlock) return;
+  const s = _editBlock;
+  try {
+    await apiJSON('POST', '/api/intervals/' + s.id + '/' + action, { seen: seenOf(s) });
+    if (_editBlock === s) closeEditTime();
+    loadDay(selectedDate, { chart: true });
+    loadCurrent();
+  } catch (e) { showError(e.message); }
+}
+
 function closeEditTime() {
+  ++_editProjectEpoch;
   id('edit-overlay').classList.remove('show');
   id('edit-popup').classList.remove('show');
   _editBlock = null;
 }
 
 async function applyEditTime() {
-  if (_editBlock == null) return;
+  if (_editBlock == null || _editProjectBusy) return;
   const s = _editBlock;
   const startVal = parseClock(id('edit-start').value); // HH:MM or null
   const endVal   = parseClock(id('edit-end').value);   // HH:MM or null
@@ -97,14 +131,28 @@ async function applyEditTime() {
   }
   const start_ms = typedMs(startVal, s.start_ms);
   const end_ms = s.end_ms == null ? null : typedMs(endVal, s.end_ms);
+  const project_id = s.end_ms == null ? s.project_id : pickedProject(id('edit-project-target'));
   // The dialog stays open until the change is saved, so a refusal keeps what was typed.
+  _editProjectBusy = true;
   try {
-    await apiJSON('PATCH', '/api/intervals/' + s.id, { seen: seenOf(s), start_ms, end_ms });
+    const body = { seen: seenOf(s), start_ms, end_ms };
+    if (s.end_ms != null && project_id !== s.project_id) {
+      const preview = await apiJSON('POST', '/api/projects/assign/preview', { scope: { interval_ids: [s.id] }, project_id });
+      if (_editBlock !== s || pickedProject(id('edit-project-target')) !== project_id ||
+          parseClock(id('edit-start').value) !== startVal || parseClock(id('edit-end').value) !== endVal) return;
+      if (preview.snapshot.intervals.length !== 1) throw { status: 409 };
+      body.project_id = project_id;
+      body.snapshot = preview.snapshot;
+    }
+    if (_editBlock !== s) return;
+    await apiJSON('PATCH', '/api/intervals/' + s.id, body);
     if (_editBlock === s) closeEditTime();
-    showToast(t('times_updated'));
+    showToast(project_id !== s.project_id ? t('project_applied', { n: 1 }) : t('times_updated'));
     loadDay(selectedDate, { chart: true });
   } catch (e) {
-    showError(e.message);
+    if (_editBlock === s) showError(e.status === 409 ? t('project_stale') : e.message);
+  } finally {
+    _editProjectBusy = false;
   }
 }
 
@@ -177,28 +225,32 @@ async function applyAddEntry() {
 }
 
 // ── Move an interval to another task by dragging ─────────────────────────────
-// A closed interval's header, or a run of its selected 15-minute slots,
-// drags onto another task's card on the same day. A run cuts the interval:
-// only that stretch moves. Times and notes stay; the report re-sorts on reload.
-let _drag = null; // { bi, part: null | { from, to } }
+// Headers drag one full interval; a selected slot drags the whole clock range.
+let _drag = null; // { snapshot }
 
 function dragBlock(e, bi) {
-  _drag = { bi, part: null };
+  const s = _blockData[bi];
+  if (!s || s.end_ms == null) return;
+  _drag = { snapshot: {
+    pieces: [{ s, from: s.start_ms, to: s.end_ms }],
+    sources: [{ id: s.id, seen: seenOf(s), ranges: [[s.start_ms, s.end_ms]] }],
+    from_ms: s.start_ms, to_ms: s.end_ms,
+    posted_tasks: new Set(D.posted_tasks || []),
+  } };
   e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', String(bi));
+  e.dataTransfer.setData('text/plain', String(s.id));
   e.currentTarget.closest('.block').classList.add('dragging');
 }
 
 // Dragging a slot outside the selection selects just that slot first.
 function dragSlots(e, bi, k) {
   e.stopPropagation();
-  if (!(_slotSel?.bi === bi && k >= _slotSel.a && k <= _slotSel.b)) {
-    _slotSel = { bi, a: k, b: k };
-    markSlotSel();
-  }
-  _drag = { bi, part: slotRange(bi, _slotSel.a, _slotSel.b) };
+  if (!e.currentTarget.closest('.slot-row').classList.contains('sel')) selectSlot({ stopPropagation() {}, shiftKey: false }, bi, k);
+  const snapshot = selectionSnapshot();
+  if (!snapshot?.sources.length) return;
+  _drag = { snapshot };
   e.dataTransfer.effectAllowed = 'move';
-  e.dataTransfer.setData('text/plain', String(bi));
+  e.dataTransfer.setData('text/plain', String(_blockData[bi].id));
 }
 
 function dragEndBlock() {
@@ -209,9 +261,8 @@ function dragEndBlock() {
 
 // Only another task's card accepts the drop.
 function dropTask(idx) {
-  const s = _drag && _blockData[_drag.bi];
   const task = _taskData[idx]?.task;
-  return s && task && task.id !== s.task.id ? task : null;
+  return _drag?.snapshot?.sources.length && task && _drag.snapshot.pieces.some(p => p.s.task.id !== task.id) ? task : null;
 }
 
 function dragOverTask(e, idx) {
@@ -231,15 +282,5 @@ async function dropOnTask(e, idx) {
   const task = dropTask(idx);
   dragEndBlock();
   if (!task) return;
-  const s = _blockData[drag.bi];
-  const body = { seen: seenOf(s), task: task.id };
-  if (drag.part) { body.from_ms = drag.part.from; body.to_ms = drag.part.to; }
-  try {
-    await apiJSON('POST', '/api/intervals/' + s.id + '/move', body);
-    const what = drag.part ? `${fmtTime(drag.part.from)}–${fmtTime(drag.part.to)}` : `${fmtTime(s.start_ms)}–${fmtTime(s.end_ms)}`;
-    showToast(t('moved_to', { what, name: task.ref || task.title }));
-  } catch (err) {
-    showError(err.data?.error === 'Overlap' ? t('move_overlap') : err.message);
-  }
-  loadDay(selectedDate, { chart: true });
+  await assignSelectionToTask(task, drag.snapshot);
 }

@@ -23,6 +23,7 @@ const openBlock = () => {
 };
 const row = sel => () => id(sel)?.closest('.set-row') || null;
 
+const prefRow = key => `#pref-menu [data-key="${key}"]`;
 const HELP = [
   // Command bar
   { id: 'date', sel: '.hdr-date', keys: '← → T' },
@@ -92,20 +93,21 @@ const HELP = [
   { id: 's_lock', sel: row('set-lock-on'), open: openSettings },
   { id: 's_lang', sel: row('set-lang'), open: openSettings },
   { id: 's_time', sel: row('set-time-format'), open: openSettings },
-  { id: 's_sidebar', sel: row('set-sidebar-days'), open: openSettings },
-  { id: 's_order', sel: row('set-day-order'), open: openSettings },
-  { id: 's_weekends', sel: row('set-show-weekends'), open: openSettings },
-  { id: 's_summary', sel: row('set-summary-format'), open: openSettings },
-  { id: 's_chart_tabs', sel: '#set-chart-tabs-row', provider: true, open: openSettings },
+  // View options, in the popover beside their view
+  { id: 's_sidebar', sel: prefRow('ui_sidebar_days'), open: () => openPrefMenu('sidebar') },
+  { id: 's_order', sel: prefRow('ui_day_order'), open: () => openPrefMenu('sidebar') },
+  { id: 's_weekends', sel: prefRow('ui_show_weekends'), open: () => openPrefMenu('sidebar') },
+  { id: 's_summary', sel: prefRow('ui_summary_format'), open: async () => { setTab('summary'); await openPrefMenu('summary'); } },
+  { id: 's_chart_tabs', sel: prefRow('ui_chart_hidden'), provider: true, open: () => openPrefMenu('chart') },
   { id: 's_links', sel: row('set-links'), provider: true, open: openSettings },
   { id: 's_buttons', sel: row('set-show-add-entry'), open: openSettings },
   { id: 's_singlekeys', sel: row('set-single-keys'), open: openSettings },
   { id: 's_openlaunch', sel: row('set-open-launch'), open: openSettings },
-  { id: 's_autofill', sel: row('set-autofill'), provider: true, open: openSettings },
+  { id: 's_autofill', sel: row('set-post-notes'), provider: true, open: openSettings },
   { id: 's_provider', sel: '#set-provider-rows .set-row', provider: true, open: openSettings },
   { id: 's_sessions', sel: '#set-post-sessions-row', provider: true, open: openSettings },
   { id: 's_account', sel: '#set-account-row', provider: true, open: openSettings },
-  { id: 's_zone', sel: row('set-zone'), open: openSettingsAdvanced },
+  { id: 's_zone', sel: row('set-zone'), open: openSettings },
   { id: 's_port', sel: () => id('set-port')?.closest('.set-row'), open: openSettingsAdvanced },
 ];
 const HELP_BY_ID = Object.fromEntries(HELP.map(h => [h.id, h]));
@@ -119,7 +121,8 @@ const HELP_SPOTS = [
   ['#keys-popup', 'keys'],
   ['#cal-popup', 'calendar'],
 ];
-const HELP_SECTIONS = ['s_daily', 's_lang', 's_autofill', 's_zone'];
+// A settings section names its help topic in data-help, so order never matters.
+const settingsSection = help => id('settings-popup').querySelector(`.set-sec[data-help="${help}"]`);
 
 function helpEl(h) {
   const el = typeof h.sel === 'function' ? h.sel() : document.querySelector(h.sel);
@@ -410,7 +413,7 @@ const isShown = popupId => id(popupId)?.classList.contains('show');
 const prevWorkday = () => {
   const d = new Date(todayStr() + 'T12:00:00');
   do d.setDate(d.getDate() - 1); while (d.getDay() === 0 || d.getDay() === 6);
-  return d.toLocaleDateString('sv');
+  return calendarDateStr(d);
 };
 const redDay = () => document.querySelector('#week-nav .dclock.unsynced')?.closest('.dbtn')
   || [...document.querySelectorAll('#week-nav .dbtn')].reverse().find(b => b.querySelector('.dtotal')?.textContent !== '—');
@@ -486,9 +489,9 @@ const FLOWS = {
       act: async () => { await submitHoras(); await pause(600); } },
     { id: 'post_after', el: '#week-nav', prep: () => { if (isShown('horas-popup')) hideHoras(); } },
     { id: 'post_settings', el: '#settings-btn', done: () => isShown('settings-popup'), act: openSettings },
-    { id: 'post_workday', el: () => id('settings-popup').querySelectorAll('.set-sec')[0] },
-    { id: 'post_display', el: () => id('settings-popup').querySelectorAll('.set-sec')[1] },
-    { id: 'post_posting', el: () => id('settings-popup').querySelectorAll('.set-sec')[2] },
+    { id: 'post_workday', el: () => settingsSection('s_daily') },
+    { id: 'post_display', el: () => settingsSection('s_lang') },
+    { id: 'post_posting', el: () => settingsSection('s_autofill') },
     { id: 'post_save', el: '.set-foot' },
   ],
 };
@@ -725,13 +728,12 @@ function addHelpButtons() {
     const box = document.querySelector(sel);
     if (box && !box.querySelector(':scope > .help-btn')) box.insertAdjacentHTML('beforeend', btn(helpId));
   }
-  const secs = id('settings-popup').querySelectorAll('.set-sec');
-  secs.forEach((sec, i) => {
+  id('settings-popup').querySelectorAll('.set-sec[data-help]').forEach(sec => {
     const head = sec.querySelector('h4, summary');
     if (!head || head.querySelector('.help-btn')) return;
     const chev = head.querySelector('.chev');
-    if (chev) chev.insertAdjacentHTML('beforebegin', btn(HELP_SECTIONS[i]));
-    else head.insertAdjacentHTML('beforeend', btn(HELP_SECTIONS[i]));
+    if (chev) chev.insertAdjacentHTML('beforebegin', btn(sec.dataset.help));
+    else head.insertAdjacentHTML('beforeend', btn(sec.dataset.help));
   });
 }
 

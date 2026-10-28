@@ -1,5 +1,93 @@
 'use strict';
 // ── Sidebar ───────────────────────────────────────────────────────────────────
+let projects = [];
+let _projectsLoading = null;
+let _projectsRev = null; // S.projects_rev when the list was last fetched
+
+function projectName(projectId) {
+  if (projectId == null) return t('project_unassigned');
+  const p = projects.find(p => p.id === projectId);
+  return p ? p.label + (p.archived ? ' (' + t('project_archived') + ')' : '') : '#' + projectId;
+}
+
+// New work defaults to the project of the current focus.
+function focusProjectId() {
+  return S?.focus?.project_id ?? null;
+}
+
+async function loadProjects() {
+  if (_projectsLoading) return _projectsLoading;
+  const rev = S?.projects_rev ?? null;
+  _projectsLoading = apiJSON('GET', '/api/projects?archived=1').then(data => {
+    projects = data.projects;
+    _projectsRev = rev;
+    return projects;
+  }).finally(() => { _projectsLoading = null; });
+  return _projectsLoading;
+}
+
+function projectOptions(value) {
+  const choices = [`<option value="unassigned">${esc(t('project_unassigned'))}</option>`];
+  for (const p of projects) {
+    if (p.archived && String(p.id) !== String(value)) continue;
+    choices.push(`<option value="${p.id}">${esc(p.label)}${p.archived ? ' (' + esc(t('project_archived')) + ')' : ''}</option>`);
+  }
+  return choices.join('');
+}
+
+// The edit and task dialogs share this searchable order. The new-task picker
+// keeps its existing options and defaults.
+// isCurrent says whether the dialog still belongs to the caller: a slow
+// answer for a dialog opened earlier must not touch the controls.
+async function setupProjectPicker(filter, select, value, isCurrent) {
+  await loadProjects();
+  if (!isCurrent()) return false;
+  let frequent = [];
+  try { frequent = (await apiJSON('GET', '/api/frequent?limit=50')).tasks || []; } catch {}
+  if (!isCurrent()) return false;
+  const available = projects.filter(p => !p.archived || String(p.id) === String(value));
+  const byId = new Map(available.filter(p => !p.archived).map(p => [p.id, p]));
+  const recent = [];
+  for (const item of frequent) {
+    const p = byId.get(item.task.project_id);
+    if (p && !recent.includes(p)) recent.push(p);
+    if (recent.length === 5) break;
+  }
+  const rest = available.filter(p => !recent.includes(p))
+    .sort((a, b) => a.label.localeCompare(b.label, locale(), { sensitivity: 'base' }) || a.id - b.id);
+  const ordered = [{ id: 'unassigned', label: t('project_unassigned') }, ...recent, ...rest];
+  select.dataset.picked = value == null ? 'unassigned' : String(value);
+  filter.value = '';
+  const render = () => {
+    const query = filter.value.toLocaleLowerCase(locale());
+    select.replaceChildren(...ordered.filter(p => p.label.toLocaleLowerCase(locale()).includes(query)).map(p => {
+      const option = document.createElement('option');
+      option.value = String(p.id);
+      option.textContent = p.label + (p.archived ? ' (' + t('project_archived') + ')' : '');
+      return option;
+    }));
+    const selected = [...select.options].find(option => option.value === select.dataset.picked);
+    select.selectedIndex = selected ? selected.index : -1;
+  };
+  filter.oninput = render;
+  filter.onkeydown = event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (select.options.length) {
+      select.selectedIndex = 0;
+      select.dataset.picked = select.value;
+    }
+  };
+  select.onchange = () => { select.dataset.picked = select.value; };
+  render();
+  return true;
+}
+
+function pickedProject(select) {
+  return select.dataset.picked === 'unassigned' ? null : Number(select.dataset.picked);
+}
+
 function renderSidebar() {
   const nav = id('week-nav');
   const lbl = id('sidebar-head-label');
@@ -11,7 +99,7 @@ function renderSidebar() {
   if (!days.length) { nav.innerHTML=''; return; }
   const prevScroll = nav.scrollTop;
   const maxMs = Math.max(...days.map(d => d.total_ms), 1);
-  nav.innerHTML = days.map(d => {
+  patchHTML(nav, days.map(d => {
     const active = d.date === (D?.date || selectedDate) ? 'active' : '';
     const pct = Math.round(d.total_ms / maxMs * 100);
     const label = d.date === todayStr() ? t('today') : dayName(d.date);
@@ -27,7 +115,7 @@ function renderSidebar() {
       <div class="dtotal">${d.total_ms ? fmtMs(d.total_ms) : '—'}</div>
       <div class="dbar"><div class="dbar-fill" style="width:${pct}%"></div></div>
     </div>`;
-  }).join('');
+  }).join(''));
   // First paint: scroll the newest day (bottom for oldest-first, top for newest-first)
   // into view. Later re-renders preserve the user's scroll position.
   if (_sidebarFirstRender && !_leftCollapsed) {
@@ -40,6 +128,7 @@ function renderSidebar() {
 
 function selectDate(date) {
   selectedDate = date;
+  saveLS('selectedDate', { date, sessionDate: todayStr(), time: Date.now() });
   loadDay(date);
 }
 
@@ -95,15 +184,16 @@ function stepDay(dir) {
   do {
     d.setDate(d.getDate() + dir);
   } while (_hideWeekends && (d.getDay() === 0 || d.getDay() === 6));
-  goToDate(d.toLocaleDateString('sv'));
+  goToDate(calendarDateStr(d));
 }
 
 // Jump to an arbitrary day (from the calendar). Unlike selectDate it doesn't need
 // a sidebar element — loadDay re-renders the sidebar and highlights the active day.
 function goToDate(date, options) {
   selectedDate = date;
+  saveLS('selectedDate', { date, sessionDate: todayStr(), time: Date.now() });
   hideCalendar();
-  loadDay(date, options);
+  return loadDay(date, options);
 }
 
 async function fetchCalTotals() {

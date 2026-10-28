@@ -4,6 +4,7 @@ const std = @import("std");
 const Io = std.Io;
 const sqlite = @import("sqlite.zig");
 const api = @import("api.zig");
+const store_mod = @import("store.zig");
 const zone = @import("zone.zig");
 const windows = std.os.windows;
 
@@ -12,6 +13,15 @@ extern "kernel32" fn GetConsoleMode(handle: windows.HANDLE, mode: *u32) callconv
 extern "kernel32" fn SetConsoleMode(handle: windows.HANDLE, mode: u32) callconv(.winapi) i32;
 extern "kernel32" fn ReadConsoleW(handle: windows.HANDLE, buffer: [*]u16, len: u32, read: *u32, control: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn ReadFile(handle: windows.HANDLE, data: [*]u8, len: u32, read: *u32, overlapped: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "winhttp" fn WinHttpOpen([*:0]const u16, u32, ?[*:0]const u16, ?[*:0]const u16, u32) callconv(.winapi) ?*anyopaque;
+extern "winhttp" fn WinHttpConnect(*anyopaque, [*:0]const u16, u16, u32) callconv(.winapi) ?*anyopaque;
+extern "winhttp" fn WinHttpOpenRequest(*anyopaque, [*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, ?*anyopaque, u32) callconv(.winapi) ?*anyopaque;
+extern "winhttp" fn WinHttpSetTimeouts(*anyopaque, i32, i32, i32, i32) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpSendRequest(*anyopaque, ?[*:0]const u16, u32, ?*const anyopaque, u32, u32, usize) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpReceiveResponse(*anyopaque, ?*anyopaque) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpQueryHeaders(*anyopaque, u32, ?[*:0]const u16, ?*anyopaque, *u32, ?*u32) callconv(.winapi) i32;
+extern "winhttp" fn WinHttpCloseHandle(*anyopaque) callconv(.winapi) i32;
 
 pub const usage =
     \\usage: kowalski [--db <path>] [--json] <command> [args]
@@ -20,18 +30,33 @@ pub const usage =
     \\  serve                        run the daemon in this console (one per user)
     \\  start                        start the daemon without a console window
     \\  open                         start the daemon if needed and open the dashboard
+    \\  doctor [--fix] [--json]      diagnose launch; repair only with --fix
     \\  autostart [on|off]           start the daemon at logon, or show the setting
-    \\  status                       focus, parallel work and today's numbers
-    \\  switch <task> [-m <text>]    focus on a task (created when nothing matches)
-    \\  parallel <task> [-m <text>]  open a task next to the focus
+    \\  status [--project-key <key>]  focus, parallel work and today's numbers
+    \\  switch|track [--project <#id|unassigned> | --project-key <key> [--project-hint <h>]] <task> [-m <text>]
+    \\  parallel [--project <#id|unassigned> | --project-key <key> [--project-hint <h>]] <task> [-m <text>]
     \\  stop <task>                  close a task's open interval
     \\  pause | resume               save and close everything open, or bring it back
-    \\  note [-t <task>] <text>      note on the focus, or on the named task
-    \\  tasks [<filter>]             tasks by recent use
-    \\  new <title>                  create a task without opening it
+    \\  note [-t <task>] [--star] <text>  note on the focus, or on the named task
+    \\  star n<id>...               mark notes as starred
+    \\  unstar n<id>...             clear notes' starred marks
+    \\  capture <kind> --source <s> --run <r> [--event <id>] [--subject <task>]
+    \\          [--default <task>] [--project-key <key>] [--project-hint <hint>]
+    \\          [--first-prompt <text>] [--unattended] [--focus]
+    \\                               record an outside run (start|subject|prompt|busy|stop|end)
+    \\  tasks [<filter>] [--project-key <key>]  tasks by recent use
+    \\  new [--project-key <key> [--project-hint <h>]] <title>  create a task without opening it
     \\  rename <#id> <title>         change a task's title
+    \\  project list [--all]         list projects
+    \\  project add <label>          add a project
+    \\  project rename <#id> <label> rename a project
+    \\  project archive <#id> [--undo]  archive or unarchive
+    \\  project bind <#id> --key <key>  point a project key at a project
+    \\  project assign <#id|unassigned> --task <#id> [--apply <hash>]
+    \\  project assign <#id|unassigned> --interval <#id>... [--apply <hash>]
+    \\  project assign <#id|unassigned> --suggest [--apply <hash>]
     \\  delete <#id>                 delete a task and its time (not while running or posted)
-    \\  day [<YYYY-MM-DD>]           totals, hops, timeline and summary
+    \\  day [<YYYY-MM-DD>] [--project-key <key>] [--starred]  day or starred notes only
     \\  summary [<YYYY-MM-DD>] [<text>]  show or set a day's summary ("" clears)
     \\  settings | set <key> <value> | unset <key>
     \\  provider                     provider status and fields
@@ -44,7 +69,7 @@ pub const usage =
     \\  provider install [--sequence N] [--yes]  install a verified release
     \\  provider login               sign in to the provider (prompts for the details)
     \\  bind <#id> <ref>             bind a task to an external ref (fields come from the provider)
-    \\  postings [<YYYY-MM-DD>]      what can be posted for a day, and what was
+    \\  postings [<YYYY-MM-DD>] [--accept]  list postings or keep a changed day posted
     \\  post [<YYYY-MM-DD>] <task> [-m <text>] [-o <option,...>]
     \\                               post a task's focus time for a day
     \\  resolve <posting> posted|not-posted     settle a posting whose outcome is unknown
@@ -55,6 +80,7 @@ pub const usage =
     \\                               fill an empty database with made-up history
     \\
     \\A task is `#<id>`, an external ref, or a title (case-insensitive).
+    \\A note id is `n<id>` (shown by `day --starred`).
     \\The database defaults to <Roaming AppData>\sadirano\kowalski\kowalski.db.
     \\
 ;
@@ -69,6 +95,8 @@ pub const Context = struct {
     out: *Io.Writer,
     err: *Io.Writer,
     call_override: ?*const fn (*Context, []const u8, []const u8, ?[]const u8) anyerror!Reply = null,
+    db_checked: bool = false,
+    other_db_path: ?[]const u8 = null,
 };
 
 const Reply = struct { status: u16, body: []const u8 };
@@ -84,6 +112,34 @@ pub fn readPort(ctx: *Context) !u16 {
 }
 
 fn call(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+    if (!ctx.db_checked and !std.mem.eql(u8, target, "/api/health")) {
+        const health = try callUnchecked(ctx, "GET", "/api/health", null);
+        if (health.status != 200) return error.NoDaemon;
+        const parsed = try parse(struct { db: ?[]const u8 = null }, ctx, health.body);
+        if (parsed.db) |daemon_db| {
+            if (!try sameDatabase(ctx.a, daemon_db, ctx.db_path)) {
+                ctx.other_db_path = daemon_db;
+                return error.OtherDatabase;
+            }
+        }
+        ctx.db_checked = true;
+    }
+    return callUnchecked(ctx, method, target, body);
+}
+
+fn sameDatabase(a: std.mem.Allocator, left: []const u8, right: []const u8) !bool {
+    const l = try std.fs.path.resolve(a, &.{left});
+    const r = try std.fs.path.resolve(a, &.{right});
+    if (l.len != r.len) return false;
+    for (l, r) |lc, rc| {
+        const ln = std.ascii.toLower(if (lc == '/') @as(u8, '\\') else lc);
+        const rn = std.ascii.toLower(if (rc == '/') @as(u8, '\\') else rc);
+        if (ln != rn) return false;
+    }
+    return true;
+}
+
+fn callUnchecked(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
     if (ctx.call_override) |override| return override(ctx, method, target, body);
     const port = try readPort(ctx);
     const address = try Io.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -107,8 +163,8 @@ fn call(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8
     return .{ .status = code, .body = raw[head_end + 4 ..] };
 }
 
-const Task = struct { id: i64, title: []const u8, ref: ?[]const u8 = null };
-const Note = struct { at_ms: i64, text: []const u8 };
+const Task = struct { id: i64, title: []const u8, ref: ?[]const u8 = null, project_id: ?i64 = null };
+const Note = struct { id: i64 = 0, at_ms: i64, text: []const u8, starred: bool = false };
 const Interval = struct {
     task: Task,
     role: []const u8,
@@ -116,6 +172,7 @@ const Interval = struct {
     end_ms: ?i64 = null,
     text: ?[]const u8 = null,
     notes: []Note = &.{},
+    project_id: ?i64 = null,
 };
 const Numbers = struct {
     total_ms: i64,
@@ -130,6 +187,7 @@ const Saved = struct { task: Task, role: []const u8 };
 const State = struct {
     now_ms: i64,
     zone: []const u8,
+    day_start_min: u16 = 0,
     date: []const u8,
     focus: ?Interval = null,
     parallel: []Interval = &.{},
@@ -161,13 +219,41 @@ fn clockTime(w: *Io.Writer, z: *const zone.Zone, ms: i64) !void {
 
 /// Whether a daemon answers on this database's port.
 pub fn ping(ctx: *Context) bool {
-    const reply = call(ctx, "GET", "/api/health", null) catch return false;
-    return reply.status == 200;
+    if (ctx.call_override != null) {
+        const reply = call(ctx, "GET", "/api/health", null) catch return false;
+        return reply.status == 200;
+    }
+    return timedHealth(readPort(ctx) catch return false);
+}
+
+/// Bounded liveness check for launch paths; a hung socket cannot hold launch.
+fn timedHealth(port: u16) bool {
+    const deadline = GetTickCount64() + 2000;
+    const agent = WinHttpOpen(std.unicode.utf8ToUtf16LeStringLiteral("kowalski-ping"), 0, null, null, 0) orelse return false;
+    defer _ = WinHttpCloseHandle(agent);
+    const connection = WinHttpConnect(agent, std.unicode.utf8ToUtf16LeStringLiteral("127.0.0.1"), port, 0) orelse return false;
+    defer _ = WinHttpCloseHandle(connection);
+    const request = WinHttpOpenRequest(connection, std.unicode.utf8ToUtf16LeStringLiteral("GET"), std.unicode.utf8ToUtf16LeStringLiteral("/api/health"), null, null, null, 0) orelse return false;
+    defer _ = WinHttpCloseHandle(request);
+    if (WinHttpSetTimeouts(request, 2000, 2000, 2000, 2000) == 0) return false;
+    if (WinHttpSendRequest(request, null, 0, null, 0, 0, 0) == 0) return false;
+    if (GetTickCount64() >= deadline) return false;
+    const left: i32 = @intCast(@max(1, deadline -| GetTickCount64()));
+    if (WinHttpSetTimeouts(request, left, left, left, left) == 0) return false;
+    if (WinHttpReceiveResponse(request, null) == 0) return false;
+    var response_status: u32 = 0;
+    var size: u32 = @sizeOf(u32);
+    return WinHttpQueryHeaders(request, 19 | 0x20000000, null, &response_status, &size, null) != 0 and response_status == 200;
 }
 
 /// Runs one command. Output goes to ctx.out / ctx.err; the caller flushes.
 pub fn run(ctx: *Context, command: []const u8, args: []const []const u8) !Exit {
     return dispatch(ctx, command, args) catch |err| switch (err) {
+        error.OtherDatabase => {
+            const message = try std.fmt.allocPrint(ctx.a, "kowalski: the daemon on port {d} has another database open ({s}); {s} needs its own daemon", .{ readPort(ctx) catch api.default_port, ctx.other_db_path.?, ctx.db_path });
+            try asciiLine(ctx.err, message);
+            return .no_daemon;
+        },
         error.NoDaemon => {
             try ctx.err.writeAll("kowalski: the daemon is not running (start it with: kowalski start)\n");
             return .no_daemon;
@@ -205,6 +291,87 @@ fn options(ctx: *Context, args: []const []const u8, comptime flags: []const []co
         try words.append(ctx.a, args[i]);
     }
     return .{ .words = words.items, .values = values };
+}
+
+fn hashId(text: []const u8) !i64 {
+    if (text.len < 2 or text[0] != '#') return error.Usage;
+    const id = std.fmt.parseInt(i64, text[1..], 10) catch return error.Usage;
+    if (id <= 0) return error.Usage;
+    return id;
+}
+
+fn noteId(text: []const u8) !i64 {
+    if (text.len < 2 or text[0] != 'n') return error.Usage;
+    const id = std.fmt.parseInt(i64, text[1..], 10) catch return error.Usage;
+    if (id <= 0) return error.Usage;
+    return id;
+}
+
+/// Adds a project key and its hint to a request body.
+fn putKey(ctx: *Context, body: *std.json.ObjectMap, key: ?[]const u8, hint: ?[]const u8) !void {
+    const k = key orelse return;
+    try body.put(ctx.a, "project_key", .{ .string = k });
+    if (hint) |h| try body.put(ctx.a, "project_hint", .{ .string = h });
+}
+
+/// The one project a key names. A read never creates one.
+fn keyProject(ctx: *Context, key: []const u8) !i64 {
+    const reply = try call(ctx, "GET", "/api/project-keys", null);
+    if (reply.status < 200 or reply.status >= 300) {
+        _ = try settle(ctx, reply);
+        return error.Reported;
+    }
+    const r = try parse(struct { keys: []struct { project_key: []const u8, project_id: i64 } }, ctx, reply.body);
+    var found: ?i64 = null;
+    for (r.keys) |k| if (std.mem.eql(u8, k.project_key, key)) {
+        if (found != null and found.? != k.project_id) {
+            try asciiLine(ctx.err, try std.fmt.allocPrint(ctx.a, "kowalski: key {s} names several projects; pick one with: kowalski project bind <#id> --key {s}", .{ key, key }));
+            return error.Reported;
+        }
+        found = k.project_id;
+    };
+    return found orelse {
+        try asciiLine(ctx.err, try std.fmt.allocPrint(ctx.a, "kowalski: no project has key {s} yet (track or new with the key makes one)", .{key}));
+        return error.Reported;
+    };
+}
+
+/// One project's share of a day: its focus total and its tasks.
+fn renderProjectDay(ctx: *Context, body: []const u8, project: i64) !void {
+    const r = try parse(struct {
+        date: []const u8,
+        tasks: []struct { task: Task, focus_ms: i64 },
+        project_totals: []struct { project_id: ?i64 = null, label: ?[]const u8 = null, focus_ms: i64 },
+    }, ctx, body);
+    var total: i64 = 0;
+    var label: ?[]const u8 = null;
+    for (r.project_totals) |p| if (p.project_id == project) {
+        total = p.focus_ms;
+        label = p.label;
+    };
+    try ctx.out.print("{s}  #{d} {s}  ", .{ r.date, project, label orelse "" });
+    try duration(ctx.out, total);
+    try ctx.out.writeAll("\n");
+    for (r.tasks) |t| if (t.task.project_id == project and t.focus_ms > 0) {
+        try ctx.out.writeAll("  ");
+        try duration(ctx.out, t.focus_ms);
+        try ctx.out.writeAll("  ");
+        try writeTask(ctx.out, t.task);
+        try ctx.out.writeAll("\n");
+    };
+}
+
+fn projectId(text: []const u8) !?i64 {
+    if (std.mem.eql(u8, text, "unassigned")) return null;
+    return try hashId(text);
+}
+
+const Project = struct { id: i64, label: []const u8, archived: bool };
+
+fn projectLabel(projects: []const Project, id: ?i64) []const u8 {
+    const wanted = id orelse return "Unassigned";
+    for (projects) |project| if (project.id == wanted) return project.label;
+    return "(missing project)";
 }
 
 fn jsonBody(ctx: *Context, value: anytype) ![]const u8 {
@@ -382,21 +549,161 @@ fn dispatch(ctx: *Context, command: []const u8, args: []const []const u8) !Exit 
     };
 }
 
+fn projectCommand(ctx: *Context, args: []const []const u8) !Exit {
+    if (args.len == 0) return error.Usage;
+    const eql = std.mem.eql;
+    if (eql(u8, args[0], "bind")) {
+        const o = try options(ctx, args[1..], &.{"--key"});
+        if (o.words.len != 1) return error.Usage;
+        const key = o.values[0] orelse return error.Usage;
+        const id = try hashId(o.words[0]);
+        const reply = try call(ctx, "PATCH", "/api/project-keys", try jsonBody(ctx, .{ .project_key = key, .project_id = id }));
+        if (!try settle(ctx, reply)) return .ok;
+        try ctx.out.print("bound     {s} -> #{d}\n", .{ key, id });
+        return .ok;
+    }
+    if (eql(u8, args[0], "list")) {
+        if (args.len > 2 or (args.len == 2 and !eql(u8, args[1], "--all"))) return error.Usage;
+        const reply = try call(ctx, "GET", if (args.len == 2) "/api/projects?archived=1" else "/api/projects", null);
+        if (!try settle(ctx, reply)) return .ok;
+        const list = try parse(struct { projects: []Project }, ctx, reply.body);
+        for (list.projects) |project| try ctx.out.print("#{d} {s}{s}\n", .{ project.id, project.label, if (project.archived) " (archived)" else "" });
+        return .ok;
+    }
+    if (eql(u8, args[0], "add")) {
+        if (args.len < 2) return error.Usage;
+        const reply = try call(ctx, "POST", "/api/projects", try jsonBody(ctx, .{ .label = try joined(ctx, args[1..]) }));
+        if (!try settle(ctx, reply)) return .ok;
+        const result = try parse(struct { project: Project }, ctx, reply.body);
+        try ctx.out.print("#{d} {s}\n", .{ result.project.id, result.project.label });
+        return .ok;
+    }
+    if (eql(u8, args[0], "rename")) {
+        if (args.len < 3) return error.Usage;
+        const id = try hashId(args[1]);
+        const reply = try call(ctx, "PATCH", try std.fmt.allocPrint(ctx.a, "/api/projects/{d}", .{id}), try jsonBody(ctx, .{ .label = try joined(ctx, args[2..]) }));
+        if (!try settle(ctx, reply)) return .ok;
+        const result = try parse(struct { project: Project }, ctx, reply.body);
+        try ctx.out.print("#{d} {s}\n", .{ result.project.id, result.project.label });
+        return .ok;
+    }
+    if (eql(u8, args[0], "archive")) {
+        if (args.len < 2 or args.len > 3 or (args.len == 3 and !eql(u8, args[2], "--undo"))) return error.Usage;
+        const id = try hashId(args[1]);
+        const archived = args.len == 2;
+        const reply = try call(ctx, "PATCH", try std.fmt.allocPrint(ctx.a, "/api/projects/{d}", .{id}), try jsonBody(ctx, .{ .archived = archived }));
+        if (!try settle(ctx, reply)) return .ok;
+        try ctx.out.print("#{d} {s}\n", .{ id, if (archived) "archived" else "active" });
+        return .ok;
+    }
+    if (eql(u8, args[0], "assign")) {
+        if (args.len < 3) return error.Usage;
+        const target = try projectId(args[1]);
+        var task: ?i64 = null;
+        var intervals: std.ArrayList(i64) = .empty;
+        var suggest = false;
+        var apply_hash: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (eql(u8, args[i], "--task")) {
+                i += 1;
+                if (i >= args.len) return error.Usage;
+                task = try hashId(args[i]);
+            } else if (eql(u8, args[i], "--interval")) {
+                i += 1;
+                if (i >= args.len or !std.mem.startsWith(u8, args[i], "#")) return error.Usage;
+                while (i < args.len and std.mem.startsWith(u8, args[i], "#")) : (i += 1) try intervals.append(ctx.a, try hashId(args[i]));
+                i -= 1;
+            } else if (eql(u8, args[i], "--suggest")) suggest = true
+            else if (eql(u8, args[i], "--apply")) {
+                i += 1;
+                if (i >= args.len) return error.Usage;
+                apply_hash = args[i];
+            }
+            else return error.Usage;
+        }
+        const modes: u8 = @intFromBool(task != null) + @as(u8, @intFromBool(intervals.items.len > 0)) + @as(u8, @intFromBool(suggest));
+        if (modes != 1) return error.Usage;
+        const scope = .{ .task_id = task, .interval_ids = if (intervals.items.len > 0) @as(?[]const i64, intervals.items) else null, .unassigned_suggestions = suggest };
+        const preview_reply = try call(ctx, "POST", "/api/projects/assign/preview", try jsonBody(ctx, .{ .scope = scope, .project_id = target }));
+        if (preview_reply.status < 200 or preview_reply.status >= 300) {
+            _ = try settle(ctx, preview_reply);
+            return .failed;
+        }
+        const preview = try parse(store_mod.AssignmentPreview, ctx, preview_reply.body);
+        const snapshot_json = try std.json.Stringify.valueAlloc(ctx.a, preview.snapshot, .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(snapshot_json, &digest, .{});
+        const alphabet = "0123456789abcdef";
+        var seen_hash: [16]u8 = undefined;
+        for (digest[0..8], 0..) |byte, n| {
+            seen_hash[n * 2] = alphabet[byte >> 4];
+            seen_hash[n * 2 + 1] = alphabet[byte & 15];
+        }
+        if (!ctx.json) {
+            const project_reply = try call(ctx, "GET", "/api/projects?archived=1", null);
+            if (project_reply.status < 200 or project_reply.status >= 300) {
+                _ = try settle(ctx, project_reply);
+                return .failed;
+            }
+            const all = try parse(struct { projects: []Project }, ctx, project_reply.body);
+            for (preview.snapshot.intervals) |row| try ctx.out.print("#{d} {s} -> {s} ({d} ms focus)\n", .{ row.id, projectLabel(all.projects, row.project_id), projectLabel(all.projects, target), row.focus_ms });
+            for (preview.snapshot.totals) |total| try ctx.out.print("{s} {s}: {d} ms focus\n", .{ total.date, projectLabel(all.projects, total.project_id), total.focus_ms });
+            for (preview.skipped) |row| try ctx.out.print("#{d} skipped (open)\n", .{row.id});
+        } else if (apply_hash == null) {
+            try ctx.out.writeAll(preview_reply.body);
+            try ctx.out.writeAll("\n");
+        }
+        if (apply_hash == null) {
+            try ctx.out.print("preview hash: {s}\n", .{seen_hash});
+            return .ok;
+        }
+        if (!std.mem.eql(u8, apply_hash.?, &seen_hash)) {
+            try ctx.out.print("preview changed: expected {s}, got {s}; preview again before applying\n", .{ apply_hash.?, seen_hash });
+            return .failed;
+        }
+        const apply_reply = try call(ctx, "POST", "/api/projects/assign/apply", try jsonBody(ctx, .{ .snapshot = preview.snapshot }));
+        if (!try settle(ctx, apply_reply)) return .ok;
+        const result = try parse(store_mod.AssignmentResult, ctx, apply_reply.body);
+        try ctx.out.print("changed {d} intervals ({d} ms focus)\n", .{ result.changed, result.focus_ms });
+        return .ok;
+    }
+    return error.Usage;
+}
+
 fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !Exit {
     const eql = std.mem.eql;
+    if (eql(u8, command, "project")) return projectCommand(ctx, args);
     if (eql(u8, command, "status")) {
-        if (args.len != 0) return error.Usage;
-        return status(ctx);
+        const o = try options(ctx, args, &.{"--project-key"});
+        if (o.words.len != 0) return error.Usage;
+        const key = o.values[0] orelse return status(ctx);
+        const project = try keyProject(ctx, key);
+        const s = try fetchState(ctx);
+        try renderState(ctx, s);
+        const where = if (s.focus) |f| (if (f.task.project_id == project) "the focus is in this project" else "the focus is in another project") else "nothing is focused";
+        try ctx.out.print("project   #{d}: {s}\n", .{ project, where });
+        return .ok;
     }
-    if (eql(u8, command, "switch") or eql(u8, command, "parallel")) {
-        const o = try options(ctx, args, &.{ "-m", "--text" });
+    if (eql(u8, command, "switch") or eql(u8, command, "track") or eql(u8, command, "parallel")) {
+        const o = try options(ctx, args, &.{ "-m", "--text", "--project", "--project-key", "--project-hint" });
         if (o.words.len == 0) return error.Usage;
+        if (o.values[2] != null and o.values[3] != null) return error.Usage;
+        if (o.values[4] != null and o.values[3] == null) return error.Usage;
         const text = o.values[0] orelse o.values[1];
-        const target = if (eql(u8, command, "switch")) "/api/switch" else "/api/parallel";
-        const reply = try call(ctx, "POST", target, try jsonBody(ctx, .{ .task = try joined(ctx, o.words), .text = text }));
+        const target = if (eql(u8, command, "parallel")) "/api/parallel" else "/api/switch";
+        var body: std.json.ObjectMap = .empty;
+        try body.put(ctx.a, "task", .{ .string = try joined(ctx, o.words) });
+        try body.put(ctx.a, "text", if (text) |value| .{ .string = value } else .null);
+        if (o.values[2]) |raw| {
+            const id = try projectId(raw);
+            try body.put(ctx.a, "project_id", if (id) |value| .{ .integer = value } else .null);
+        }
+        try putKey(ctx, &body, o.values[3], o.values[4]);
+        const reply = try call(ctx, "POST", target, try jsonBody(ctx, std.json.Value{ .object = body }));
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { task: Task, created: bool }, ctx, reply.body);
-        try ctx.out.writeAll(if (eql(u8, command, "switch")) "focus     " else "parallel  ");
+        try ctx.out.writeAll(if (eql(u8, command, "parallel")) "parallel  " else "focus     ");
         try writeTask(ctx.out, r.task);
         try ctx.out.writeAll(if (r.created) " (new task)\n" else "\n");
         return .ok;
@@ -418,22 +725,75 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         try renderState(ctx, try parse(State, ctx, reply.body));
         return .ok;
     }
+    if (eql(u8, command, "capture")) {
+        var rest: std.ArrayList([]const u8) = .empty;
+        var attended = true;
+        var focus = false;
+        for (args) |arg| {
+            if (eql(u8, arg, "--unattended")) attended = false else if (eql(u8, arg, "--focus")) focus = true else try rest.append(ctx.a, arg);
+        }
+        const o = try options(ctx, rest.items, &.{ "--source", "--run", "--event", "--subject", "--default", "--project-key", "--project-hint", "--first-prompt" });
+        if (o.words.len != 1 or o.values[0] == null or o.values[1] == null) return error.Usage;
+        const reply = try call(ctx, "POST", "/api/capture", try jsonBody(ctx, .{
+            .source = o.values[0].?,
+            .run = o.values[1].?,
+            .event = o.values[2],
+            .kind = o.words[0],
+            .subject = o.values[3],
+            .default_subject = o.values[4],
+            .project_key = o.values[5],
+            .project_hint = o.values[6],
+            .first_prompt = o.values[7],
+            .attended = attended,
+            .focus = focus,
+        }));
+        if (!try settle(ctx, reply)) return .failed;
+        return .ok;
+    }
     if (eql(u8, command, "note")) {
-        const o = try options(ctx, args, &.{ "-t", "--task" });
+        var rest: std.ArrayList([]const u8) = .empty;
+        var starred = false;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (eql(u8, arg, "-t") or eql(u8, arg, "--task")) {
+                if (i + 1 >= args.len) return error.Usage;
+                try rest.append(ctx.a, arg);
+                i += 1;
+                try rest.append(ctx.a, args[i]);
+            } else if (eql(u8, arg, "--star")) starred = true else try rest.append(ctx.a, arg);
+        }
+        const o = try options(ctx, rest.items, &.{ "-t", "--task" });
         if (o.words.len == 0) return error.Usage;
         const task = o.values[0] orelse o.values[1];
-        const reply = try call(ctx, "POST", "/api/notes", try jsonBody(ctx, .{ .task = task, .text = try joined(ctx, o.words) }));
+        const reply = try call(ctx, "POST", "/api/notes", try jsonBody(ctx, .{ .task = task, .text = try joined(ctx, o.words), .starred = starred }));
         if (!try settle(ctx, reply)) return .ok;
         try ctx.out.writeAll("noted\n");
         return .ok;
     }
+    if (eql(u8, command, "star") or eql(u8, command, "unstar")) {
+        if (args.len == 0 or args.len > 500) return error.Usage;
+        const ids = try ctx.a.alloc(i64, args.len);
+        for (args, 0..) |arg, i| ids[i] = try noteId(arg);
+        const starred = eql(u8, command, "star");
+        const reply = try call(ctx, "POST", "/api/notes/star", try jsonBody(ctx, .{ .ids = ids, .starred = starred }));
+        if (!try settle(ctx, reply)) return .ok;
+        try ctx.out.print("{s} {d} note{s}\n", .{ if (starred) "starred" else "unstarred", ids.len, if (ids.len == 1) "" else "s" });
+        return .ok;
+    }
     if (eql(u8, command, "tasks")) {
-        const target = if (args.len == 0) "/api/tasks?limit=40" else try std.fmt.allocPrint(ctx.a, "/api/tasks?limit=200&q={s}", .{try pathEscape(ctx, try joined(ctx, args))});
+        const o = try options(ctx, args, &.{"--project-key"});
+        const project = if (o.values[0]) |key| try keyProject(ctx, key) else null;
+        const target = if (o.words.len == 0 and project == null) "/api/tasks?limit=40" else if (o.words.len == 0) "/api/tasks?limit=1000" else try std.fmt.allocPrint(ctx.a, "/api/tasks?limit=200&q={s}", .{try pathEscape(ctx, try joined(ctx, o.words))});
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
-        const r = try parse(struct { tasks: []struct { id: i64, title: []const u8, ref: ?[]const u8 = null, last_ms: ?i64 = null } }, ctx, reply.body);
+        const r = try parse(struct { tasks: []struct { id: i64, title: []const u8, ref: ?[]const u8 = null, project_id: ?i64 = null, last_ms: ?i64 = null } }, ctx, reply.body);
         const z = try currentZone(ctx);
+        var shown: usize = 0;
         for (r.tasks) |t| {
+            if (project) |id| if (t.project_id != id) continue;
+            if (project != null and shown == 40) break;
+            shown += 1;
             var id_buf: [24]u8 = undefined;
             try ctx.out.print("{s: <6} ", .{try std.fmt.bufPrint(&id_buf, "#{d}", .{t.id})});
             if (t.last_ms) |ms| {
@@ -447,8 +807,13 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "new")) {
-        if (args.len == 0) return error.Usage;
-        const reply = try call(ctx, "POST", "/api/tasks", try jsonBody(ctx, .{ .title = try joined(ctx, args) }));
+        const o = try options(ctx, args, &.{ "--project-key", "--project-hint" });
+        if (o.words.len == 0) return error.Usage;
+        if (o.values[1] != null and o.values[0] == null) return error.Usage;
+        var body: std.json.ObjectMap = .empty;
+        try body.put(ctx.a, "title", .{ .string = try joined(ctx, o.words) });
+        try putKey(ctx, &body, o.values[0], o.values[1]);
+        const reply = try call(ctx, "POST", "/api/tasks", try jsonBody(ctx, std.json.Value{ .object = body }));
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { task: Task }, ctx, reply.body);
         try ctx.out.writeAll("created   ");
@@ -478,11 +843,25 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "day")) {
-        if (args.len > 1) return error.Usage;
-        const target = if (args.len == 1) try std.fmt.allocPrint(ctx.a, "/api/day?date={s}", .{try pathEscape(ctx, args[0])}) else "/api/day";
+        var rest: std.ArrayList([]const u8) = .empty;
+        var starred = false;
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (eql(u8, arg, "--project-key")) {
+                if (i + 1 >= args.len) return error.Usage;
+                try rest.append(ctx.a, arg);
+                i += 1;
+                try rest.append(ctx.a, args[i]);
+            } else if (eql(u8, arg, "--starred")) starred = true else try rest.append(ctx.a, arg);
+        }
+        const o = try options(ctx, rest.items, &.{"--project-key"});
+        if (o.words.len > 1) return error.Usage;
+        const project = if (o.values[0]) |key| try keyProject(ctx, key) else null;
+        const target = if (o.words.len == 1) try std.fmt.allocPrint(ctx.a, "/api/day?date={s}", .{try pathEscape(ctx, o.words[0])}) else "/api/day";
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
-        try renderDay(ctx, reply.body);
+        if (starred) try renderStarredDay(ctx, reply.body, project) else if (project) |id| try renderProjectDay(ctx, reply.body, id) else try renderDay(ctx, reply.body);
         return .ok;
     }
     if (eql(u8, command, "summary")) {
@@ -623,8 +1002,20 @@ fn dispatchInner(ctx: *Context, command: []const u8, args: []const []const u8) !
         return .ok;
     }
     if (eql(u8, command, "postings")) {
-        if (args.len > 1) return error.Usage;
-        const target = if (args.len == 1) try std.fmt.allocPrint(ctx.a, "/api/postings?date={s}", .{try pathEscape(ctx, args[0])}) else "/api/postings";
+        var rest: std.ArrayList([]const u8) = .empty;
+        var accept = false;
+        for (args) |arg| {
+            if (eql(u8, arg, "--accept")) accept = true else try rest.append(ctx.a, arg);
+        }
+        if (rest.items.len > 1) return error.Usage;
+        if (accept) {
+            const reply = try call(ctx, "POST", "/api/postings/accept", try jsonBody(ctx, .{ .date = if (rest.items.len == 1) rest.items[0] else @as(?[]const u8, null) }));
+            if (!try settle(ctx, reply)) return .ok;
+            const r = try parse(struct { date: []const u8 }, ctx, reply.body);
+            try ctx.out.print("accepted {s}\n", .{r.date});
+            return .ok;
+        }
+        const target = if (rest.items.len == 1) try std.fmt.allocPrint(ctx.a, "/api/postings?date={s}", .{try pathEscape(ctx, rest.items[0])}) else "/api/postings";
         const reply = try call(ctx, "GET", target, null);
         if (!try settle(ctx, reply)) return .ok;
         const r = try parse(struct { date: []const u8, instance: ?[]const u8 = null, sessions_mode: bool = false, offers: []struct { task: Task, total_focus_ms: i64, postable: bool, ref: ?[]const u8 = null, postings: []Posting, sessions: []struct { start: []const u8, end: []const u8 } = &.{}, open_session: bool = false } }, ctx, reply.body);
@@ -882,6 +1273,7 @@ test "JSON source enrollment confirms the proposal and prints the final response
     const Fake = struct {
         var calls: usize = 0;
         fn callSource(_: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
             try std.testing.expectEqualStrings("POST", method);
             try std.testing.expectEqualStrings("/api/provider/source", target);
             calls += 1;
@@ -909,8 +1301,64 @@ test "JSON source enrollment confirms the proposal and prints the final response
     try std.testing.expectEqualStrings("{\"enrolled\":true}\n", out.written());
 }
 
+test "daemon database guard refuses a different file and accepts matching or legacy health" {
+    const Fake = struct {
+        const Mode = enum { different, same, legacy };
+        var mode: Mode = .different;
+        var calls: usize = 0;
+        fn request(_: *Context, method: []const u8, target: []const u8, _: ?[]const u8) !Reply {
+            calls += 1;
+            if (std.mem.eql(u8, target, "/api/health")) {
+                try std.testing.expectEqualStrings("GET", method);
+                return .{ .status = 200, .body = switch (mode) {
+                    .different => "{\"ok\":true,\"db\":\"live\\\\work.db\"}",
+                    .same => "{\"ok\":true,\"db\":\"SCRATCH/WORK.DB\"}",
+                    .legacy => "{\"ok\":true}",
+                } };
+            }
+            try std.testing.expectEqualStrings("POST", method);
+            try std.testing.expectEqualStrings("/api/notes", target);
+            return .{ .status = 200, .body = "{\"ok\":true}" };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "scratch\\work.db", .json = true,
+        .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+
+    try std.testing.expectEqual(Exit.no_daemon, try run(&ctx, "note", &.{"sample"}));
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqualStrings("kowalski: the daemon on port 47100 has another database open (live\\work.db); scratch\\work.db needs its own daemon\n", err.written());
+
+    Fake.mode = .same;
+    Fake.calls = 0;
+    ctx.db_checked = false;
+    ctx.other_db_path = null;
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{"sample"}));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{"again"}));
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+
+    Fake.mode = .legacy;
+    Fake.calls = 0;
+    ctx.db_checked = false;
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{"sample"}));
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+}
+
+fn asciiByte(c: u8) u8 {
+    return if (std.ascii.isPrint(c)) c else '?';
+}
+
+fn asciiBytes(w: *Io.Writer, bytes: []const u8) !void {
+    for (bytes) |c| try w.writeByte(asciiByte(c));
+}
+
 fn asciiLine(w: *Io.Writer, bytes: []const u8) !void {
-    for (bytes) |c| try w.writeByte(if (std.ascii.isPrint(c)) c else '?');
+    try asciiBytes(w, bytes);
     try w.writeByte('\n');
 }
 
@@ -954,7 +1402,9 @@ fn fetchState(ctx: *Context) !State {
 
 fn currentZone(ctx: *Context) !zone.Zone {
     const s = try fetchState(ctx);
-    return zone.Zone.load(s.zone);
+    var z = try zone.Zone.load(s.zone);
+    z.day_start_min = s.day_start_min;
+    return z;
 }
 
 fn status(ctx: *Context) !Exit {
@@ -977,7 +1427,8 @@ fn renderOpen(ctx: *Context, z: *const zone.Zone, label: []const u8, i: Interval
 
 fn renderState(ctx: *Context, s: State) !void {
     const w = ctx.out;
-    const z = try zone.Zone.load(s.zone);
+    var z = try zone.Zone.load(s.zone);
+    z.day_start_min = s.day_start_min;
     if (s.focus) |f| try renderOpen(ctx, &z, "focus", f, s.now_ms) else try w.writeAll("focus     (none)\n");
     for (s.parallel) |p| try renderOpen(ctx, &z, "parallel", p, s.now_ms);
     if (s.focus == null and s.parallel.len == 0 and s.saved.len > 0) {
@@ -1009,17 +1460,45 @@ fn renderState(ctx: *Context, s: State) !void {
     try w.writeAll("\n");
 }
 
+fn renderStarredDay(ctx: *Context, body: []const u8, project: ?i64) !void {
+    const d = try parse(struct { date: []const u8, zone: []const u8, day_start_min: u16 = 0, intervals: []Interval }, ctx, body);
+    var z = try zone.Zone.load(d.zone);
+    z.day_start_min = d.day_start_min;
+    const date = try api.parseDate(ctx.a, d.date);
+    const bounds = try z.dayBounds(date.year, date.month, date.day);
+    for (d.intervals) |i| {
+        if (project != null and i.project_id != project) continue;
+        for (i.notes) |note| {
+            if (!note.starred or note.at_ms < bounds.start_ms or note.at_ms >= bounds.end_ms) continue;
+            try ctx.out.print("n{d}  ", .{note.id});
+            try clockTime(ctx.out, &z, note.at_ms);
+            try ctx.out.print("  #{d} ", .{i.task.id});
+            try asciiBytes(ctx.out, i.task.title);
+            if (i.task.ref) |ref| {
+                try ctx.out.writeAll(" [");
+                try asciiBytes(ctx.out, ref);
+                try ctx.out.writeByte(']');
+            }
+            try ctx.out.writeAll("  ");
+            try asciiBytes(ctx.out, note.text);
+            try ctx.out.writeByte('\n');
+        }
+    }
+}
+
 fn renderDay(ctx: *Context, body: []const u8) !void {
     const Day = struct {
         date: []const u8,
         zone: []const u8,
+        day_start_min: u16 = 0,
         numbers: Numbers,
         tasks: []struct { task: Task, focus_ms: i64, hops: u32 },
         intervals: []Interval,
         summary: ?[]const u8 = null,
     };
     const d = try parse(Day, ctx, body);
-    const z = try zone.Zone.load(d.zone);
+    var z = try zone.Zone.load(d.zone);
+    z.day_start_min = d.day_start_min;
     const w = ctx.out;
     try w.print("{s}  ", .{d.date});
     try duration(w, d.numbers.total_ms);
@@ -1042,13 +1521,194 @@ fn renderDay(ctx: *Context, body: []const u8) !void {
         if (i.end_ms) |end| try clockTime(w, &z, end) else try w.writeAll("now  ");
         try w.writeAll(if (std.mem.eql(u8, i.role, "focus")) "  " else "  + ");
         try writeTask(w, i.task);
-        if (i.text) |text| try w.print("  \"{s}\"", .{text});
+        if (i.text) |value| {
+            const first = std.mem.sliceTo(value, '\n');
+            try w.print("  \"{s}{s}\"", .{ std.mem.trimEnd(u8, first, "\r"), if (first.len < value.len) "..." else "" });
+        }
         try w.writeAll("\n");
         for (i.notes) |note| {
             try w.writeAll("        ");
             try clockTime(w, &z, note.at_ms);
-            try w.print("  {s}\n", .{note.text});
+            const first = std.mem.sliceTo(note.text, '\n');
+            try w.print("  {s}{s}\n", .{ std.mem.trimEnd(u8, first, "\r"), if (first.len < note.text.len) "..." else "" });
         }
     }
     if (d.summary) |text| try w.print("\nsummary: {s}\n", .{text});
+}
+
+test "day listing keeps each multiline note on one row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false,
+        .out = &out.writer, .err = &err.writer };
+    const body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"numbers\":{\"total_ms\":0,\"hops\":0,\"working\":false,\"remaining_ms\":0},\"tasks\":[],\"intervals\":[{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773100800000,\"end_ms\":1773100801000,\"notes\":[{\"at_ms\":1773100800000,\"text\":\"first\\nsecond\"}]}]}";
+    try renderDay(&ctx, body);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "first...\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "second") == null);
+}
+
+test "starred note commands and day output use the API" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn request(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            defer calls += 1;
+            switch (calls) {
+                0 => {
+                    try std.testing.expectEqualStrings("POST", method);
+                    try std.testing.expectEqualStrings("/api/notes", target);
+                    const b = try parse(struct { task: ?[]const u8, text: []const u8, starred: bool }, ctx, body.?);
+                    try std.testing.expect(b.task == null);
+                    try std.testing.expectEqualStrings("important", b.text);
+                    try std.testing.expect(b.starred);
+                    return .{ .status = 201, .body = "{\"note\":7}" };
+                },
+                1, 2 => {
+                    try std.testing.expectEqualStrings("POST", method);
+                    try std.testing.expectEqualStrings("/api/notes/star", target);
+                    const b = try parse(struct { ids: []i64, starred: bool }, ctx, body.?);
+                    try std.testing.expectEqualSlices(i64, if (calls == 1) &.{ 7, 8 } else &.{8}, b.ids);
+                    try std.testing.expectEqual(calls == 1, b.starred);
+                    return .{ .status = 200, .body = "{}" };
+                },
+                3 => {
+                    try std.testing.expectEqualStrings("GET", method);
+                    try std.testing.expectEqualStrings("/api/day?date=2026-03-10", target);
+                    return .{ .status = 200, .body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"intervals\":[{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773100800000,\"notes\":[{\"id\":7,\"at_ms\":1773100800000,\"text\":\"first\\nline\",\"starred\":true},{\"id\":8,\"at_ms\":1773100860000,\"text\":\"hidden\",\"starred\":false}]}]}" };
+                },
+                else => return error.UnexpectedCall,
+            }
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{ "--star", "important" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "star", &.{ "n7", "n8" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "unstar", &.{"n8"}));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "day", &.{ "2026-03-10", "--starred" }));
+    try std.testing.expectEqual(@as(usize, 4), Fake.calls);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "n7  00:00  #1 A  first?line\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "hidden") == null);
+}
+
+test "postings accept flag uses the API" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn request(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            try std.testing.expectEqualStrings("POST", method);
+            try std.testing.expectEqualStrings("/api/postings/accept", target);
+            const parsed = try parse(struct { date: ?[]const u8 }, ctx, body.?);
+            if (calls == 0) try std.testing.expectEqualStrings("2026-03-10", parsed.date.?) else try std.testing.expect(parsed.date == null);
+            calls += 1;
+            return .{ .status = 200, .body = "{\"date\":\"2026-03-10\",\"accepted\":true}" };
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "postings", &.{ "--accept", "2026-03-10" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "postings", &.{"--accept"}));
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+    try std.testing.expectEqualStrings("accepted 2026-03-10\naccepted 2026-03-10\n", out.written());
+}
+
+test "starred day lists only notes within the selected day" {
+    const Fake = struct {
+        const day_body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"intervals\":[" ++
+            "{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773100680000,\"end_ms\":1773100920000,\"notes\":[" ++
+            "{\"id\":1,\"at_ms\":1773100740000,\"text\":\"previous\",\"starred\":true}," ++
+            "{\"id\":2,\"at_ms\":1773100800000,\"text\":\"current\",\"starred\":true}]}," ++
+            "{\"task\":{\"id\":1,\"title\":\"A\"},\"role\":\"focus\",\"start_ms\":1773187080000,\"end_ms\":1773187320000,\"notes\":[" ++
+            "{\"id\":3,\"at_ms\":1773187140000,\"text\":\"late\",\"starred\":true}," ++
+            "{\"id\":4,\"at_ms\":1773187200000,\"text\":\"next\",\"starred\":true}]}]}";
+        fn request(_: *Context, method: []const u8, target: []const u8, _: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            try std.testing.expectEqualStrings("GET", method);
+            try std.testing.expectEqualStrings("/api/day?date=2026-03-10", target);
+            return .{ .status = 200, .body = day_body };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "day", &.{ "2026-03-10", "--starred" }));
+    try std.testing.expectEqualStrings("n2  00:00  #1 A  current\nn3  23:59  #1 A  late\n", out.written());
+}
+
+test "starred day replaces non-ASCII and control bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer };
+    const body = "{\"date\":\"2026-03-10\",\"zone\":\"UTC\",\"intervals\":[{\"task\":{\"id\":1,\"title\":\"Caf\\u00e9\",\"ref\":\"R\\u00e9f\"},\"role\":\"focus\",\"start_ms\":1773100800000,\"notes\":[{\"id\":7,\"at_ms\":1773100800000,\"text\":\"na\\u00efve\\u0001 note\",\"starred\":true}]}]}";
+    try renderStarredDay(&ctx, body, null);
+    try std.testing.expectEqualStrings("n7  00:00  #1 Caf?? [R??f]  na??ve? note\n", out.written());
+    for (out.written()) |ch| try std.testing.expect(ch < 128);
+}
+
+test "boolean-looking option values stay attached to their options" {
+    const Fake = struct {
+        var calls: usize = 0;
+        fn request(ctx: *Context, method: []const u8, target: []const u8, body: ?[]const u8) !Reply {
+            if (std.mem.eql(u8, target, "/api/health")) return .{ .status = 200, .body = "{\"ok\":true}" };
+            defer calls += 1;
+            switch (calls) {
+                0 => {
+                    try std.testing.expectEqualStrings("POST", method);
+                    try std.testing.expectEqualStrings("/api/notes", target);
+                    const b = try parse(struct { task: []const u8, text: []const u8, starred: bool }, ctx, body.?);
+                    try std.testing.expectEqualStrings("--star", b.task);
+                    try std.testing.expectEqualStrings("text", b.text);
+                    try std.testing.expect(!b.starred);
+                    return .{ .status = 201, .body = "{\"note\":1}" };
+                },
+                1 => {
+                    try std.testing.expectEqualStrings("GET", method);
+                    try std.testing.expectEqualStrings("/api/project-keys", target);
+                    return .{ .status = 200, .body = "{\"keys\":[{\"project_key\":\"--starred\",\"project_id\":1}]}" };
+                },
+                2 => {
+                    try std.testing.expectEqualStrings("GET", method);
+                    try std.testing.expectEqualStrings("/api/day", target);
+                    return .{ .status = 200, .body = "{\"date\":\"2026-03-10\",\"tasks\":[],\"project_totals\":[{\"project_id\":1,\"label\":\"P\",\"focus_ms\":0}]}" };
+                },
+                else => return error.UnexpectedCall,
+            }
+        }
+    };
+    Fake.calls = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err.deinit();
+    var ctx: Context = .{ .io = std.testing.io, .a = arena.allocator(), .db_path = "unused", .json = false, .out = &out.writer, .err = &err.writer, .call_override = Fake.request };
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "note", &.{ "-t", "--star", "text" }));
+    try std.testing.expectEqual(Exit.ok, try run(&ctx, "day", &.{ "--project-key", "--starred" }));
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "2026-03-10  #1 P") != null);
 }
